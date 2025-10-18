@@ -37,7 +37,7 @@ SL_ATR_CUSHION     = 0.25     # 0.25 * ATR au-delà de la mèche
 QUICK_BARS         = 3        # doit avancer vite en <= 3 barres
 QUICK_PROGRESS     = 0.30     # >= 30% du chemin vers TP
 
-# Pyramide
+# Pyramide (non activée pour l’instant, réservé)
 PYRAMID_MAX        = 1
 
 # Fallback testnet : marchés USDT-perp disponibles le plus souvent
@@ -102,13 +102,27 @@ def touches_band(c, band_price, side="lower", tol_pct=0.0006):
     return c["high"] >= (band_price - tol)
 
 # =======================
-# UNIVERS (Top 100)
+# UNIVERS (Top 100) + Filtrage TESTNET
 # =======================
+def filter_working_symbols(ex, symbols, timeframe="1h"):
+    """
+    Retourne uniquement les symboles qui répondent à un mini fetch_ohlcv.
+    Utile surtout sur TESTNET où tous les marchés ne sont pas disponibles.
+    """
+    ok = []
+    for s in symbols:
+        try:
+            ex.fetch_ohlcv(s, timeframe=timeframe, limit=2)
+            ok.append(s)
+        except Exception:
+            pass
+    return ok
+
 def build_universe(ex):
     """
     Construit le Top-N swaps USDT (linéaires) :
     - Live : vrai Top N par volume 24h
-    - Testnet : si pas de volumes, fallback vers une petite liste
+    - Testnet : si pas de volumes, fallback vers une petite liste, filtrée par marchés réellement OK
     Respecte UNIVERSE_SIZE & MIN_VOLUME_USDT.
     """
     print("[UNIVERSE] building top by 24h volume...")
@@ -158,6 +172,16 @@ def build_universe(ex):
         print(f"[UNIVERSE] size={len(universe)} (ranked by 24h volume)")
         print(f"[UNIVERSE] top10: {preview}")
         tg_send(f"📊 Univers LIVE top10: {preview}")
+
+        # En testnet, on garde uniquement les symboles qui répondent vraiment
+        if BITGET_TESTNET:
+            u2 = filter_working_symbols(ex, universe[:20], timeframe=TF)  # on valide les ~20 premiers
+            if u2:
+                print(f"[UNIVERSE] testnet filtered working={len(u2)}: {', '.join(u2)}")
+                tg_send(f"🧪 Testnet marchés OK: {', '.join(u2)}")
+                return u2[:UNIVERSE_SIZE]
+            else:
+                print("[UNIVERSE] testnet: aucun symbole valide parmi le top -> fallback")
         return universe
 
     # 4) Pas de volume (testnet) => fallback
@@ -166,7 +190,14 @@ def build_universe(ex):
         fb = [s for s in FALLBACK_TESTNET if s in candidates] or FALLBACK_TESTNET
     else:
         fb = FALLBACK_TESTNET
-    universe = fb[:max(1, min(UNIVERSE_SIZE, len(fb)))]
+    # On ne garde que ceux qui répondent
+    universe = filter_working_symbols(ex, fb, timeframe=TF)
+    if not universe:
+        # Si vraiment rien ne répond, tente un mini scan des candidates
+        probe = filter_working_symbols(ex, candidates[:30], timeframe=TF)
+        universe = probe or fb  # dernier recours
+
+    universe = universe[:max(1, min(UNIVERSE_SIZE, len(universe)))]
     print(f"[UNIVERSE] size={len(universe)} (fallback)")
     print(f"[UNIVERSE] list: {', '.join(universe)}")
     tg_send(f"🧪 Univers TESTNET: {', '.join(universe)}")
