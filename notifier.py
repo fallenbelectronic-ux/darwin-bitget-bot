@@ -95,7 +95,7 @@ def purge_chat(keep_kinds=("signal", "trade"), keep_date=None):
         # sinon suppression
         tg_delete(mid)
     _save_index(kept)
-    tg_send("🧹 *Purge*: seuls *trades* et *signaux* du *jour* sont conservés.", kind="info")
+    tg_send("🧹 *Nettoyage*", kind="info")
     return True
 
 _last_nightly_key = None
