@@ -1,40 +1,163 @@
-# === main.py — Darwin-Bitget (strict close-only logic) ========================
-import os, time, math, csv, requests
+# main.py
+import os, time, math, csv, io, requests, traceback
 import ccxt
 import pandas as pd
 import numpy as np
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
 from ta.volatility import BollingerBands, AverageTrueRange
-from datetime import datetime
-from notifier import tg_send
 
-# ─────────────────────────── ENV ───────────────────────────
-BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1","true","yes")
-API_KEY          = os.getenv("BITGET_API_KEY", "")
-API_SECRET       = os.getenv("BITGET_API_SECRET", "")
+load_dotenv()
+
+# ========================
+# ENV / PARAMS
+# ========================
+BITGET_TESTNET   = os.getenv("BITGET_TESTNET","true").lower() in ("1","true","yes")
+API_KEY          = os.getenv("BITGET_API_KEY")
+API_SECRET       = os.getenv("BITGET_API_SECRET")
 PASSPHRASE       = os.getenv("BITGET_API_PASSWORD") or os.getenv("BITGET_PASSPHRASE")
 
-TF               = os.getenv("TIMEFRAME","1h")
+TF               = os.getenv("TIMEFRAME", "1h")
+DRY_RUN          = os.getenv("DRY_RUN","true").lower() in ("1","true","yes")
+UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE","30"))   # Top-30
+MAX_PER_HOUR     = int(os.getenv("PICKS","4"))            # 4 meilleurs / heure
+MAX_OPEN_TRADES  = int(os.getenv("MAX_OPEN_TRADES","4"))
 RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE","0.01"))
 MIN_RR           = float(os.getenv("MIN_RR","3.0"))
-MAX_OPEN_TRADES  = int(os.getenv("MAX_OPEN_TRADES","4"))
-UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE","100"))
-LOOP_DELAY       = int(os.getenv("LOOP_DELAY","5"))
-DRY_RUN          = os.getenv("DRY_RUN","true").lower() in ("1","true","yes")
-
 ATR_WINDOW       = 14
 SL_ATR_CUSHION   = 0.25
-TP_TICKS         = 2
-TICK_PCT         = 0.0001
+TP_TICKS         = 2          # TP un peu avant la bande
+CONTACT_TOL      = 0.0008     # tolérance contact (~0.08%)
 
-TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
+TRADES_CSV       = os.getenv("TRADES_CSV", "./trades.csv")
+TZNAME           = os.getenv("TIMEZONE", "Europe/Lisbon")
 
-FALLBACK_TESTNET = ["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","LTC/USDT:USDT","BCH/USDT:USDT"]
+# Telegram
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN","")
+TG_CHATID = os.getenv("TELEGRAM_CHAT_ID","")
 
-# ─────────────────────────── EXCHANGE ───────────────────────────
+# ========================
+# TELEGRAM HELPERS
+# ========================
+SENT_MSGS = deque(maxlen=6000)   # [{id, ts(UTC), kind}] kind in {'trade','signal','info','error','keep'}
+LAST_UPDATE_ID = None
+RUNNING = True
+LAST_PURGE_HOUR = None
+LAST_SIGNAL_PURGE_DATE = None  # 'YYYY-MM-DD' (TZ local)
+
+def tg_api(method, payload=None, files=None, timeout=10):
+    if not TG_TOKEN: return None
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+    try:
+        if files:
+            r = requests.post(url, data=payload or {}, files=files, timeout=timeout)
+        else:
+            r = requests.post(url, json=payload or {}, timeout=timeout)
+        if not r.ok: return None
+        data = r.json()
+        return data if data.get("ok") else None
+    except Exception:
+        return None
+
+def tg_send(text:str, kind:str="info", keep=False):
+    """kind: 'trade'|'signal'|'info'|'error'|'keep' ; keep=True empêche les purges."""
+    if not TG_TOKEN or not TG_CHATID: return None
+    data = tg_api("sendMessage", {"chat_id": TG_CHATID, "text": text, "parse_mode":"Markdown"})
+    if data and data.get("result"):
+        mid = data["result"]["message_id"]
+        SENT_MSGS.append({"id": mid, "ts": datetime.now(timezone.utc), "kind": ("trade" if kind=="trade" else ("keep" if keep else kind))})
+        return mid
+    return None
+
+def tg_delete(mid:int):
+    tg_api("deleteMessage", {"chat_id": TG_CHATID, "message_id": mid})
+
+def tg_send_document(filename:str, bytes_data:bytes, caption:str=""):
+    files = {'document': (filename, bytes_data)}
+    payload = {"chat_id": TG_CHATID, "caption": caption}
+    tg_api("sendDocument", payload, files=files)
+
+def utc_to_local(utc_dt: datetime) -> datetime:
+    # simple tz conversion using fixed offset via time.tzname is unreliable; use offset from env if needed.
+    # Here we use Python's zoneinfo if available (Py>=3.9). If not, we approximate with system localtime.
+    try:
+        from zoneinfo import ZoneInfo
+        return utc_dt.astimezone(ZoneInfo(TZNAME))
+    except Exception:
+        return utc_dt.astimezone()
+
+def purge_chat(keep_kinds=("trade","signal","keep"), only_older_than_utc: datetime|None=None, remove_signals=False):
+    """
+    Supprime les messages envoyés par le bot.
+    - keep_kinds: types conservés
+    - only_older_than_utc: si fourni, on ne supprime que les messages plus anciens que cette date UTC
+    - remove_signals: si True, on supprime aussi les 'signal' (même s'ils sont dans keep_kinds)
+    """
+    survivors = deque(maxlen=SENT_MSGS.maxlen)
+    for m in list(SENT_MSGS):
+        k = m["kind"]
+        if remove_signals and k == "signal":
+            tg_delete(m["id"])
+            continue
+        if k in keep_kinds:
+            if only_older_than_utc and m["ts"] > only_older_than_utc:
+                survivors.append(m); continue
+            if only_older_than_utc is None:
+                survivors.append(m); continue
+        # supprime si non-conforme
+        if only_older_than_utc and m["ts"] > only_older_than_utc:
+            survivors.append(m); continue
+        tg_delete(m["id"])
+    SENT_MSGS.clear()
+    for x in survivors: SENT_MSGS.append(x)
+
+def hourly_auto_purge():
+    """Chaque heure: on supprime info/erreur et on garde *trades* + *signaux du jour*."""
+    global LAST_PURGE_HOUR
+    now_utc = datetime.now(timezone.utc)
+    key = now_utc.strftime("%Y-%m-%d %H")
+    if LAST_PURGE_HOUR == key:
+        return
+    if now_utc.minute == 0 and now_utc.second <= 10:
+        # garde trades et signaux du *jour courant* (TZ)
+        today_local = utc_to_local(now_utc).date()
+        survivors = deque(maxlen=SENT_MSGS.maxlen)
+        for m in list(SENT_MSGS):
+            if m["kind"] in ("trade","keep"):
+                survivors.append(m); continue
+            if m["kind"] == "signal":
+                if utc_to_local(m["ts"]).date() == today_local:
+                    survivors.append(m)
+                else:
+                    tg_delete(m["id"])
+                continue
+            # info / error -> delete
+            tg_delete(m["id"])
+        SENT_MSGS.clear()
+        for x in survivors: SENT_MSGS.append(x)
+        LAST_PURGE_HOUR = key
+
+def nightly_signals_purge():
+    """Chaque nuit (minuit local): supprimer *tous* les signaux de la veille et antérieurs, garder trades & keep uniquement."""
+    global LAST_SIGNAL_PURGE_DATE
+    now_local = utc_to_local(datetime.now(timezone.utc))
+    today_key = now_local.strftime("%Y-%m-%d")
+    if LAST_SIGNAL_PURGE_DATE == today_key:
+        return
+    if now_local.hour == 0 and now_local.minute <= 2:
+        # supprimer tout 'signal'
+        purge_chat(keep_kinds=("trade","keep"), remove_signals=True)
+        LAST_SIGNAL_PURGE_DATE = today_key
+
+# ========================
+# EXCHANGE
+# ========================
 def create_exchange():
     ex = ccxt.bitget({
-        "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASE,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": PASSPHRASE,
         "enableRateLimit": True,
         "options": {"defaultType": "swap", "testnet": BITGET_TESTNET}
     })
@@ -43,10 +166,12 @@ def create_exchange():
         except Exception: pass
     return ex
 
-# ─────────────────────────── DATA ───────────────────────────
-def fetch_ohlcv_df(ex, symbol, timeframe="1h", limit=300):
-    o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(o, columns=["ts","open","high","low","close","vol"])
+# ========================
+# DATA / INDICATEURS
+# ========================
+def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
+    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(raw, columns=["ts","open","high","low","close","vol"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df.set_index("ts", inplace=True)
 
@@ -62,270 +187,417 @@ def fetch_ohlcv_df(ex, symbol, timeframe="1h", limit=300):
 
     atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=ATR_WINDOW)
     df["atr"] = atr.average_true_range()
-    return df
+    return df.dropna()
 
-def tick_of(price: float) -> float:
-    return max(price * TICK_PCT, 0.01)
+def get_tick(p):                 
+    return max(p*0.0001, 0.0000001)
 
-def touches(value, target, side, tol=0.0):
-    if pd.isna(value) or pd.isna(target): return False
-    if side == "up":
-        return value >= (target - tol)
-    return value <= (target + tol)
+def within(x, target, tol):
+    return abs(x-target) <= tol
 
-# ─────────────────────────── UNIVERS ───────────────────────────
-def filter_working_symbols(ex, symbols):
-    ok=[]
-    for s in symbols:
-        try: ex.fetch_ohlcv(s, timeframe=TF, limit=2); ok.append(s)
-        except Exception: pass
-    return ok
+def had_contact_last_or_prev(df, side:str) -> bool:
+    """Contact BB20 sur *dernière* ou *précédente* bougie (pas plus loin)."""
+    if len(df) < 2: return False
+    last, prev = df.iloc[-1], df.iloc[-2]
+    tol_last = max(last["close"]*CONTACT_TOL, get_tick(last["close"]))
+    tol_prev = max(prev["close"]*CONTACT_TOL, get_tick(prev["close"]))
 
+    if side == "buy":
+        c1 = (last["low"] <= last["bb20_lo"] + tol_last) or within(last["low"], last["bb20_lo"], tol_last)
+        c2 = (prev["low"] <= last["bb20_lo"] + tol_prev) or within(prev["low"], last["bb20_lo"], tol_prev)
+        return c1 or c2
+    else:
+        c1 = (last["high"] >= last["bb20_up"] - tol_last) or within(last["high"], last["bb20_up"], tol_last)
+        c2 = (prev["high"] >= last["bb20_up"] - tol_prev) or within(prev["high"], last["bb20_up"], tol_prev)
+        return c1 or c2
+
+def strong_reaction(candle: pd.Series) -> bool:
+    o,h,l,c = float(candle["open"]),float(candle["high"]),float(candle["low"]),float(candle["close"])
+    rng  = max(h-l, 1e-12); body = abs(c-o)
+    up_wick   = h-max(c,o); down_wick = min(c,o)-l
+    return (body/rng >= 0.30) or (up_wick/rng >= 0.30) or (down_wick/rng >= 0.30)
+
+def bb20_outside_bb80(c: pd.Series) -> bool:
+    return (c["bb20_lo"] < c["bb80_lo"]) or (c["bb20_up"] > c["bb80_up"])
+
+def prolonged_outside_count(df) -> int:
+    """Enfoncement 'deux bandes' avant la bougie de signal.
+       La 4ᵉ barre n’est pas comptée si la dernière clôture est déjà dans BB20.
+    """
+    if len(df) < 5: return 0
+    last = df.iloc[-1]
+    end_idx = -2 if (last["close"]<=last["bb20_up"] and last["close"]>=last["bb20_lo"]) else -1
+    cnt = 0; i = end_idx
+    while abs(i) <= len(df):
+        r = df.iloc[i]
+        out_up   = (r["high"] >= r["bb20_up"]) and (r["high"] >= r["bb80_up"])
+        out_down = (r["low"]  <= r["bb20_lo"]) and (r["low"]  <= r["bb80_lo"])
+        if out_up or out_down: cnt += 1; i -= 1
+        else: break
+    return cnt
+
+# ========================
+# UNIVERS (Top-30 volume)
+# ========================
 def build_universe(ex):
     try:
         ex.load_markets()
-        candidates = [
-            m["symbol"] for m in ex.markets.values()
-            if (m.get("type")=="swap" or m.get("swap")) and m.get("linear")
-               and m.get("settle")=="USDT" and m.get("quote")=="USDT"
-        ]
+        cands = []
+        for m in ex.markets.values():
+            if (m.get("type")=="swap" or m.get("swap")) and m.get("linear") \
+               and m.get("quote")=="USDT" and m.get("settle")=="USDT":
+                cands.append(m["symbol"])
     except Exception:
-        candidates = []
+        cands = []
+
     rows=[]
     try:
-        t = ex.fetch_tickers(candidates if candidates else None)
-        for s, tk in t.items():
-            if "/USDT" not in s and ":USDT" not in s: continue
-            vol = tk.get("quoteVolume") or tk.get("baseVolume") or 0
+        tks = ex.fetch_tickers(cands if cands else None)
+        for s,t in tks.items():
+            if "/USDT" not in s and ":USDT" not in s: 
+                continue
+            vol = t.get("quoteVolume") or t.get("baseVolume") or 0
             try: vol=float(vol)
             except: vol=0.0
-            rows.append((s, vol))
+            rows.append((s,vol))
     except Exception:
         pass
+
     if rows:
         df = pd.DataFrame(rows, columns=["symbol","vol"]).sort_values("vol", ascending=False)
-        uni = df.head(UNIVERSE_SIZE)["symbol"].tolist()
-        if BITGET_TESTNET:
-            uni = filter_working_symbols(ex, uni[:30]) or FALLBACK_TESTNET
-        return uni
-    return filter_working_symbols(ex, FALLBACK_TESTNET)
+        return df.head(UNIVERSE_SIZE)["symbol"].tolist()
 
-# ─────────────────────────── PATTERN FORT ───────────────────────────
-def reaction_strong(prev, last, side):
-    body = abs(last["close"] - last["open"])
-    rng  = last["high"] - last["low"]
-    if rng <= 0: return False
-    body_ratio = body / rng
-    upper_wick = last["high"] - max(last["close"], last["open"])
-    lower_wick = min(last["close"], last["open"]) - last["low"]
-    wr_up   = upper_wick / rng
-    wr_down = lower_wick / rng
-    gap_up   = last["open"] > prev["close"] and last["close"] > last["open"]
-    gap_down = last["open"] < prev["close"] and last["close"] < last["open"]
-    if side == "buy":
-        if wr_down >= 0.30: return True
-        if body_ratio >= 0.60 and last["close"] > last["open"]: return True
-        if gap_up: return True
-    else:
-        if wr_up >= 0.30: return True
-        if body_ratio >= 0.60 and last["close"] < last["open"]: return True
-        if gap_down: return True
-    return False
+    return ["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT"]
 
-# ─────────────────────────── DÉTECTION SUR BOUGIE CLOSE ───────────────────────────
-def detect_signal_strict(df):
-    """
-    Utilise la dernière bougie **close** (index -2).
-    """
-    if len(df) < 5: return None
-    last  = df.iloc[-2]   # BOUGIE FERMÉE
-    prev  = df.iloc[-3]
-    prev2 = df.iloc[-4]
-
-    # close DANS/SUR BB20
-    in_bb20 = (last["close"] <= last["bb20_up"] + 1e-12) and (last["close"] >= last["bb20_lo"] - 1e-12)
-    if not in_bb20: return None
-
-    t = tick_of(float(last["close"]))
-
-    long_trend  = (last["close"] >= last["bb80_mid"])
-    short_trend = (last["close"] <= last["bb80_mid"])
-
-    contacted_lo_20 = touches(prev["low"], prev["bb20_lo"], "lo", t) or touches(prev2["low"], prev2["bb20_lo"], "lo", t)
-    contacted_up_20 = touches(prev["high"], prev["bb20_up"], "up", t) or touches(prev2["high"], prev2["bb20_up"], "up", t)
-
-    prev_out_up   = touches(prev["high"], max(prev["bb80_up"], prev["bb20_up"]), "up", t)
-    prev_out_down = touches(prev["low"],  min(prev["bb80_lo"], prev["bb20_lo"]), "lo", t)
-    double_ext_up   = prev_out_up   and (prev["close"] >  prev["bb20_up"])
-    double_ext_down = prev_out_down and (prev["close"] <  prev["bb20_lo"])
-
-    side=None; regime=None; notes=[]
-
-    if long_trend and contacted_lo_20:
-        side, regime = "buy","trend"; notes += ["Contact bande basse BB20","Clôture dans/sur BB20","Tendance"]
-    elif short_trend and contacted_up_20:
-        side, regime = "sell","trend"; notes += ["Contact bande haute BB20","Clôture dans/sur BB20","Tendance"]
-    elif double_ext_down:
-        side, regime = "buy","counter"; notes += ["Double extrême bas (BB80 & BB20)","Réintégration + close dans/sur BB20","Contre-tendance"]
-    elif double_ext_up:
-        side, regime = "sell","counter"; notes += ["Double extrême haut (BB80 & BB20)","Réintégration + close dans/sur BB20","Contre-tendance"]
-    else:
+# ========================
+# SIGNALS (règles TWIN)
+# ========================
+def detect_signal(df, state, sym):
+    if len(df) < 3: 
         return None
-
-    if not reaction_strong(prev, last, side): return None
-
+    last, prev = df.iloc[-1], df.iloc[-2]
+    atr = float(last["atr"])
     entry = float(last["close"])
-    atr   = float(last["atr"])
-    if side=="buy":
-        sl = min(float(prev["low"]), float(last["low"])) - SL_ATR_CUSHION*atr
-        tp = (float(last["bb80_up"]) if regime=="trend" else float(last["bb20_up"])) - TP_TICKS*t
+    tick  = get_tick(entry)
+
+    # 3 conditions : contact (last/prev), réaction forte, close dans/sur BB20
+    in_bb20 = (last["close"]<=last["bb20_up"]) and (last["close"]>=last["bb20_lo"])
+    if not in_bb20: return None
+    if not strong_reaction(last): return None
+
+    above80 = last["close"] >= last["bb80_mid"]
+    ext_cnt = prolonged_outside_count(df)
+    need_double_reint = bb20_outside_bb80(last) and (ext_cnt >= 4)
+
+    # ---- Contre-tendance (double extrême) ----
+    if above80:
+        side_ct = "sell"
+        has_contact = had_contact_last_or_prev(df, "sell")
+        double_ok = (last["close"]<=last["bb80_up"] and last["close"]>=last["bb80_lo"])
+        if has_contact and ( (not need_double_reint) or double_ok ):
+            st = state.setdefault(sym, {"cooldown_done":False})
+            if need_double_reint and not st.get("cooldown_done", False):
+                st["cooldown_done"]=True
+                return None
+            sl = max(prev["high"], last["high"]) + SL_ATR_CUSHION*atr
+            tp = float(last["bb20_lo"] - TP_TICKS*tick)
+            rr = abs((tp-entry) / (abs(entry-sl) or 1e-12))
+            if rr >= MIN_RR: 
+                return {"side":side_ct,"regime":"counter","entry":entry,"sl":float(sl),"tp":tp,"rr":float(rr)}
     else:
-        sl = max(float(prev["high"]), float(last["high"])) + SL_ATR_CUSHION*atr
-        tp = (float(last["bb80_lo"]) if regime=="trend" else float(last["bb20_lo"])) + TP_TICKS*t
+        side_ct = "buy"
+        has_contact = had_contact_last_or_prev(df, "buy")
+        double_ok = (last["close"]<=last["bb80_up"] and last["close"]>=last["bb80_lo"])
+        if has_contact and ( (not need_double_reint) or double_ok ):
+            st = state.setdefault(sym, {"cooldown_done":False})
+            if need_double_reint and not st.get("cooldown_done", False):
+                st["cooldown_done"]=True
+                return None
+            sl = min(prev["low"], last["low"]) - SL_ATR_CUSHION*atr
+            tp = float(last["bb20_up"] + TP_TICKS*tick)
+            rr = abs((tp-entry) / (abs(entry-sl) or 1e-12))
+            if rr >= MIN_RR: 
+                return {"side":side_ct,"regime":"counter","entry":entry,"sl":float(sl),"tp":tp,"rr":float(rr)}
 
-    denom = abs(entry - sl)
-    rr = abs((tp - entry)/denom) if denom>0 else 0.0
+    # ---- Tendance ----
+    if above80:
+        side="buy"
+        if not had_contact_last_or_prev(df,"buy"): return None
+        sl = min(prev["low"], last["low"]) - SL_ATR_CUSHION*atr
+        tp = float(last["bb80_up"] - TP_TICKS*tick)
+    else:
+        side="sell"
+        if not had_contact_last_or_prev(df,"sell"): return None
+        sl = max(prev["high"], last["high"]) + SL_ATR_CUSHION*atr
+        tp = float(last["bb80_lo"] + TP_TICKS*tick)
+
+    rr = abs((tp-entry) / (abs(entry-sl) or 1e-12))
     if rr < MIN_RR: return None
+    return {"side":side,"regime":"trend","entry":entry,"sl":float(sl),"tp":tp,"rr":float(rr)}
 
-    return {"side":side,"regime":regime,"entry":entry,"sl":sl,"tp":tp,"rr":rr,"notes":notes}
-
-# ─────────────────────────── ORDRES ───────────────────────────
-def has_open_position(ex, symbol):
+# ========================
+# ORDRES & RISK
+# ========================
+def acct_usdt_free(ex) -> float:
     try:
-        pos = ex.fetch_positions([symbol])
-        for p in pos:
-            size = float(p.get("contracts") or p.get("size") or 0)
-            if abs(size)>0: return True
-        return False
+        b = ex.fetch_balance()
+        if isinstance(b, dict) and "USDT" in b:
+            return float(b["USDT"].get("free",0) or b["USDT"].get("available",0) or 0)
+        if "free" in b and isinstance(b["free"], dict):
+            return float(b["free"].get("USDT",0))
     except Exception:
-        return False
+        pass
+    return 0.0
 
-def count_open_positions(ex):
+def qty_from_risk(entry, sl, risk_usdt):
+    diff = abs(entry-sl)
+    return max(risk_usdt / diff, 0.0) if diff>0 else 0.0
+
+# ========================
+# CSV JOURNAL
+# ========================
+def ensure_trades_csv():
+    if not os.path.exists(TRADES_CSV):
+        with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["ts","symbol","side","regime","entry","sl","tp","rr","mode"])
+
+def log_open_trade(symbol, side, regime, entry, sl, tp, rr, mode):
+    ensure_trades_csv()
+    with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([datetime.utcnow().isoformat(), symbol, side, regime, f"{entry:.8f}", f"{sl:.8f}", f"{tp:.8f}", f"{rr:.2f}", mode])
+
+# ========================
+# COMMANDES TELEGRAM
+# ========================
+ACTIVE_PAPER = {}  # id -> dict
+PAPER_SEQ = 0
+
+def poll_commands(ex):
+    global LAST_UPDATE_ID, RUNNING
+    if not TG_TOKEN or not TG_CHATID: return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
+    if LAST_UPDATE_ID is not None: url += f"?offset={LAST_UPDATE_ID+1}"
     try:
-        pos = ex.fetch_positions()
-        return sum(1 for p in pos if abs(float(p.get("contracts") or p.get("size") or 0))>0)
-    except Exception:
-        return 0
-
-def compute_qty(entry, sl, risk_amount):
-    d = abs(entry - sl)
-    return 0 if d<=0 else risk_amount / d
-
-# ─────────────────────────── NOTIFS ───────────────────────────
-def notify_signal(sym, sig):
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    side = "LONG" if sig["side"]=="buy" else "SHORT"
-    regime = "Tendance" if sig["regime"]=="trend" else "Contre-tendance"
-    bullets = "\n".join([f"• {n}" for n in sig.get("notes",[])])
-    tg_send(
-        f"📈 *Signal {'[PAPER]' if DRY_RUN else ''}* `{sym}` {side}\n"
-        f"Entrée `{sig['entry']:.6f}` | SL `{sig['sl']:.6f}` | TP `{sig['tp']:.6f}`\n"
-        f"RR x{sig['rr']:.2f}\n{bullets}"
-    )
-
-def notify_exec(sym, side, qty):
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    tg_send(f"🎯 {'PAPER ' if DRY_RUN else ''}{sym} {side.upper()} qty `{qty:.6f}`")
-
-# ─────────────────────────── TELEGRAM (minimal) ───────────────────────────
-_last_update_id = None
-def poll_tg(ex):
-    global _last_update_id
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
-        if _last_update_id is not None: url += f"?offset={_last_update_id+1}"
-        data = requests.get(url, timeout=6).json()
-        if not data.get("ok"): return
-        for upd in data.get("result", []):
-            _last_update_id = upd["update_id"]
+        res = requests.get(url, timeout=8).json()
+        if not res.get("ok"): return
+        for upd in res.get("result", []):
+            LAST_UPDATE_ID = upd["update_id"]
             msg = upd.get("message") or upd.get("edited_message")
-            if not msg or str(msg["chat"]["id"])!=str(TG_CHAT_ID): continue
-            text = (msg.get("text") or "").strip().lower()
-            if text.startswith("/start"):
+            if not msg: continue
+            if str(msg["chat"]["id"]) != str(TG_CHATID): continue
+            text = (msg.get("text") or "").strip()
+            low = text.lower()
+
+            if low.startswith("/start"):
+                tg_send("🤖 Bot lancé. Je conserve les *trades* et les *signaux du jour* (purge auto toutes les heures pour le reste). Purge des *signaux* chaque nuit.", keep=True)
+
+            elif low.startswith("/config"):
                 mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-                tg_send(f"🤖 Bot — Mode {mode} — TF {TF} — Risk {int(RISK_PER_TRADE*100)}% — RR≥{MIN_RR}")
-            elif text.startswith("/config"):
-                mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-                tg_send(f"*Config*\nMode: {mode}\nTF:{TF}\nRisk:{int(RISK_PER_TRADE*100)}%\nRR≥{MIN_RR}\nMax:{MAX_OPEN_TRADES}")
+                tg_send(f"*Config*\nMode: {mode}\nTF: {TF}\nTop: {UNIVERSE_SIZE} | Picks/h: {MAX_PER_HOUR}\nRisk: {int(RISK_PER_TRADE*100)}% | RR≥{MIN_RR}\nCSV: {TRADES_CSV}")
+
+            elif low.startswith("/stats"):
+                ensure_trades_csv()
+                try:
+                    df = pd.read_csv(TRADES_CSV)
+                    n = len(df)
+                    rr = df["rr"].astype(float).mean() if n else 0.0
+                    tg_send(f"*Stats*\nTrades loggés: {n}\nRR moyen: x{rr:.2f}")
+                except Exception:
+                    tg_send("*Stats*\nAucune donnée.")
+
+            elif low.startswith("/mode"):
+                tg_send(f"*Mode actuel*: {'PAPER' if DRY_RUN else ('LIVE' if not BITGET_TESTNET else 'TESTNET')}")
+
+            elif low.startswith("/exportcsv"):
+                try:
+                    with open(TRADES_CSV, "rb") as f:
+                        tg_send_document("trades.csv", f.read(), caption="Journal des trades")
+                except Exception:
+                    tg_send("⚠️ Pas de journal disponible.")
+
+            elif low.startswith("/orders"):
+                if DRY_RUN:
+                    if not ACTIVE_PAPER:
+                        tg_send("Aucune position (papier)."); continue
+                    lines=["*Positions (papier)*"]
+                    for pid, p in ACTIVE_PAPER.items():
+                        lines.append(f"• #{pid} {p['symbol']} {p['side']} entry {p['entry']:.6f}")
+                    tg_send("\n".join(lines))
+                else:
+                    try:
+                        pos = ex.fetch_positions()
+                        rows=[]
+                        for p in pos:
+                            size = float(p.get("contracts") or 0)
+                            if abs(size)>0:
+                                rows.append(f"• {p.get('symbol')} qty {abs(size)}")
+                        tg_send("*Positions*\n"+("\n".join(rows) if rows else "aucune"))
+                    except Exception as e:
+                        tg_send(f"⚠️ orders: {e}")
+
+            elif low.startswith("/test"):
+                if not DRY_RUN:
+                    tg_send("⚠️ /test uniquement en PAPER.")
+                    continue
+                global PAPER_SEQ
+                PAPER_SEQ += 1
+                pid = PAPER_SEQ
+                ACTIVE_PAPER[pid] = {"symbol":"BTC/USDT:USDT","side":"buy","entry":100.0}
+                tg_send(f"✅ Test: ouverture papier #{pid} BTC/USDT:USDT", kind="trade")
+
+            elif low.startswith("/closepaper"):
+                if not DRY_RUN:
+                    tg_send("⚠️ /closepaper uniquement en PAPER."); continue
+                parts = low.split()
+                if len(parts)>=2:
+                    try:
+                        pid = int(parts[1])
+                        if ACTIVE_PAPER.pop(pid, None):
+                            tg_send(f"✅ Papier fermé #{pid}")
+                        else:
+                            tg_send("⚠️ ID introuvable.")
+                    except:
+                        tg_send("Usage: /closepaper <id>")
+                else:
+                    tg_send("Usage: /closepaper <id>")
+
+            elif low.startswith("/closeallpaper"):
+                if not DRY_RUN:
+                    tg_send("⚠️ /closeallpaper uniquement en PAPER."); continue
+                n=len(ACTIVE_PAPER); ACTIVE_PAPER.clear()
+                tg_send(f"✅ Fermeture papier : {n} positions")
+
+            elif low.startswith("/pause"):
+                RUNNING = False
+                tg_send("⏸️ Pause : scan suspendu (les commandes restent actives).")
+
+            elif low.startswith("/resume"):
+                RUNNING = True
+                tg_send("▶️ Reprise : scan relancé.")
+
+            elif low.startswith("/logs"):
+                tg_send("🗒️ Logs : silencieux (anti-spam).")
+
+            elif low.startswith("/ping"):
+                tg_send("🏓 Ping ok.")
+
+            elif low.startswith("/report"):
+                tg_send("🧭 Rapport (compact) — le chat conserve *trades* et *signaux du jour*.")
+
+            elif low.startswith("/restart"):
+                tg_send("♻️ Redémarrage demandé (placeholder).")
+
+            elif low.startswith("/purge"):
+                # Nettoyage « bruit » : garde trades + signaux du *jour*
+                hourly_auto_purge()
+                tg_send("🧹 Purge: seuls *trades* et *signaux du jour* sont conservés.", keep=True)
+
+            elif low.startswith("/purgesignals"):
+                # Efface *tous* les signaux
+                purge_chat(keep_kinds=("trade","keep"), remove_signals=True)
+                tg_send("🧹 Purge *signaux* effectuée (trades conservés).", keep=True)
+
     except Exception:
         pass
 
-# ─────────────────────────── MAIN LOOP ───────────────────────────
+# ========================
+# BOUCLE PRINCIPALE
+# ========================
 def main():
     ex = create_exchange()
     universe = build_universe(ex)
-    if not universe:
-        tg_send("⚠️ Univers vide, arrêt."); return
 
-    # suivi du dernier **close** traité par symbole
-    last_closed_ts = {}
-    # signaux en attente d'exécution à l'OPEN suivant (on tolère encore 1 bougie si la 1ère open n'est pas “dans BB20”)
-    pending = {}  # sym -> {"sig":sig, "remaining_checks":2, "last_closed":ts_closed}
+    last_bar = {}       # symbole -> timestamp dernière bougie traitée
+    state = {}          # cooldown / état étendu
 
-    if TG_TOKEN and TG_CHAT_ID:
-        mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-        tg_send(f"🚀 Démarrage — {mode} — {len(universe)} marchés")
+    tg_send(f"🤖 *Bot prêt* — Mode {'PAPER' if DRY_RUN else ('LIVE' if not BITGET_TESTNET else 'TESTNET')} — TF {TF} — Top{len(universe)} — Picks/h {MAX_PER_HOUR} — RR≥{MIN_RR}", keep=True)
 
     while True:
         try:
-            poll_tg(ex)
-            open_cnt = 0 if DRY_RUN else count_open_positions(ex)
-            slots = max(0, MAX_OPEN_TRADES - open_cnt)
+            # commandes & purges
+            poll_commands(ex)
+            hourly_auto_purge()
+            nightly_signals_purge()
 
+            if not RUNNING:
+                time.sleep(3)
+                continue
+
+            picked = []
             for sym in universe:
                 try:
-                    df = fetch_ohlcv_df(ex, sym, TF, limit=220)
+                    df = fetch_ohlcv_df(ex, sym, TF, 300)
                 except Exception:
                     continue
-
-                # ts_closed = index de la DERNIÈRE bougie **fermée**
-                if len(df.index) < 3: 
+                last_ts = df.index[-1]
+                # agir uniquement à l'ouverture d'une *nouvelle* bougie H1
+                if last_bar.get(sym) == last_ts:
                     continue
-                ts_closed = df.index[-2]
+                last_bar[sym] = last_ts
 
-                # Évaluer un NOUVEAU signal uniquement quand une nouvelle bougie s’est fermée
-                if last_closed_ts.get(sym) != ts_closed:
-                    last_closed_ts[sym] = ts_closed
-                    sig = detect_signal_strict(df)
-                    if sig:
-                        notify_signal(sym, sig)
-                        pending[sym] = {"sig":sig, "remaining_checks":2, "last_closed":ts_closed}
+                sig = detect_signal(df, state, sym)
+                if sig:
+                    picked.append((sym, sig))
 
-                # Tentative d’exécution à l’OPEN suivant : la bougie -2 a changé au cycle précédent,
-                # maintenant la bougie -1 est la bougie en formation (open courant).
-                if sym in pending and slots>0:
-                    p = pending[sym]
-                    # on veut vérifier la bougie COURANTE (en formation) est bien “dans/sur BB20”
-                    cur = df.iloc[-1]
-                    in_bb20_now = (cur["close"] <= cur["bb20_up"] + 1e-12) and (cur["close"] >= cur["bb20_lo"] - 1e-12)
-                    if in_bb20_now and (not has_open_position(ex, sym)):
+            # 4 meilleurs RR
+            if picked:
+                picked.sort(key=lambda x: x[1]["rr"], reverse=True)
+                picked = picked[:MAX_PER_HOUR]
+
+                # slots réels (si non PAPER)
+                open_slots = MAX_OPEN_TRADES
+                if not DRY_RUN:
+                    try:
+                        pos = ex.fetch_positions()
+                        open_now = sum(1 for p in pos if abs(float(p.get("contracts") or 0))>0)
+                        open_slots = max(0, MAX_OPEN_TRADES - open_now)
+                    except Exception:
+                        pass
+                if not DRY_RUN and open_slots<=0:
+                    picked=[]
+
+                usdt = 1000.0 if DRY_RUN else acct_usdt_free(ex)
+                risk_usdt = max(1.0, usdt*RISK_PER_TRADE)
+
+                for sym, s in picked:
+                    qty = qty_from_risk(s["entry"], s["sl"], risk_usdt)
+                    if qty <= 0: 
+                        continue
+
+                    side_txt = "LONG" if s["side"]=="buy" else "SHORT"
+                    bullets = [
+                        "Contact bande " + ("basse BB20" if s["side"]=="buy" else "haute BB20"),
+                        "Clôture dans/sur BB20",
+                        f"RR x{s['rr']:.2f} (≥ {MIN_RR})",
+                        "Tendance" if s["regime"]=="trend" else "Contre-tendance"
+                    ]
+                    tg_send(
+                        f"📈 *Signal {'[PAPER]' if DRY_RUN else ''}* `{sym}` {side_txt}\n"
+                        f"Entrée `{s['entry']:.6f}` | SL `{s['sl']:.6f}` | TP `{s['tp']:.6f}`\n" +
+                        "\n".join([f"• {b}" for b in bullets]),
+                        kind="signal"
+                    )
+
+                    if DRY_RUN:
+                        tg_send(f"🎯 *PAPER* {sym} {'BUY' if s['side']=='buy' else 'SELL'} @{s['entry']:.6f}  RR={s['rr']:.2f}", kind="trade")
+                        log_open_trade(sym, s["side"], s["regime"], s["entry"], s["sl"], s["tp"], s["rr"], "paper")
+                    else:
                         try:
-                            bal = ex.fetch_balance()
-                            usdt = float(bal.get("USDT",{}).get("free",0)) if not DRY_RUN else 1000.0
-                        except Exception:
-                            usdt = 1000.0 if DRY_RUN else 0.0
-                        risk = max(1.0, usdt*RISK_PER_TRADE)
-                        qty = compute_qty(p["sig"]["entry"], p["sig"]["sl"], risk)
-                        if qty>0:
-                            if not DRY_RUN:
-                                ex.create_order(sym, "market", p["sig"]["side"], qty)
-                            notify_exec(sym, p["sig"]["side"], qty)
-                            slots -= 1
-                            del pending[sym]
-                            continue
-                    # sinon on retente encore 1 bougie
-                    p["remaining_checks"] -= 1
-                    if p["remaining_checks"] <= 0:
-                        del pending[sym]
+                            ex.create_order(sym, "market", s["side"], qty)
+                            opp = "sell" if s["side"]=="buy" else "buy"
+                            ex.create_order(sym, "stop", opp, qty, params={"stopPrice": s["sl"], "reduceOnly": True})
+                            ex.create_order(sym, "limit", opp, qty, price=s["tp"], params={"reduceOnly": True})
+                            tg_send(f"✅ {sym} {side_txt} @{s['entry']:.6f}  RR≈{s['rr']:.2f}", kind="trade")
+                            log_open_trade(sym, s["side"], s["regime"], s["entry"], s["sl"], s["tp"], s["rr"], "real")
+                        except Exception as e:
+                            tg_send(f"⚠️ {sym} ordre échoué : {e}", kind="error")
 
-            time.sleep(LOOP_DELAY)
+            time.sleep(4)
 
         except KeyboardInterrupt:
-            tg_send("⛔ Arrêt manuel."); break
+            tg_send("⛔ Arrêt manuel.", keep=True); break
         except Exception as e:
-            try: tg_send(f"⚠️ Loop error: {e}")
-            except: pass
+            tg_send(f"🚨 Loop error: {e}", kind="error")
             time.sleep(5)
 
 if __name__ == "__main__":
