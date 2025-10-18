@@ -772,7 +772,6 @@ def cmd_order(exchange, text):
             tp = float(last["bb_slow_lower"]) + 2*tick
         api_side = "sell"
 
-    # taille
     try:
         usdt = 1000.0 if DRY_RUN else float(exchange.fetch_balance().get("USDT", {}).get("free", 0))
     except Exception:
@@ -789,7 +788,7 @@ def cmd_order(exchange, text):
             "entry":f"{entry:.6f}","sl":f"{sl:.6f}","tp":f"{tp:.6f}",
             "risk_pct":f"{risk:.6f}","leverage":str(MAX_LEVERAGE),"qty":f"{qty:.6f}","status":"OPEN"
         })
-        tg_send(f"🧪 PAPER ORDER {symbol} {side_h.upper()} entry {entry:.2f} SL {sl:.2f} TP {tp:.2f} qty {qty}")
+        tg_send(f"🧪 PAPER ORDER {symbol} {side_h.UPPER()} entry {entry:.2f} SL {sl:.2f} TP {tp:.2f} qty {qty}")
     else:
         try:
             place_market(exchange, symbol, api_side, qty)
