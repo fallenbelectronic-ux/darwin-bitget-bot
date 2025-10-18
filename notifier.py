@@ -39,6 +39,6 @@ def tg_send_document(path: str, caption: str = ""):
         print("[TG DOC ERR]", e, path)
 
 def tg_send_codeblock(lines):
-    """Petit helper pour envoyer un bloc de code monospace."""
+    """Envoie un bloc de code formaté."""
     text = "```\n" + "\n".join(lines) + "\n```"
     tg_send(text)
