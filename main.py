@@ -10,34 +10,29 @@ from notifier import tg_send
 load_dotenv()
 
 # =======================
-# ENV / PARAMÈTRES GÉNÉRAUX
+# ENV
 # =======================
 BITGET_TESTNET = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
 API_KEY       = os.getenv("BITGET_API_KEY")
 API_SECRET    = os.getenv("BITGET_API_SECRET")
 PASSPHRASE    = os.getenv("BITGET_API_PASSWORD") or os.getenv("BITGET_PASSPHRASE")
 
-TF                 = os.getenv("TIMEFRAME", "1h")                 # 1H unique
-RISK_PER_TRADE     = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1%
-MIN_RR             = float(os.getenv("MIN_RR", "3"))              # RR mini 1:3
+TF                 = os.getenv("TIMEFRAME", "1h")
+RISK_PER_TRADE     = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1 %
+MIN_RR             = float(os.getenv("MIN_RR", "3"))
 MAX_OPEN_TRADES    = int(os.getenv("MAX_OPEN_TRADES", "4"))
 LOOP_DELAY         = int(os.getenv("LOOP_DELAY", "5"))
-
 UNIVERSE_SIZE      = int(os.getenv("UNIVERSE_SIZE", "100"))
 
 ATR_WINDOW         = 14
 SL_ATR_CUSHION     = 0.25
 
+# vitesse (réaction rapide en tendance)
 QUICK_BARS         = 3
-QUICK_PROGRESS     = 0.30
+QUICK_PROGRESS     = 0.30  # +30% de la distance TP en <= QUICK_BARS bougies
 
-# =========== TESTNET SAFE ===========
-FALLBACK_TESTNET = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "XRP/USDT:USDT",
-]
-# ====================================
+# Testnet de secours
+FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"]
 
 # =======================
 # EXCHANGE
@@ -61,7 +56,7 @@ def create_exchange():
     return ex
 
 # =======================
-# UTILITAIRES
+# OUTILS
 # =======================
 def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
     raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -69,11 +64,13 @@ def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     df.set_index("ts", inplace=True)
 
+    # BB blanche: 20 / 2
     bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
     df["bb20_mid"] = bb20.bollinger_mavg()
     df["bb20_up"]  = bb20.bollinger_hband()
     df["bb20_lo"]  = bb20.bollinger_lband()
 
+    # BB jaune: 80 / 2
     bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
     df["bb80_mid"] = bb80.bollinger_mavg()
     df["bb80_up"]  = bb80.bollinger_hband()
@@ -83,9 +80,6 @@ def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
     df["atr"] = atr.average_true_range()
     return df
 
-# =======================
-# UNIVERS
-# =======================
 def filter_working_symbols(ex, symbols, timeframe="1h"):
     ok = []
     for s in symbols:
@@ -146,30 +140,75 @@ def build_universe(ex):
     return universe
 
 # =======================
-# DÉTECTION
+# DÉTECTION — règles Darwin H1
 # =======================
-def detect_signal(df):
+def prolonged_double_exit(df, lookback=6):
+    """
+    Vrai s’il y a eu >= 3 bougies consécutives *à l’extérieur des 2 bornes en même temps*,
+    i.e. high>bb20_up & >bb80_up OU low<bb20_lo & <bb80_lo.
+    Sert à sauter le *premier* signal après une longue sortie (consigne PDF).
+    """
+    streak = 0
+    out_side = None
+    for i in range(-lookback-3, -1):  # parcourt un peu avant
+        row = df.iloc[i]
+        up_both = (row["high"] >= row["bb20_up"]) and (row["high"] >= row["bb80_up"])
+        lo_both = (row["low"]  <= row["bb20_lo"]) and (row["low"]  <= row["bb80_lo"])
+        if up_both:
+            if out_side in (None, "up"):
+                streak += 1; out_side = "up"
+            else:
+                streak = 1; out_side = "up"
+        elif lo_both:
+            if out_side in (None, "down"):
+                streak += 1; out_side = "down"
+            else:
+                streak = 1; out_side = "down"
+        else:
+            streak = 0; out_side = None
+    return streak >= 3
+
+def detect_signal(df, skip_first_after_prolonged=True, state=None, sym=None):
+    """
+    Retourne un dict {side, regime, entry, sl, tp, rr, notes[]} ou None
+    """
     if len(df) < 3:
         return None
-    last, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    last, prev = df.iloc[-1], df.iloc[-2]
 
+    notes = []
     above80 = last["close"] >= last["bb80_mid"]
-
-    # Réintégration (contact/travers + clôture à l'intérieur) sur BB blanche, UT 1H
+    # règles “contact/travers + réintégration” sur BB blanche (1H)
     reinteg_long  = (prev["low"]  <= min(prev["bb20_lo"], prev["bb80_lo"])) and (last["close"] > last["bb20_lo"])
     reinteg_short = (prev["high"] >= max(prev["bb20_up"], prev["bb80_up"])) and (last["close"] < last["bb20_up"])
 
     long_trend  =  above80 and reinteg_long
     short_trend = (not above80) and reinteg_short
 
+    # gestion “ne pas prendre le premier trade après sortie prolongée”
+    if skip_first_after_prolonged and state is not None and sym is not None:
+        if state.get(sym, {}).get("cooldown", False) is True:
+            notes.append("⏳ 1er signal après *sortie prolongée* — *skippé*")
+            state[sym]["cooldown"] = False  # ne skippe qu'une fois
+            return None
+        # détecte une sortie prolongée en cours → armer le cooldown
+        if prolonged_double_exit(df):
+            st = state.setdefault(sym, {})
+            st["cooldown"] = True
+            notes.append("⚠️ *Sortie prolongée* détectée — prochain signal sera ignoré")
+            # on ne déclenche pas un trade *sur* la barre de sortie prolongée
+            return None
+
     if long_trend:
         side, regime = "buy", "trend"
+        notes.append("Au-dessus MM *BB80* + réintégration *BB20 basse*")
     elif short_trend:
         side, regime = "sell", "trend"
+        notes.append("Sous MM *BB80* + réintégration *BB20 haute*")
     elif reinteg_long:
-        side, regime = "buy", "counter"
+        side, regime = "buy", "counter"; notes.append("Contre-tendance : réintégration *BB20 basse*")
     elif reinteg_short:
-        side, regime = "sell", "counter"
+        side, regime = "sell", "counter"; notes.append("Contre-tendance : réintégration *BB20 haute*")
     else:
         return None
 
@@ -186,10 +225,10 @@ def detect_signal(df):
     if rr < MIN_RR:
         return None
 
-    return {"side": side, "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+    return {"side": side, "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr, "notes": notes}
 
 # =======================
-# POSITIONS / MONEY MGMT
+# POSITIONS & MONEY MGMT
 # =======================
 def has_open_position(ex, symbol):
     try:
@@ -218,50 +257,58 @@ def compute_qty(entry, sl, risk_amount):
 def notify_signal(symbol, sig):
     regime_emoji = "📈" if sig["regime"] == "trend" else "🔄"
     side_txt = "LONG" if sig["side"] == "buy" else "SHORT"
+    bullet = "\n".join([f"• {n}" for n in sig.get("notes", [])])
     msg = (
-        f"{regime_emoji} *Signal* {symbol} {side_txt}\n"
-        f"Entrée ~ {sig['entry']:.4f}\n"
-        f"SL ~ {sig['sl']:.4f}\n"
-        f"TP ~ {sig['tp']:.4f}\n"
-        f"RR {sig['rr']:.2f}"
+        f"{regime_emoji} *Signal* `{symbol}` {side_txt}\n"
+        f"Entrée ~ `{sig['entry']:.4f}`  |  SL ~ `{sig['sl']:.4f}`  |  TP ~ `{sig['tp']:.4f}`\n"
+        f"RR `x{sig['rr']:.2f}`\n{bullet}"
     )
     tg_send(msg)
 
-def notify_order_ok(symbol, side, qty):
+def notify_order_ok(symbol, side, qty, be_rule=None, tp_rule=None):
     side_txt = "LONG" if side == "buy" else "SHORT"
-    tg_send(f"🎯 *Trade exécuté* {symbol} {side_txt}\nTaille : {qty:.6f}")
+    lines = [f"🎯 *Trade exécuté* `{symbol}` {side_txt}\nTaille : `{qty:.6f}`"]
+    if be_rule: lines.append(f"• BE : {be_rule}")
+    if tp_rule: lines.append(f"• TP : {tp_rule}")
+    tg_send("\n".join(lines))
 
 def notify_error(context, err):
-    tg_send(f"⚠️ *Erreur* ({context})\n{err}")
+    tg_send(f"⚠️ *Erreur* `{context}`\n{err}")
 
 # =======================
-# MAIN LOOP
+# MAIN
 # =======================
 def main():
     ex = create_exchange()
     tg_send(f"🔔 Bot démarré — H1 — Risk {int(RISK_PER_TRADE*100)}% — RR≥{MIN_RR}")
     universe = build_universe(ex)
-    valid_set = set(universe)
+    valid = set(universe)
+
+    # état par symbole (cooldown sortie prolongée)
+    state = {}
 
     last_ts_seen = {}
     while True:
         try:
             for sym in list(universe):
-                if sym not in valid_set:
+                if sym not in valid:
                     continue
 
+                # OHLCV
                 try:
                     df = fetch_ohlcv_df(ex, sym, TF, 300)
                 except Exception as e:
                     print("[WARN] fetch_ohlcv:", e)
                     continue
 
+                # anti-double lecture même bougie
                 last_ts = df.index[-1]
                 if last_ts_seen.get(sym) == last_ts:
                     continue
                 last_ts_seen[sym] = last_ts
 
-                sig = detect_signal(df)
+                # signal
+                sig = detect_signal(df, skip_first_after_prolonged=True, state=state, sym=sym)
                 if not sig:
                     continue
 
@@ -273,20 +320,30 @@ def main():
                 print(f"[SIGNAL] {sym} {sig['side']} {sig['regime']} RR={sig['rr']:.2f}")
                 notify_signal(sym, sig)
 
+                # Taille
                 try:
                     bal = ex.fetch_balance()
                     usdt = float(bal.get("USDT", {}).get("free", 0))
                 except Exception:
                     usdt = 0.0
-
                 risk_amt = max(1.0, usdt * RISK_PER_TRADE)
                 qty = compute_qty(sig["entry"], sig["sl"], risk_amt)
                 if qty <= 0:
                     continue
 
+                # Règles MM -> info Telegram
+                be_rule = None; tp_rule = None
+                if sig["regime"] == "trend":
+                    be_rule = "Pas de BE si réaction rapide ; sinon *50%* pris à la *MM BB20* (pas de BE)."
+                    tp_rule = "TP dynamique sur *BB80 opposée* (ajusté quelques ticks)."
+                else:
+                    be_rule = "BE à la *MM BB20* après entrée."
+                    tp_rule = "TP sur *borne BB20 opposée* (ajusté quelques ticks)."
+
+                # Ordre au marché (testnet recommandé)
                 try:
                     ex.create_order(sym, "market", sig["side"], qty)
-                    notify_order_ok(sym, sig["side"], qty)
+                    notify_order_ok(sym, sig["side"], qty, be_rule=be_rule, tp_rule=tp_rule)
                 except Exception as e:
                     print("[ERROR] order:", e)
                     notify_error("order", e)
