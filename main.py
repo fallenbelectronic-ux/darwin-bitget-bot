@@ -150,4 +150,402 @@ def build_universe(ex):
     # 3) Si volumes, trier & prendre Top N
     if rows:
         df = pd.DataFrame(rows, columns=["symbol", "volume"]).sort_values("volume", ascending=False)
-        universe = df.head(UNIVERSE_SIZE)["]()_
+        universe = df.head(UNIVERSE_SIZE)["symbol"].tolist()
+        # Log top 10
+        head10 = df.head(10).copy()
+        head10["volume"] = head10["volume"].round(0).astype(int)
+        preview = ", ".join([f"{r.symbol}:{r.volume}" for r in head10.itertuples(index=False)])
+        print(f"[UNIVERSE] size={len(universe)} (ranked by 24h volume)")
+        print(f"[UNIVERSE] top10: {preview}")
+        tg_send(f"📊 Univers LIVE top10: {preview}")
+        return universe
+
+    # 4) Pas de volume (testnet) => fallback
+    print("[UNIVERSE] empty after volume filter, using fallback list (testnet)")
+    if candidates:
+        fb = [s for s in FALLBACK_TESTNET if s in candidates] or FALLBACK_TESTNET
+    else:
+        fb = FALLBACK_TESTNET
+    universe = fb[:max(1, min(UNIVERSE_SIZE, len(fb)))]
+    print(f"[UNIVERSE] size={len(universe)} (fallback)")
+    print(f"[UNIVERSE] list: {', '.join(universe)}")
+    tg_send(f"🧪 Univers TESTNET: {', '.join(universe)}")
+    return universe
+
+# =======================
+# DÉTECTION (fenêtre 1–2 barres) + traversée prolongée
+# =======================
+def count_prolonged_extreme(df, side):
+    """Nombre de barres consécutives avec prix au-delà des 2 bandes (BB20 & BB80) AVANT la bougie de signal."""
+    cnt = 0
+    idx = -2
+    while abs(idx) <= len(df):
+        r = df.iloc[idx]
+        if side == "buy":
+            outside = (r["low"] <= min(r["bb_fast_lower"], r["bb_slow_lower"]))
+        else:
+            outside = (r["high"] >= max(r["bb_fast_upper"], r["bb_slow_upper"]))
+        if outside:
+            cnt += 1
+            idx -= 1
+        else:
+            break
+    return cnt
+
+def detect_signal(df):
+    """
+    Retourne None ou dict {side, regime, entry, stop, tp, rr, atr, entry_delay_bars}
+    - fenêtre 1–2 barres pour la réintégration
+    - entrée à l’ouverture de la bougie suivante
+    - si traversée prolongée (>=2 barres) -> entry_delay_bars=1 (on saute la 1ʳᵉ opportunité)
+    """
+    if len(df) < 3:
+        return None
+    last  = df.iloc[-1]   # bougie qui vient de clore
+    prev  = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    above_slow_mid = last["close"] >= last["bb_slow_mid"]
+
+    # Réintégrations (1 ou 2 bougies)
+    reinteg_long_1  = (prev["low"]  <= min(prev["bb_fast_lower"], prev["bb_slow_lower"])) and (last["close"] > last["bb_fast_lower"])
+    reinteg_short_1 = (prev["high"] >= max(prev["bb_fast_upper"], prev["bb_slow_upper"])) and (last["close"] < last["bb_fast_upper"])
+    reinteg_long_2  = (prev2["low"]  <= min(prev2["bb_fast_lower"], prev2["bb_slow_lower"])) and (last["close"] > last["bb_fast_lower"])
+    reinteg_short_2 = (prev2["high"] >= max(prev2["bb_fast_upper"], prev2["bb_slow_upper"])) and (last["close"] < last["bb_fast_upper"])
+
+    # Tendance (1–2 barres)
+    long_trend  = (above_slow_mid and ((prev["low"] <= prev["bb_fast_lower"]) or (prev2["low"] <= prev2["bb_fast_lower"])) and (last["close"] > last["bb_fast_lower"]))
+    short_trend = ((not above_slow_mid) and ((prev["high"] >= prev["bb_fast_upper"]) or (prev2["high"] >= prev2["bb_fast_upper"])) and (last["close"] < last["bb_fast_upper"]))
+
+    # Contre-tendance = double extrême + réintégration
+    long_ct  = reinteg_long_1 or reinteg_long_2
+    short_ct = reinteg_short_1 or reinteg_short_2
+
+    side = regime = None
+    if long_trend:
+        side, regime = "buy", "trend"
+    elif short_trend:
+        side, regime = "sell", "trend"
+    elif long_ct:
+        side, regime = "buy", "counter"
+    elif short_ct:
+        side, regime = "sell", "counter"
+    else:
+        return None
+
+    entry  = float(last["close"])  # référence; l'entrée réelle = open de la suivante
+    atr    = float(last["atr"])
+    tick   = max(entry * 0.0001, 0.01)
+
+    # SL mèche +/- cushion ATR
+    if side == "buy":
+        raw_sl = float(last["low"]) - 2 * tick
+        sl = min(raw_sl, float(prev["low"])) - SL_ATR_CUSHION * atr
+    else:
+        raw_sl = float(last["high"]) + 2 * tick
+        sl = max(raw_sl, float(prev["high"])) + SL_ATR_CUSHION * atr
+
+    # TP théorique
+    if regime == "trend":
+        tp = float(last["bb_slow_upper"] if side == "buy" else last["bb_slow_lower"])
+    else:
+        tp = float(last["bb_fast_upper"] if side == "buy" else last["bb_fast_lower"])
+
+    denom = abs(entry - sl)
+    rr = abs((tp - entry) / denom) if denom > 0 else 0.0
+    if rr < MIN_RR:
+        return None
+
+    # traversée prolongée -> retarder l’entrée d’1 barre
+    ext_cnt = count_prolonged_extreme(df, side)
+    entry_delay_bars = 1 if ext_cnt >= 2 else 0
+
+    return {
+        "side": side, "regime": regime,
+        "entry": entry, "stop": sl, "tp": tp, "rr": rr, "atr": atr,
+        "entry_delay_bars": entry_delay_bars
+    }
+
+# =======================
+# POSITION / ORDRES
+# =======================
+def count_open_positions(ex):
+    try:
+        pos = ex.fetch_positions()
+        n = 0
+        for p in pos:
+            size = float(p.get("contracts") or p.get("size") or 0)
+            if abs(size) > 0:
+                n += 1
+        return n
+    except Exception as e:
+        print("[WARN] fetch_positions:", e)
+        return 0
+
+def has_open_position(ex, symbol):
+    try:
+        pos = ex.fetch_positions([symbol])
+        for p in pos:
+            size = float(p.get("contracts") or p.get("size") or 0)
+            if abs(size) > 0:
+                return True
+        return False
+    except Exception:
+        return False
+
+def compute_qty(entry, sl, risk_amount):
+    diff = abs(entry - sl)
+    if diff <= 0:
+        return 0.0
+    return float(risk_amount / diff)
+
+def place_market(ex, symbol, side, qty):
+    return ex.create_order(symbol, "market", side, qty)
+
+# =======================
+# GESTION POST-ENTRÉE
+# =======================
+def get_tick(price):
+    return max(price * 0.0001, 0.01)
+
+def latest_bands(ex, symbol):
+    df = fetch_ohlcv_df(ex, symbol, TF, limit=120)
+    last = df.iloc[-1]
+    return {
+        "fast_mid":  float(last["bb_fast_mid"]),
+        "fast_up":   float(last["bb_fast_upper"]),
+        "fast_lo":   float(last["bb_fast_lower"]),
+        "slow_mid":  float(last["bb_slow_mid"]),
+        "slow_up":   float(last["bb_slow_upper"]),
+        "slow_lo":   float(last["bb_slow_lower"]),
+    }
+
+def manage_trend(ex, symbol, side, entry, sl, tp_init, qty):
+    """
+    Tendance :
+    - Si réaction RAPIDE (>=30% du chemin en <=3 barres) -> pas de BE, on laisse courir
+    - Si réaction LENTE -> 50% sur MM(BB20) (sans BE), reste sur BB80 opposée
+    - TP dynamiques ± ticks
+    """
+    try:
+        px = ex.fetch_ticker(symbol)["last"]
+    except Exception:
+        px = entry
+    tick = get_tick(px)
+
+    # TP principal (BB80 opposée ± offset)
+    b = latest_bands(ex, symbol)
+    if side == "buy":
+        tp80 = b["slow_up"] - 2 * tick
+    else:
+        tp80 = b["slow_lo"] + 2 * tick
+
+    # Place TP global 100% (on ajustera avec un partiel si lent)
+    try:
+        ex.create_order(symbol, "limit", "sell" if side == "buy" else "buy", qty, tp80, {"reduceOnly": True})
+    except Exception as e:
+        print("[WARN] place TP80:", e)
+
+    # SL initial
+    try:
+        ex.create_order(symbol, "stop_market", "sell" if side == "buy" else "buy", qty, None,
+                        {"stopPrice": sl, "reduceOnly": True})
+    except Exception as e:
+        print("[WARN] place SL:", e)
+
+    bars = 0
+    progressed = 0.0
+    dist_total = abs(tp80 - entry) if tp80 and entry else 0.0
+    took_half = False
+
+    while True:
+        time.sleep(LOOP_DELAY)
+        try:
+            px = ex.fetch_ticker(symbol)["last"]
+        except Exception:
+            continue
+
+        prog = abs(px - entry)
+        if dist_total > 0:
+            progressed = max(progressed, prog / dist_total)
+
+        bars += 1
+
+        # Réaction lente après QUICK_BARS
+        if (not took_half) and (bars > QUICK_BARS) and (progressed < QUICK_PROGRESS):
+            b = latest_bands(ex, symbol)
+            tp_mid = (b["fast_mid"] - 1 * tick) if side == "buy" else (b["fast_mid"] + 1 * tick)
+            try:
+                ex.create_order(symbol, "limit", "sell" if side == "buy" else "buy", max(qty * 0.5, 0.000001),
+                                tp_mid, {"reduceOnly": True})
+                tg_send(f"🟨 {symbol} tendance: 50% pris sur MM(BB20), pas de BE")
+                took_half = True
+            except Exception as e:
+                print("[WARN] place 50% mid:", e)
+
+        # Ajuste légèrement le TP80 (rafraîchi périodiquement)
+        if bars % 6 == 0:  # ~30s si LOOP_DELAY=5
+            b = latest_bands(ex, symbol)
+            tp80 = (b["slow_up"] - 2 * tick) if side == "buy" else (b["slow_lo"] + 2 * tick)
+
+        if not has_open_position(ex, symbol):
+            tg_send(f"✅ Position clôturée {symbol} (tendance)")
+            break
+
+def manage_counter(ex, symbol, side, entry, sl, qty):
+    """
+    Contre-tendance :
+    - BE = stop sur MM(BB20) (stop “suiveur” sur la moyenne blanche)
+    - TP = borne blanche opposée ± ticks
+    """
+    tick = get_tick(entry)
+
+    # SL initial (sera déplacé niveau BE=MM blanche)
+    try:
+        ex.create_order(symbol, "stop_market", "sell" if side == "buy" else "buy", qty, None,
+                        {"stopPrice": sl, "reduceOnly": True})
+    except Exception as e:
+        print("[WARN] place SL:", e)
+
+    while True:
+        time.sleep(LOOP_DELAY)
+        b = latest_bands(ex, symbol)
+
+        # BE = MM(BB20)
+        be_stop = b["fast_mid"]
+        try:
+            ex.create_order(symbol, "stop_market", "sell" if side == "buy" else "buy", qty, None,
+                            {"stopPrice": be_stop, "reduceOnly": True})
+        except Exception as e:
+            print("[WARN] move BE to fast_mid:", e)
+
+        # TP = borne blanche opposée ± ticks
+        if side == "buy":
+            tp_fast = b["fast_up"] - 2 * tick
+        else:
+            tp_fast = b["fast_lo"] + 2 * tick
+
+        try:
+            ex.create_order(symbol, "limit", "sell" if side == "buy" else "buy", qty, tp_fast, {"reduceOnly": True})
+        except Exception as e:
+            print("[WARN] place TP fast:", e)
+
+        if not has_open_position(ex, symbol):
+            tg_send(f"✅ Position clôturée {symbol} (contre-tendance)")
+            break
+
+# =======================
+# MAIN LOOP (entrées à l’ouverture)
+# =======================
+def main():
+    ex = create_exchange()
+    tg_send(f"🤖 Darwin H1 — BB20/2 & BB80/2 — Risk {int(RISK_PER_TRADE*100)}% — RR min {MIN_RR}")
+
+    if not API_KEY or not API_SECRET or not PASSPHRASE:
+        print("[FATAL] Missing API keys")
+        tg_send("❌ BITGET_API_* manquantes")
+        return
+
+    # léger délai de démarrage
+    time.sleep(3)
+
+    universe = build_universe(ex)
+    last_bar_time = {}      # dernière clôture vue par symbole
+    pending = {}            # {symbol: {"wait": n_bars, "ref_ts": last_ts, "sig": sig}}
+    pyramided = {}
+
+    while True:
+        try:
+            # solde USDT
+            try:
+                bal = ex.fetch_balance()
+                usdt_free = 0.0
+                if isinstance(bal, dict):
+                    if "USDT" in bal:
+                        usdt_free = float(bal["USDT"].get("free", 0) or bal["USDT"].get("available", 0))
+                    elif "free" in bal and isinstance(bal["free"], dict):
+                        usdt_free = float(bal["free"].get("USDT", 0))
+            except Exception as e:
+                print("[WARN] fetch_balance:", e)
+                usdt_free = 0.0
+
+            open_cnt = count_open_positions(ex)
+            slots = max(0, MAX_OPEN_TRADES - open_cnt)
+
+            if not universe:
+                universe = build_universe(ex)
+
+            # Détection: uniquement à la CLÔTURE d’une nouvelle bougie H1
+            for sym in universe:
+                try:
+                    df = fetch_ohlcv_df(ex, sym, TF, limit=300)
+                    last_ts = df.index[-1]
+                    # 1) Décrément des pending UNIQUEMENT quand une nouvelle bougie s'est close
+                    if sym in pending:
+                        p = pending[sym]
+                        if p["ref_ts"] != last_ts:
+                            p["wait"] -= 1
+                            p["ref_ts"] = last_ts
+                    # 2) Nouveau signal ?
+                    if last_bar_time.get(sym) != last_ts:
+                        last_bar_time[sym] = last_ts
+                        sig = detect_signal(df)
+                        if sig:
+                            enter_after = 1 + sig["entry_delay_bars"]
+                            pending[sym] = {"wait": enter_after, "ref_ts": last_ts, "sig": sig}
+                            print(f"[SIGNAL] {sym} {sig['side']} ({sig['regime']}) RR={sig['rr']:.2f} wait={enter_after}")
+                except Exception as e:
+                    print(f"[ERROR] scan {sym}:", e)
+
+            # Entrées à l’OUVERTURE (quand wait == 0)
+            to_delete = []
+            for sym, p in pending.items():
+                if p["wait"] > 0:
+                    continue
+                if slots <= 0:
+                    continue
+                if has_open_position(ex, sym):
+                    to_delete.append(sym)
+                    continue
+
+                s = p["sig"]
+                risk_amount = max(1.0, usdt_free * RISK_PER_TRADE)
+                qty = round(compute_qty(s["entry"], s["stop"], risk_amount), 6)
+                if qty <= 0:
+                    to_delete.append(sym)
+                    continue
+
+                try:
+                    place_market(ex, sym, s["side"], qty)
+                    tg_send(f"✅ {sym} {s['side'].upper()} @{s['entry']:.4f} RR={s['rr']:.2f} ({s['regime']})")
+                    slots -= 1
+                except Exception as e:
+                    print("[ERROR] market:", e)
+                    tg_send(f"⚠️ Ordre market échoué {sym}: {e}")
+                    to_delete.append(sym)
+                    continue
+
+                # Gestion post-entrée
+                if s["regime"] == "trend":
+                    manage_trend(ex, sym, s["side"], s["entry"], s["stop"], s["tp"], qty)
+                else:
+                    manage_counter(ex, sym, s["side"], s["entry"], s["stop"], qty)
+
+                to_delete.append(sym)
+
+            for sym in to_delete:
+                pending.pop(sym, None)
+
+            time.sleep(LOOP_DELAY)
+
+        except KeyboardInterrupt:
+            print("Stopped by user")
+            tg_send("⛔ Arrêt manuel du bot")
+            break
+        except Exception as e:
+            print("[FATAL LOOP ERROR]", e)
+            tg_send(f"🚨 Fatal: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
