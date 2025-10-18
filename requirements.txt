@@ -1,0 +1,6 @@
+ccxt==3.*
+pandas
+numpy
+ta
+python-dotenv
+requests
