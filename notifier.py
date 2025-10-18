@@ -1,23 +1,21 @@
 import os
 import requests
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def tg_send(text: str):
-    """Envoie un message Markdown à Telegram (ne fait rien si non configuré)."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[NOTIFIER] Telegram not configured.")
+def tg_send(text):
+    if not TOKEN or not CHAT_ID:
+        print("[NOTIFIER] Telegram non configuré.")
         return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown"
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
         }
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print("[NOTIFIER] Telegram send failed:", r.status_code, r.text)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print("[NOTIFIER] Exception sending telegram:", e)
+        print("[NOTIFIER] error:", e)
