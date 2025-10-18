@@ -1,6 +1,6 @@
-ccxt==3.*
-pandas
-numpy
-ta
-python-dotenv
-requests
+ccxt==4.3.59
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv==1.0.1
+ta==0.10.2
+requests==2.32.3
