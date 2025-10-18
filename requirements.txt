@@ -1,14 +1,6 @@
-# Core trading/exchange
-ccxt>=4.0.0,<5
-
-# Data & indicators
-pandas>=2.1,<3
-numpy>=1.26,<2
-ta==0.11.0
-
-# Env & utils
-python-dotenv>=1.0.0
-requests>=2.31.0
-
-# (optionnel mais utile sur certaines plateformes)
-ujson>=5.8.0
+ccxt
+pandas
+numpy
+ta
+python-dotenv
+requests
