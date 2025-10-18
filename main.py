@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from notifier import tg_send, purge_chat, nightly_signals_purge  # <- requis
+from notifier import tg_send, purge_chat, nightly_signals_purge  # /purge et purge nocturne
 
 load_dotenv()
 
@@ -30,13 +30,16 @@ LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
 TZ               = os.getenv("TIMEZONE", "Europe/Lisbon")
 DRY_RUN          = os.getenv("DRY_RUN", "true").lower() in ("1","true","yes")
 
-# MM / SL
+# SL / MM
 ATR_WINDOW       = 14
 SL_ATR_CUSHION   = 0.25
 
 # Prolonged double exit
-PROLONGED_MIN_BARS = 4   # ≥ 4 barres hors des 2 BB
-# Si la réintégration se fait "dans" les BB, elle ne compte pas comme 4e barre
+PROLONGED_MIN_BARS = 4   # ≥ 4 barres hors des 2 BB (la bougie de réintégration dans BB ne compte pas)
+
+# Intrabar (papier) – tendance lente = partiel 50% si progression < 30% après ~3h
+QUICK_BARS       = 3
+QUICK_PROGRESS   = 0.30
 
 TRADES_CSV       = os.getenv("TRADES_CSV", "/app/trades.csv")
 
@@ -55,17 +58,11 @@ def create_exchange():
     return ex
 
 def try_set_leverage(ex, symbol, leverage=2, mode="cross"):
-    """
-    Applique levier 2x cross si possible, sans spammer de logs.
-    """
     try:
-        params = {}
-        if hasattr(ex, "private_mix_post_order_margin_mode"):
-            # ccxt unifie: set_margin_mode / set_leverage
-            try:
-                ex.set_margin_mode(mode, symbol, params={})
-            except Exception:
-                pass
+        try:
+            ex.set_margin_mode(mode, symbol, params={})
+        except Exception:
+            pass
         try:
             ex.set_leverage(leverage, symbol, params={})
         except Exception:
@@ -91,13 +88,12 @@ def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
     df["bb20_up"]  = bb_fast.bollinger_hband()
     df["bb20_lo"]  = bb_fast.bollinger_lband()
 
-    # BB 80/2 (jaune)
+    # BB 80/2 (jaune) = 4x H1 (équivalent 4H compressé)
     bb_slow = BollingerBands(close=df["close"], window=80, window_dev=2)
     df["bb80_mid"] = bb_slow.bollinger_mavg()
     df["bb80_up"]  = bb_slow.bollinger_hband()
     df["bb80_lo"]  = bb_slow.bollinger_lband()
 
-    # ATR
     atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=ATR_WINDOW)
     df["atr"] = atr.average_true_range()
 
@@ -150,11 +146,6 @@ def build_universe(ex):
 # OUTILS DETECTION
 # =========================
 def _contact_last2(df, side, band="bb20"):
-    """
-    Contact/traversée sur la bougie précédente ou l'avant-dernière.
-    band: 'bb20' ou 'bb80'
-    side: 'buy' (contact basse) / 'sell' (contact haute)
-    """
     if len(df) < 3: 
         return False
     prev  = df.iloc[-2]
@@ -176,21 +167,14 @@ def _close_inside_bb20(candle):
     return (candle["close"] <= candle["bb20_up"]) and (candle["close"] >= candle["bb20_lo"])
 
 def _reaction_pattern(prev, last, side):
-    """
-    Simplifiée: 'fort' si la bougie de signal est directionnelle (marubozu-ish / meche courte côté entrée)
-    ou mèche de rejet sur la bande touchée. On reste volontairement strict.
-    """
     body = abs(last["close"] - last["open"])
     range_ = last["high"] - last["low"]
     if range_ <= 0: 
         return False
     body_ratio = body / range_
-    # seuils raisonnables
     if body_ratio >= 0.55:
         return True
-    # mèche de rejet côté bande
     if side=="buy":
-        # longue mèche basse sur prev ou last
         lower_wick = min(prev["open"], prev["close"]) - prev["low"]
         lower_wick2= min(last["open"], last["close"]) - last["low"]
         return (lower_wick/range_ >= 0.35) or (lower_wick2/(last["high"]-last["low"]+1e-12) >= 0.35)
@@ -200,19 +184,11 @@ def _reaction_pattern(prev, last, side):
         return (upper_wick/range_ >= 0.35) or (upper_wick2/(last["high"]-last["low"]+1e-12) >= 0.35)
 
 def _bb20_outside_bb80(candle):
-    """BB20 à l'extérieur de BB80 (fort enfoncement) : mid20 hors [lo80, up80]."""
     return (candle["bb20_mid"] > candle["bb80_up"]) or (candle["bb20_mid"] < candle["bb80_lo"])
 
 def _prolonged_double_exit(df, min_bars=PROLONGED_MIN_BARS):
-    """
-    ≥ min_bars barres consécutives AVANT la bougie précédente avec high>bb20_up & >bb80_up (sell)
-    ou low<bb20_lo & <bb80_lo (buy). Si la bougie de réintégration ferme "dans" les BB,
-    elle ne compte pas comme 4e barre.
-    Retourne 'up' / 'down' / None
-    """
     if len(df) < (min_bars+2):
         return None
-    # on regarde jusqu'à la bougie -2 (prev)
     count_up, count_down = 0, 0
     for i in range(-min_bars-2, -1):
         r = df.iloc[i]
@@ -234,51 +210,34 @@ def _prolonged_double_exit(df, min_bars=PROLONGED_MIN_BARS):
 # DETECTION DARWIN
 # =========================
 def detect_signal(df, state, sym):
-    """
-    Retourne None ou dict {side, regime, entry, sl, tp, rr, notes, wait_bars}
-    - entrée uniquement si la bougie de signal (last) **clôture dans/sur BB20**,
-      sinon on autorise la **bougie suivante** comme 2e chance.
-    - contact ≤ 2 bougies
-    - contre-tendance: si BB20 en dehors BB80 => réintégration des 2 BB obligatoire
-    - skip 1er trade après 'prolonged_double_exit'
-    """
     if len(df) < 3: 
         return None
 
     last, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
     notes=[]
     above80 = last["close"] >= last["bb80_mid"]
-
-    # réintégrations strictes (1 ou 2 barres) + close dans/sur BB20
     close_in_bb20 = _close_inside_bb20(last)
 
-    # Contact conditions (≤ 2 barres)
     touch20_long  = _contact_last2(df, "buy",  "bb20")
     touch20_short = _contact_last2(df, "sell", "bb20")
     touch80_long  = _contact_last2(df, "buy",  "bb80")
     touch80_short = _contact_last2(df, "sell", "bb80")
 
-    # Prolonged double exit handling
     long_short_prolonged = _prolonged_double_exit(df)
     st = state.setdefault(sym, {})
     if st.get("cooldown", False):
-        # on vient de voir la première réintégration, on saute ce trade puis on lève le cooldown
         st["cooldown"] = False
         return None
     if long_short_prolonged in ("up","down"):
         st["cooldown"] = True
         return None
 
-    # Trend (au-dessus/sous bb80_mid) + contact bb20 + close dans/sur bb20 + réaction
     regime = None; side=None
     if above80 and touch20_long and close_in_bb20 and _reaction_pattern(prev, last, "buy"):
         regime="trend"; side="buy"; notes+=["Contact bande basse BB20","Réaction (pattern fort) & close dans/sur BB20","Tendance"]
     elif (not above80) and touch20_short and close_in_bb20 and _reaction_pattern(prev, last, "sell"):
         regime="trend"; side="sell"; notes+=["Contact bande haute BB20","Réaction (pattern fort) & close dans/sur BB20","Tendance"]
     else:
-        # Counter-trend : double extrême + réintégration
-        # on exige contact BB20 + BB80 (selon le côté)
-        # si BB20 en dehors BB80 => réintégration des 2 BB obligatoire (close last > loBB20 & > loBB80 pour long, etc.)
         outside = _bb20_outside_bb80(last) or _bb20_outside_bb80(prev)
         if close_in_bb20:
             if touch20_long and touch80_long and _reaction_pattern(prev, last, "buy"):
@@ -303,14 +262,13 @@ def detect_signal(df, state, sym):
 
     denom = abs(entry-sl)
     rr = abs((tp-entry)/(denom if denom>0 else 1e-12))
-
     if rr < MIN_RR:
         return None
 
     return {"side":side,"regime":regime,"entry":entry,"sl":sl,"tp":tp,"rr":rr,"notes":notes, "wait_bars":1}
 
 # =========================
-# ORDRES RÉELS / PAPER
+# ORDRES / HISTO
 # =========================
 def has_open_position_real(ex, symbol):
     try:
@@ -330,9 +288,6 @@ def compute_qty(entry, sl, risk_amount):
     diff=abs(entry-sl)
     return risk_amount/diff if diff>0 else 0.0
 
-# =========================
-# HISTO / RAPPORTS (compacts)
-# =========================
 def ensure_trades_csv():
     if not os.path.exists(TRADES_CSV):
         with open(TRADES_CSV,"w",newline="",encoding="utf-8") as f:
@@ -424,11 +379,9 @@ def poll_telegram_commands(ex, active_paper):
                 tg_send(f"Mode actuel: {'PAPER' if DRY_RUN else ('LIVE' if not BITGET_TESTNET else 'TESTNET')}", kind="info")
 
             elif text.startswith("/report"):
-                # compact
                 tg_send("🧾 Rapport (compact) — le chat conserve *trades* et *signaux* du *jour*.", kind="info")
 
             elif text.startswith("/exportcsv"):
-                # envoie juste un résumé (le vrai envoi de fichier demanderait sendDocument)
                 tg_send(f"CSV: {TRADES_CSV}", kind="info")
 
             elif text.startswith("/orders"):
@@ -456,7 +409,7 @@ def poll_telegram_commands(ex, active_paper):
                         tg_send(f"⚠️ Impossible de lire les positions : {e}", kind="info")
 
             elif text.startswith("/test"):
-                tg_send("Mode PAPER: utilisez les signaux automatiques (entrée à l’ouverture H1).", kind="info")
+                tg_send("Mode PAPER: signaux/entrées à l’ouverture H1. BE/TP/SL peuvent notifier intra-barre.", kind="info")
 
             elif text.startswith("/closeallpaper"):
                 n=len(active_paper); active_paper.clear()
@@ -471,7 +424,7 @@ def poll_telegram_commands(ex, active_paper):
                 tg_send("▶️ Bot *repris*.", kind="info")
 
             elif text.startswith("/logs"):
-                tg_send("Logs: (suppression des logs verbeux — seuls les *trades/signaux* sont notifiés).", kind="info")
+                tg_send("Logs: (seuls *trades/signaux* sont notifiés, pas de flood).", kind="info")
 
             elif text.startswith("/ping"):
                 tg_send("📡 Ping ok.", kind="info")
@@ -483,14 +436,17 @@ def poll_telegram_commands(ex, active_paper):
                 tg_send("♻️ Redémarrage demandé…", kind="info")
 
             elif text.startswith("/purge"):
+                # conserve uniquement trades & signaux du jour
                 purge_chat(keep_kinds=("signal","trade"))
+            elif text.startswith("/purgeall"):
+                # efface tout l'historique envoyé par le bot
+                purge_chat(keep_kinds=())  # -> notifier supprime tout
 
     except Exception:
-        # ne spam pas
         pass
 
 # =========================
-# NOTIFICATIONS
+# NOTIFS
 # =========================
 def notify_signal(symbol, sig):
     side  = "LONG" if sig["side"]=="buy" else "SHORT"
@@ -509,6 +465,9 @@ def notify_close(symbol, pnl, rr):
     emo = "✅" if pnl>=0 else "❌"
     tg_send(f"{emo} *Trade clos {'[PAPER]' if DRY_RUN else ''}* {symbol}  P&L `{pnl:+.2f}%`  |  RR `x{rr:.2f}`", kind="trade")
 
+def notify_info(msg):
+    tg_send(msg, kind="info")
+
 def notify_error(context, err):
     tg_send(f"🧯 *Erreur* `{context}`\n{err}", kind="info")
 
@@ -518,16 +477,16 @@ def notify_error(context, err):
 def main():
     ex = create_exchange()
     mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-    tg_send(f"🔔 Démarrage — {mode} • TF {TF} • Risk {int(RISK_PER_TRADE*100)}% • RR≥{MIN_RR}", kind="info")
+    notify_info(f"🔔 Démarrage — {mode} • TF {TF} • Risk {int(RISK_PER_TRADE*100)}% • RR≥{MIN_RR}")
 
     universe = build_universe(ex)
     for s in universe:
         try_set_leverage(ex, s, leverage=2, mode="cross")
 
     state = {}
-    active_paper = {}
+    active_paper = {}      # sym -> position simulée
     last_ts_seen = {}
-    pending_entries = {}  # sym -> {"wait": n_bars, "ref_ts": ts, "sig": sig}
+    pending_entries = {}   # sym -> {"wait": n_bars, "ref_ts": ts, "sig": sig}
 
     while True:
         try:
@@ -537,11 +496,48 @@ def main():
                 time.sleep(LOOP_DELAY)
                 continue
 
-            # Ouvertures/fermetures PAPER intra-barre (BE/TP/SL) — si tu le souhaites, on peut réactiver
-            # Ici, on se concentre sur les signaux/entrées uniquement à l'ouverture H1 -> donc rien intra-barre.
+            # ============ GESTION INTRABARRE (PAPER) ============
+            if DRY_RUN and active_paper:
+                for sym in list(active_paper.keys()):
+                    try:
+                        df = fetch_ohlcv_df(ex, sym, TF, limit=200)
+                        last = df.iloc[-1]
+                        price = float(last["close"])
+                    except Exception:
+                        continue
 
-            # Scan
-            # 1) Décrément des pending UNIQUEMENT quand une nouvelle bougie se ferme
+                    p = active_paper[sym]
+                    side = p["side"]
+                    # BE en contre-tendance à la MM(BB20)
+                    if p["regime"]=="counter" and not p.get("be_applied", False):
+                        be_level = float(last["bb20_mid"])
+                        if (side=="buy"  and price>=be_level) or (side=="sell" and price<=be_level):
+                            p["be_applied"]=True
+                            notify_info(f"🛡️ BE (papier) {sym} à l’entrée `{p['entry']:.6f}` (contre-tendance)")
+
+                    # Partiel 50% si tendance lente
+                    if p["regime"]=="trend" and not p.get("partial_done", False):
+                        elapsed_h = (datetime.utcnow() - p["ts"]).total_seconds()/3600.0
+                        dist_full = abs(p["tp"]-p["entry"]); dist_now=abs(price-p["entry"])
+                        progressed = (dist_now/dist_full) if dist_full>0 else 0.0
+                        if elapsed_h >= QUICK_BARS and progressed < QUICK_PROGRESS:
+                            mid = float(last["bb20_mid"])
+                            # On simule la prise de 50% en marquant l’état ; le PnL final reste sur TP/SL/BE
+                            p["partial_done"]=True
+                            notify_info(f"✂️ Alt 50% (papier) {sym} pris près de la MM(BB20) `{mid:.6f}`")
+
+                    # Clôtures (TP/SL/BE)
+                    hit_tp = (price>=p["tp"] if side=="buy" else price<=p["tp"])
+                    hit_sl = (price<=p["sl"] if side=="buy" else price>=p["sl"])
+                    hit_be = p.get("be_applied", False) and ((price<=p["entry"] and side=="buy") or (price>=p["entry"] and side=="sell"))
+                    if hit_tp or hit_sl or hit_be:
+                        exit_price = p["tp"] if hit_tp else (p["entry"] if hit_be else p["sl"])
+                        result = "be" if hit_be else ("win" if hit_tp else "loss")
+                        pnl = log_trade_close(sym, side, p["regime"], p["entry"], exit_price, p["rr"], result, "paper")
+                        notify_close(sym, pnl, p["rr"])
+                        del active_paper[sym]
+
+            # ============ SCAN (clôture H1 uniquement) ============
             for sym in list(universe):
                 try:
                     df = fetch_ohlcv_df(ex, sym, TF, limit=300)
@@ -550,45 +546,36 @@ def main():
 
                 last_ts = df.index[-1]
 
-                # si nouvelle bougie close, décrémenter les pending
-                p = pending_entries.get(sym)
-                if p and p["ref_ts"] != last_ts:
-                    p["wait"] -= 1
-                    p["ref_ts"]  = last_ts
+                # décrément de la file d'attente seulement quand une nouvelle bougie se ferme
+                pend = pending_entries.get(sym)
+                if pend and pend["ref_ts"] != last_ts:
+                    pend["wait"] -= 1
+                    pend["ref_ts"]  = last_ts
 
-                # signal UNIQUEMENT à la CLÔTURE d’une nouvelle bougie
                 if last_ts_seen.get(sym) == last_ts:
-                    continue  # pas de nouveau close => pas de signal
+                    continue  # rien de neuf
 
-                # nouvelle clôture détectée
+                # nouvelle clôture -> détection
                 last_ts_seen[sym] = last_ts
                 sig = detect_signal(df, state, sym)
                 if sig:
-                    # file d’attente : entrée à l’ouverture suivante
                     pending_entries[sym] = {"wait": sig["wait_bars"], "ref_ts": last_ts, "sig": sig}
 
-            # 2) Sélectionner les meilleurs signaux à l’ouverture (wait==0), max PICKS_PER_HOUR
+            # ============ Entrées à l'ouverture (top 4 RR) ============
             candidates=[]
             for sym, p in pending_entries.items():
                 if p["wait"] <= 0:
                     candidates.append((sym, p["sig"]))
-            # trier par RR
             candidates.sort(key=lambda x: x[1]["rr"], reverse=True)
-            # limiter aux 4 meilleurs
             candidates = candidates[:PICKS_PER_HOUR]
 
-            # vérifier slots disponibles
             open_cnt = len(active_paper) if DRY_RUN else count_open_positions_real(ex)
             slots_avail = max(0, MAX_OPEN_TRADES - open_cnt)
-            if slots_avail <= 0:
-                # rien à faire, on purge ceux qui de toute façon étaient prêts
-                for sym,_ in candidates: pending_entries.pop(sym, None)
-            else:
+
+            if slots_avail > 0:
                 to_take = candidates[:slots_avail]
                 for sym, sig in to_take:
                     notify_signal(sym, sig)
-
-                    # risk sizing
                     try:
                         usdt = 1000.0 if DRY_RUN else float(ex.fetch_balance().get("USDT", {}).get("free", 0))
                     except Exception:
@@ -596,15 +583,14 @@ def main():
                     risk_amt = max(1.0, usdt*RISK_PER_TRADE)
                     qty = compute_qty(sig["entry"], sig["sl"], risk_amt)
                     if qty <= 0:
-                        pending_entries.pop(sym, None)
-                        continue
+                        pending_entries.pop(sym, None); continue
 
                     if DRY_RUN:
                         notify_order_ok(sym, sig["side"], qty, sig["rr"], sig["regime"])
                         active_paper[sym] = {
                             "entry":sig["entry"], "side":sig["side"], "regime":sig["regime"],
                             "sl":sig["sl"], "tp":sig["tp"], "rr":sig["rr"], "qty":qty,
-                            "ts":datetime.utcnow()
+                            "ts":datetime.utcnow(), "be_applied":False, "partial_done":False
                         }
                     else:
                         try:
@@ -615,10 +601,14 @@ def main():
 
                     pending_entries.pop(sym, None)
 
+            # Purger les en attente non pris si pas de slot (on ne garde pas à l’infini)
+            if slots_avail <= 0:
+                for sym,_ in candidates: pending_entries.pop(sym, None)
+
             time.sleep(LOOP_DELAY)
 
         except KeyboardInterrupt:
-            tg_send("⛔ Arrêt manuel.", kind="info")
+            notify_info("⛔ Arrêt manuel.")
             break
         except Exception as e:
             notify_error("loop", f"{e}\n{traceback.format_exc()}")
