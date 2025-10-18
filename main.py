@@ -17,9 +17,9 @@ API_KEY       = os.getenv("BITGET_API_KEY")
 API_SECRET    = os.getenv("BITGET_API_SECRET")
 PASSPHRASE    = os.getenv("BITGET_API_PASSWORD") or os.getenv("BITGET_PASSPHRASE")
 
-TF                 = os.getenv("TIMEFRAME", "1h")            # 1H unique
-RISK_PER_TRADE     = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1%
-MIN_RR             = float(os.getenv("MIN_RR", "3"))         # RR mini 1:3
+TF                 = os.getenv("TIMEFRAME", "1h")                 # 1H unique
+RISK_PER_TRADE     = float(os.getenv("RISK_PER_TRADE", "0.01"))   # 1%
+MIN_RR             = float(os.getenv("MIN_RR", "3"))              # RR mini 1:3
 MAX_OPEN_TRADES    = int(os.getenv("MAX_OPEN_TRADES", "4"))
 LOOP_DELAY         = int(os.getenv("LOOP_DELAY", "5"))
 
@@ -71,13 +71,13 @@ def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
 
     bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
     df["bb20_mid"] = bb20.bollinger_mavg()
-    df["bb20_up"] = bb20.bollinger_hband()
-    df["bb20_lo"] = bb20.bollinger_lband()
+    df["bb20_up"]  = bb20.bollinger_hband()
+    df["bb20_lo"]  = bb20.bollinger_lband()
 
     bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
     df["bb80_mid"] = bb80.bollinger_mavg()
-    df["bb80_up"] = bb80.bollinger_hband()
-    df["bb80_lo"] = bb80.bollinger_lband()
+    df["bb80_up"]  = bb80.bollinger_hband()
+    df["bb80_lo"]  = bb80.bollinger_lband()
 
     atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=ATR_WINDOW)
     df["atr"] = atr.average_true_range()
@@ -101,8 +101,9 @@ def build_universe(ex):
     try:
         ex.load_markets()
         candidates = [m["symbol"] for m in ex.markets.values()
-                      if (m.get("type") == "swap" or m.get("swap")) and m.get("linear")
-                      and m.get("settle") == "USDT" and m.get("quote") == "USDT"]
+                      if (m.get("type") == "swap" or m.get("swap"))
+                      and m.get("linear") and m.get("settle") == "USDT"
+                      and m.get("quote") == "USDT"]
     except Exception:
         candidates = []
 
@@ -124,23 +125,24 @@ def build_universe(ex):
     if rows:
         df = pd.DataFrame(rows, columns=["symbol", "volume"]).sort_values("volume", ascending=False)
         universe = df.head(UNIVERSE_SIZE)["symbol"].tolist()
-        head10 = df.head(10)
-        preview = ", ".join([f"{r.symbol}:{int(r.volume)}" for r in head10.itertuples(index=False)])
+        top10 = df.head(10)
+        preview = ", ".join([f"{r.symbol}:{int(r.volume)}" for r in top10.itertuples(index=False)])
         print(f"[UNIVERSE] size={len(universe)} (ranked by 24h volume)")
         print(f"[UNIVERSE] top10: {preview}")
-        tg_send(f"📊 Univers LIVE top10: {preview}")
+        tg_send(f"📊 *Univers LIVE (Top10)*\n{preview}")
 
         if BITGET_TESTNET:
             universe = filter_working_symbols(ex, universe[:20], timeframe=TF) or FALLBACK_TESTNET
             print(f"[UNIVERSE] testnet filtered: {universe}")
-            tg_send(f"🧪 Testnet marchés OK: {', '.join(universe)}")
+            tg_send("🧪 *Testnet actifs* : " + ", ".join(universe))
         return universe
 
+    # Fallback testnet
     print("[UNIVERSE] empty after volume filter, using fallback list (testnet)")
     universe = filter_working_symbols(ex, FALLBACK_TESTNET, timeframe=TF)
     print(f"[UNIVERSE] size={len(universe)} (fallback)")
     print(f"[UNIVERSE] list: {', '.join(universe)}")
-    tg_send(f"🧪 Univers TESTNET: {', '.join(universe)}")
+    tg_send("🧪 *Univers TESTNET* : " + ", ".join(universe))
     return universe
 
 # =======================
@@ -153,10 +155,11 @@ def detect_signal(df):
 
     above80 = last["close"] >= last["bb80_mid"]
 
-    reinteg_long = (prev["low"] <= min(prev["bb20_lo"], prev["bb80_lo"])) and (last["close"] > last["bb20_lo"])
+    # Réintégration (contact/travers + clôture à l'intérieur) sur BB blanche, UT 1H
+    reinteg_long  = (prev["low"]  <= min(prev["bb20_lo"], prev["bb80_lo"])) and (last["close"] > last["bb20_lo"])
     reinteg_short = (prev["high"] >= max(prev["bb20_up"], prev["bb80_up"])) and (last["close"] < last["bb20_up"])
 
-    long_trend = above80 and reinteg_long
+    long_trend  =  above80 and reinteg_long
     short_trend = (not above80) and reinteg_short
 
     if long_trend:
@@ -172,9 +175,8 @@ def detect_signal(df):
 
     entry = float(last["close"])
     atr = float(last["atr"])
-    tick = max(entry * 0.0001, 0.01)
     if side == "buy":
-        sl = float(prev["low"]) - SL_ATR_CUSHION * atr
+        sl = float(prev["low"])  - SL_ATR_CUSHION * atr
         tp = float(last["bb80_up"]) if regime == "trend" else float(last["bb20_up"])
     else:
         sl = float(prev["high"]) + SL_ATR_CUSHION * atr
@@ -187,7 +189,7 @@ def detect_signal(df):
     return {"side": side, "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
 
 # =======================
-# POSITIONS
+# POSITIONS / MONEY MGMT
 # =======================
 def has_open_position(ex, symbol):
     try:
@@ -211,11 +213,33 @@ def compute_qty(entry, sl, risk_amount):
     return risk_amount / diff if diff > 0 else 0
 
 # =======================
+# NOTIFICATIONS
+# =======================
+def notify_signal(symbol, sig):
+    regime_emoji = "📈" if sig["regime"] == "trend" else "🔄"
+    side_txt = "LONG" if sig["side"] == "buy" else "SHORT"
+    msg = (
+        f"{regime_emoji} *Signal* {symbol} {side_txt}\n"
+        f"Entrée ~ {sig['entry']:.4f}\n"
+        f"SL ~ {sig['sl']:.4f}\n"
+        f"TP ~ {sig['tp']:.4f}\n"
+        f"RR {sig['rr']:.2f}"
+    )
+    tg_send(msg)
+
+def notify_order_ok(symbol, side, qty):
+    side_txt = "LONG" if side == "buy" else "SHORT"
+    tg_send(f"🎯 *Trade exécuté* {symbol} {side_txt}\nTaille : {qty:.6f}")
+
+def notify_error(context, err):
+    tg_send(f"⚠️ *Erreur* ({context})\n{err}")
+
+# =======================
 # MAIN LOOP
 # =======================
 def main():
     ex = create_exchange()
-    tg_send(f"🤖 Darwin H1 — Risk {int(RISK_PER_TRADE*100)}% — RR≥{MIN_RR}")
+    tg_send(f"🔔 Bot démarré — H1 — Risk {int(RISK_PER_TRADE*100)}% — RR≥{MIN_RR}")
     universe = build_universe(ex)
     valid_set = set(universe)
 
@@ -225,34 +249,56 @@ def main():
             for sym in list(universe):
                 if sym not in valid_set:
                     continue
-                df = fetch_ohlcv_df(ex, sym, TF, 300)
+
+                try:
+                    df = fetch_ohlcv_df(ex, sym, TF, 300)
+                except Exception as e:
+                    print("[WARN] fetch_ohlcv:", e)
+                    continue
+
                 last_ts = df.index[-1]
                 if last_ts_seen.get(sym) == last_ts:
                     continue
                 last_ts_seen[sym] = last_ts
+
                 sig = detect_signal(df)
                 if not sig:
+                    continue
+
+                if count_open_positions(ex) >= MAX_OPEN_TRADES:
                     continue
                 if has_open_position(ex, sym):
                     continue
 
                 print(f"[SIGNAL] {sym} {sig['side']} {sig['regime']} RR={sig['rr']:.2f}")
-                bal = ex.fetch_balance()
-                usdt = float(bal.get("USDT", {}).get("free", 0))
-                risk_amt = usdt * RISK_PER_TRADE
+                notify_signal(sym, sig)
+
+                try:
+                    bal = ex.fetch_balance()
+                    usdt = float(bal.get("USDT", {}).get("free", 0))
+                except Exception:
+                    usdt = 0.0
+
+                risk_amt = max(1.0, usdt * RISK_PER_TRADE)
                 qty = compute_qty(sig["entry"], sig["sl"], risk_amt)
                 if qty <= 0:
                     continue
+
                 try:
                     ex.create_order(sym, "market", sig["side"], qty)
-                    tg_send(f"✅ {sym} {sig['side'].upper()} RR={sig['rr']:.2f} ({sig['regime']})")
+                    notify_order_ok(sym, sig["side"], qty)
                 except Exception as e:
                     print("[ERROR] order:", e)
+                    notify_error("order", e)
+
             time.sleep(LOOP_DELAY)
+
         except KeyboardInterrupt:
+            tg_send("⛔ Arrêt manuel du bot.")
             break
         except Exception as e:
             print("[FATAL]", e)
+            notify_error("loop", e)
             time.sleep(5)
 
 if __name__ == "__main__":
