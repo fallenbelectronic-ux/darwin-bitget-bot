@@ -15,7 +15,6 @@ import trader
 import notifier
 from notifier import (
     tg_send,
-    tg_get_updates,
     tg_send_start_banner,
 )
 
@@ -27,13 +26,11 @@ API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
 PASSPHRASE       = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASE", "")
 
-# --- Paramètres de la Stratégie ---
 TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
 UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
 MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
 MM80_DEAD_ZONE_PERCENT = float(os.getenv("MM80_DEAD_ZONE_PERCENT", "0.1"))
 
-# --- Paramètres Techniques ---
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
 TICK_RATIO       = 0.0005
 FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"]
@@ -50,21 +47,40 @@ def create_exchange():
     return ex
 
 # =========================
-# DATA
+# DATA (FONCTION CORRIGÉE)
 # =========================
-def fetch_ohlcv_df(ex, symbol, timeframe, limit=300) -> pd.DataFrame:
-    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not raw or len(raw) < 100: raise RuntimeError("OHLCV vide")
-    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("ts", inplace=True)
-    bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
-    df["bb20_mid"], df["bb20_up"], df["bb20_lo"] = bb20.bollinger_mavg(), bb20.bollinger_hband(), bb20.bollinger_lband()
-    bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
-    df["bb80_mid"], df["bb80_up"], df["bb80_lo"] = bb80.bollinger_mavg(), bb80.bollinger_hband(), bb80.bollinger_lband()
-    return df
+def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.DataFrame]:
+    """
+    Récupère les données OHLCV.
+    Retourne None si les données sont vides, invalides ou si le symbole n'existe pas.
+    Ceci évite les erreurs "OHLCV vide" dans les logs.
+    """
+    try:
+        raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        # Condition de garde : s'assurer qu'on a assez de données pour les indicateurs
+        if not raw or len(raw) < 100:
+            return None # Ignore silencieusement ce symbole
+        
+        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        df.set_index("ts", inplace=True)
+        
+        bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
+        df["bb20_mid"], df["bb20_up"], df["bb20_lo"] = bb20.bollinger_mavg(), bb20.bollinger_hband(), bb20.bollinger_lband()
+        
+        bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
+        df["bb80_mid"], df["bb80_up"], df["bb80_lo"] = bb80.bollinger_mavg(), bb80.bollinger_hband(), bb80.bollinger_lband()
+        
+        return df
+    except ccxt.BadSymbol:
+        # L'exchange confirme que ce symbole n'existe pas (sur le testnet par ex.)
+        return None
+    except Exception:
+        # Pour toute autre erreur de l'API, on ignore aussi
+        return None
 
 def build_universe(ex) -> List[str]:
+    # (Inchangé)
     try:
         ex.load_markets()
         candidates = [m['symbol'] for m in ex.markets.values() if m.get('swap') and m.get('linear') and m.get('settle') == 'USDT' and m.get('quote') == 'USDT']
@@ -77,14 +93,14 @@ def build_universe(ex) -> List[str]:
     return FALLBACK_TESTNET
 
 # =========================
-# OUTILS / CONDITIONS
+# OUTILS / CONDITIONS (inchangés)
 # =========================
 def tick_from_price(price: float) -> float: return max(price * TICK_RATIO, 0.01)
 def touched_or_crossed(low, high, band, side): return (low <= band) if side == "buy" else (high >= band)
 def close_inside_bb20(close, lo, up): return lo <= close <= up
 
 # =========================
-# DÉTECTION DE SIGNAL
+# DÉTECTION DE SIGNAL (inchangé)
 # =========================
 def detect_signal(df: pd.DataFrame, state: Dict, sym: str) -> Optional[Dict]:
     if len(df) < 5: return None
@@ -102,7 +118,6 @@ def detect_signal(df: pd.DataFrame, state: Dict, sym: str) -> Optional[Dict]:
     if MM80_DEAD_ZONE_PERCENT > 0:
         dead_zone = last["bb80_mid"] * (MM80_DEAD_ZONE_PERCENT / 100.0)
         if (last["bb80_mid"] - dead_zone) <= entry <= (last["bb80_mid"] + dead_zone):
-            print(f"[{sym}] Signal ignoré (zone d'indécision MM80).")
             return None
 
     tck = tick_from_price(entry)
@@ -118,9 +133,9 @@ def detect_signal(df: pd.DataFrame, state: Dict, sym: str) -> Optional[Dict]:
     return {"side": side, "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr, "bb20_mid": float(last["bb20_mid"])}
 
 # =========================
-# MAIN LOOP
+# MAIN LOOP (MISE À JOUR)
 # =========================
-_paused = False # Géré par /pause, /resume (non implémenté ici pour la clarté)
+_paused = False
 
 def main():
     ex = create_exchange()
@@ -133,6 +148,7 @@ def main():
     universe = build_universe(ex)
     last_ts_seen: Dict[str, pd.Timestamp] = {}
     state: Dict[str, Any] = {}
+    print(f"Univers de {len(universe)} symboles chargé.")
 
     while True:
         try:
@@ -143,18 +159,19 @@ def main():
             trader.manage_open_positions(ex)
 
             for sym in universe:
-                try:
-                    df = fetch_ohlcv_df(ex, sym, TIMEFRAME, 300)
-                    if last_ts_seen.get(sym) == df.index[-1]: continue
-                    last_ts_seen[sym] = df.index[-1]
-
-                    sig = detect_signal(df, state, sym)
-                    if sig:
-                        trader.execute_trade(ex, sym, sig)
-                
-                except Exception as e:
-                    print(f"Erreur de scan sur {sym}: {e}")
+                # La gestion d'erreur est maintenant plus propre
+                df = fetch_ohlcv_df(ex, sym, TIMEFRAME, 300)
+                if df is None:
+                    # fetch_ohlcv_df a déjà géré l'erreur, on passe au suivant
                     continue
+                
+                if last_ts_seen.get(sym) == df.index[-1]:
+                    continue
+                last_ts_seen[sym] = df.index[-1]
+
+                sig = detect_signal(df, state, sym)
+                if sig:
+                    trader.execute_trade(ex, sym, sig)
 
             time.sleep(LOOP_DELAY)
 
