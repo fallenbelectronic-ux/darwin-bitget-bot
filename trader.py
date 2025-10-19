@@ -47,7 +47,7 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
-    max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', 3))
+    max_pos = int(os.getenv('MAX_OPEN_POSITIONS', 3))
     
     # IMPORTANT: Votre DB renvoie toujours [], donc cette condition est toujours vraie.
     if len(database.get_open_positions()) >= max_pos: 
