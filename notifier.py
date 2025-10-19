@@ -1,140 +1,116 @@
-# /app/notifier.py
+# notifier.py
 import os
 import time
+import json
 import requests
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
 
-# --- ENV ----------------------------------------------------------------------
-TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def _enabled() -> bool:
-    return bool(TG_TOKEN) and bool(TG_CHAT_ID)
+_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else None
 
-# --- ENVOI DE MESSAGES --------------------------------------------------------
-def tg_send(
-    text: str,
-    parse_mode: Optional[str] = "Markdown",
-    disable_web_page_preview: bool = True,
-    silent: bool = False,
-) -> Optional[int]:
-    """Envoie un message Telegram et retourne le message_id ou None."""
-    if not _enabled():
-        print("[NOTIFIER] tg_send ignoré (token/chat_id manquants).")
+# — mémoire locale des signaux envoyés (pour /signals)
+#   [(ts_utc, symbol, side, rr, message_id)]
+_signal_log = []
+
+def _ok():
+    return bool(TG_TOKEN and TG_CHAT_ID and _API)
+
+def tg_send(text: str, parse_mode: str = "Markdown", disable_notification: bool=False) -> int | None:
+    """Envoie un message Telegram. Retourne message_id si succès."""
+    if not _ok():
+        print("[NOTIF] tg_send skipped (token/chat missing)")
         return None
     try:
         r = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
+            _API + "/sendMessage",
             json={
                 "chat_id": TG_CHAT_ID,
                 "text": text,
                 "parse_mode": parse_mode,
-                "disable_web_page_preview": disable_web_page_preview,
-                "disable_notification": silent,
+                "disable_web_page_preview": True,
+                "disable_notification": disable_notification,
             },
             timeout=10,
-        )
-        data = r.json()
-        if not data.get("ok"):
-            print("[NOTIFIER] sendMessage error:", data)
+        ).json()
+        if not r.get("ok"):
+            print("[NOTIF] sendMessage error:", r)
             return None
-        return data["result"]["message_id"]
+        return r["result"]["message_id"]
     except Exception as e:
-        print("[NOTIFIER] sendMessage exception:", e)
+        print("[NOTIF] sendMessage exception:", e)
         return None
 
-# --- SUPPRESSION --------------------------------------------------------------
-def tg_delete_message(message_id: int) -> bool:
-    if not _enabled():
-        return False
-    try:
-        r = requests.post(
-            f"{TELEGRAM_API}/deleteMessage",
-            json={"chat_id": TG_CHAT_ID, "message_id": message_id},
-            timeout=10,
-        )
-        data = r.json()
-        if not data.get("ok"):
-            # Non bloquant si message déjà supprimé / trop ancien, etc.
-            print("[NOTIFIER] deleteMessage:", data)
-            return False
-        return True
-    except Exception as e:
-        print("[NOTIFIER] deleteMessage exception:", e)
-        return False
-
-def tg_delete_many(message_ids: List[int]) -> Tuple[int, int]:
-    ok = ko = 0
-    for mid in message_ids:
-        if tg_delete_message(mid):
-            ok += 1
-        else:
-            ko += 1
-        time.sleep(0.06)  # petit throttle
-    return ok, ko
-
-# --- RECEPTION / COMMANDES ----------------------------------------------------
-def tg_get_updates(offset: Optional[int] = None, timeout: int = 0) -> Dict[str, Any]:
-    """Retourne le JSON getUpdates; si non configuré, retourne {ok:True,result:[]}."""
-    if not _enabled():
-        return {"ok": True, "result": []}
-    params: Dict[str, Any] = {}
-    if offset is not None:
-        params["offset"] = offset
-    if timeout and timeout > 0:
-        params["timeout"] = int(timeout)
-    try:
-        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=timeout + 10)
-        data = r.json()
-        if not data.get("ok"):
-            print("[NOTIFIER] getUpdates error:", data)
-        return data
-    except Exception as e:
-        print("[NOTIFIER] getUpdates exception:", e)
-        return {"ok": False, "result": [], "error": str(e)}
-
-# --- PIN/UNPIN (optionnel) ----------------------------------------------------
-def tg_pin_message(message_id: int) -> bool:
-    if not _enabled():
-        return False
-    try:
-        r = requests.post(
-            f"{TELEGRAM_API}/pinChatMessage",
-            json={"chat_id": TG_CHAT_ID, "message_id": message_id},
-            timeout=10,
-        )
-        return bool(r.json().get("ok"))
-    except Exception as e:
-        print("[NOTIFIER] pinChatMessage exception:", e)
-        return False
-
-def tg_unpin_all() -> bool:
-    if not _enabled():
-        return False
-    try:
-        r = requests.post(
-            f"{TELEGRAM_API}/unpinAllChatMessages",
-            json={"chat_id": TG_CHAT_ID},
-            timeout=10,
-        )
-        return bool(r.json().get("ok"))
-    except Exception as e:
-        print("[NOTIFIER] unpinAllChatMessages exception:", e)
-        return False
-
-# --- STUBS POUR COMPATIBILITE AVEC main.py -----------------------------------
-def purge_chat(*args, **kwargs) -> Tuple[int, int]:
+def tg_get_updates(last_update_id: int | None) -> tuple[int | None, list[dict]]:
     """
-    Stub inoffensif : ne purge rien, retourne (0,0).
-    Gardé pour compatibilité si main.py continue d'importer purge_chat.
+    Récupère les updates (polling). Retourne (new_last_update_id, messages list)
+    Chaque message = {"text": "...", "chat_id": str, "message_id": int}
     """
-    # Si tu veux quand même un petit accusé :
-    # tg_send("🧹 Purge désactivée (aucun message supprimé).", silent=True)
-    return (0, 0)
+    if not _ok():
+        return last_update_id, []
+    params = {"timeout": 0}
+    if last_update_id is not None:
+        params["offset"] = last_update_id + 1
+    try:
+        r = requests.get(_API + "/getUpdates", params=params, timeout=10).json()
+        if not r.get("ok"):
+            return last_update_id, []
+        out = []
+        new_last = last_update_id
+        for upd in r.get("result", []):
+            new_last = max(new_last or 0, upd["update_id"])
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+            text = (msg.get("text") or "").strip()
+            chat = str(msg["chat"]["id"])
+            out.append({"text": text, "chat_id": chat, "message_id": msg.get("message_id")})
+        return new_last, out
+    except Exception as e:
+        print("[NOTIF] getUpdates exception:", e)
+        return last_update_id, []
 
-def nightly_signals_purge(*args, **kwargs) -> None:
-    """
-    Stub inoffensif : ne fait rien. Gardé si main.py l'importe encore.
-    """
-    return
+# ===== Signaux récents (pour /signals) =====
+
+def remember_signal_message(symbol: str, side: str, rr: float, message_id: int | None = None):
+    """Stocke un signal afin de pouvoir lister les signaux récents."""
+    now = datetime.utcnow()
+    _signal_log.append((now, symbol, side, float(rr), message_id))
+    # garder 2h rolling
+    limit = now - timedelta(hours=2)
+    while _signal_log and _signal_log[0][0] < limit:
+        _signal_log.pop(0)
+
+def signals_last_hour_text() -> str:
+    """Retourne un texte formaté des signaux sur la dernière heure."""
+    if not _signal_log:
+        return "Aucun signal sur l’heure écoulée."
+    now = datetime.utcnow()
+    recent = [s for s in _signal_log if (now - s[0]).total_seconds() <= 3600]
+    if not recent:
+        return "Aucun nouveau signal cette heure-ci."
+    lines = ["🕐 *Signaux de la dernière heure*"]
+    for ts, sym, side, rr, _mid in recent:
+        t = ts.strftime("%H:%M")
+        lines.append(f"• `{sym}` {side.upper()}  RR×{rr:.2f}  ({t} UTC)")
+    return "\n".join(lines)
+
+# ===== Helpers informatifs =====
+
+def tg_send_start_banner(mode:str, tf:str, risk_pct:int, rr_min:float):
+    return tg_send(f"🔔 Démarrage — *{mode}* • TF {tf} • Risk {risk_pct}% • RR≥{rr_min}")
+
+def tg_send_signal_card(symbol:str, side:str, entry:float, sl:float, tp:float,
+                        rr:float, bullets:list[str], regime:str, paper:bool) -> int | None:
+    tag = "[PAPER]" if paper else ""
+    side_txt = "LONG" if side=="buy" else "SHORT"
+    header = f"📈 Signal {tag} | `{symbol}` {side_txt}\n"
+    core   = f"Entrée `{entry:.6f}` | SL `{sl:.6f}` | TP `{tp:.6f}`\nRR x{rr:.2f}\n"
+    btxt   = "\n".join([f"• {b}" for b in bullets])
+    return tg_send(header + core + btxt)
+
+def tg_send_trade_exec(symbol:str, side:str, price:float, rr:float, paper:bool):
+    tag = "PAPER " if paper else ""
+    side_txt = "BUY" if side=="buy" else "SELL"
+    tg_send(f"🎯 {tag}`{symbol}` {side_txt} @ `{price:.6f}`  RR={rr:.2f}")
