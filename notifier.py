@@ -1,12 +1,17 @@
 # Fichier: notifier.py
-import os, time, html, requests, io
+import os
+import time
+import html
+import requests
+import io
 from typing import List, Dict, Any, Optional
 
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-def _escape(text: str) -> str: return html.escape(str(text))
+def _escape(text: str) -> str:
+    return html.escape(str(text))
 
 def tg_send(text: str, reply_markup: Optional[Dict] = None):
     if not TG_TOKEN or not TG_CHAT_ID: return
@@ -35,10 +40,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
     pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pauser", "callback_data": "pause"}
-    return {"inline_keyboard": [
-        [pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}],
-        [{"text": "⚙️ Paramètres", "callback_data": "settings_menu"}, {"text": "ℹ️ Statut", "callback_data": "show_status"}]
-    ]}
+    return {"inline_keyboard": [[pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}]]}
 
 def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     if not positions: return None
@@ -48,8 +50,18 @@ def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
         keyboard.append([{"text": f"❌ Clôturer Trade #{trade_id}", "callback_data": f"close_trade_{trade_id}"}])
     return {"inline_keyboard": keyboard}
 
-def format_start_message(is_paused: bool):
-    tg_send("🤖 **Panneau de Contrôle Darwin Bot**", reply_markup=get_main_menu_keyboard(is_paused))
+def send_start_banner(platform: str, trading: str, risk: float):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"<b>🔔 Darwin Bot Démarré</b>\n\n"
+        f" plateforme: <code>{_escape(platform)}</code>\n"
+        f" Mode: <b>{_escape(trading)}</b>\n"
+        f" Risque: <code>{risk}%</code>"
+    )
+    tg_send(msg)
+
+def send_main_menu(is_paused: bool):
+    tg_send("🤖 **Panneau de Contrôle**", reply_markup=get_main_menu_keyboard(is_paused))
 
 def format_open_positions(positions: List[Dict[str, Any]]):
     if not positions:
@@ -70,5 +82,15 @@ def tg_send_error(title: str, error: Any):
     tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(error)}</code>")
 
 def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
-    # ... (implémentation inchangée)
-    pass
+    side_icon = "📈" if signal['side'] == 'buy' else "📉"
+    mode_icon = "📝" if mode == 'PAPIER' else "✅"
+    return (
+        f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
+        f" paire: <code>{_escape(symbol)}</code>\n"
+        f" Type: <b>{_escape(signal['regime'].capitalize())}</b>\n\n"
+        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
+        f" SL: <code>{signal['sl']:.5f}</code>\n"
+        f" TP: <code>{signal['tp']:.5f}</code>\n\n"
+        f" Quantité: <code>{quantity:.4f}</code>\n"
+        f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
+    )
