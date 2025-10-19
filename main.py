@@ -9,7 +9,7 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from dotenv import load_dotenv
 
 from notifier import (
-    tg_send, tg_get_updates, purge_chat, purge_last_100, purge_all,
+    tg_send, tg_get_updates, purge_chat, purge_all,
     send_document, remember_signal_message, signals_last_hour_text
 )
 
