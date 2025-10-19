@@ -9,18 +9,22 @@ import database
 import trader
 import notifier
 
-# --- (PARAMÈTRES STABLES) ---
+# --- PARAMÈTRES CHARGÉS DEPUIS L'ENVIRONNEMENT ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
 API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
 PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
-TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
+
+# Paramètres de la stratégie
+TIMEFRAME        = os.getenv("TIMEFRAME", "1h") # Unité de temps unique
 UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
 MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
-MM80_DEAD_ZONE_PERCENT = float(os.getenv("MM80_DEAD_ZONE_PERCENT", "0.1"))
+MM_DEAD_ZONE_PERCENT = float(os.getenv("MM_DEAD_ZONE_PERCENT", "0.1")) # Zone neutre autour de la MM20
+TICK_RATIO       = 0.0005 # Pour calculer le "tick" comme un % du prix
+
+# Paramètres du bot
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
-TICK_RATIO       = 0.0005
-FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT"]
+FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"]
 
 def create_exchange():
     """Initialise et retourne l'objet d'échange CCXT."""
@@ -31,12 +35,8 @@ def create_exchange():
     if BITGET_TESTNET: ex.set_sandbox_mode(True)
     return ex
 
-# ==============================================================================
-# FONCTIONS DE BASE AJOUTÉES
-# ==============================================================================
-
-def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str = '1h', limit: int = 100) -> Optional[pd.DataFrame]:
-    """Récupère les données OHLCV et les retourne sous forme de DataFrame Pandas."""
+def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 120) -> Optional[pd.DataFrame]:
+    """Récupère les données OHLCV. Augmentation de la limite pour la BB 80."""
     try:
         ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -44,66 +44,101 @@ def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str = '1h', limit:
         df.set_index('timestamp', inplace=True)
         return df
     except Exception as e:
-        print(f"Erreur lors de la récupération des données OHLCV pour {symbol}: {e}")
+        print(f"Erreur de récupération OHLCV pour {symbol} sur {timeframe}: {e}")
         return None
 
 def build_universe(ex: ccxt.Exchange) -> List[str]:
-    """Construit la liste des paires à trader en se basant sur le volume."""
+    # ... (Cette fonction reste inchangée)
     print("Construction de l'univers de trading...")
     try:
         markets = ex.load_markets()
-        # Filtre pour les perpetuals linéaires USDT
-        symbols = [
-            m['symbol'] for m in markets.values()
-            if m.get('swap', False) and m.get('quote', '') == 'USDT' and m.get('linear', False)
-        ]
-        
-        # Pour trier par volume, une approche plus complexe serait nécessaire.
-        # Pour l'instant, nous utilisons une liste de secours ou les premiers résultats.
-        # Idéalement, il faudrait fetch les tickers et trier par quoteVolume.
-        
-        if not symbols:
-            print("Aucun symbole trouvé via l'API, utilisation de la liste de secours.")
-            return FALLBACK_TESTNET
-        
-        # Limiter à la taille de l'univers (si la liste est très grande)
+        symbols = [m['symbol'] for m in markets.values() if m.get('swap') and m.get('quote') == 'USDT' and m.get('linear')]
+        if not symbols: return FALLBACK_TESTNET
         return symbols[:UNIVERSE_SIZE]
-        
     except Exception as e:
-        print(f"Impossible de construire l'univers via l'API, utilisation de la liste de secours. Erreur: {e}")
+        print(f"Impossible de construire l'univers via l'API. Utilisation de la liste de secours. Erreur: {e}")
         return FALLBACK_TESTNET
 
+# ==============================================================================
+# LOGIQUE DE DÉTECTION "DARWIN TRADING" MISE À JOUR (1 UT, 2 BB)
+# ==============================================================================
 def detect_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
-    Fonction de détection de signal (placeholder).
-    C'est ici que votre logique de trading (croisement de MM, etc.) doit être implémentée.
+    Détecte les signaux de trading en utilisant deux Bandes de Bollinger sur une seule unité de temps.
     """
-    # Ajout des indicateurs (Bandes de Bollinger)
+    # Nous avons besoin d'au moins 81 bougies pour calculer la BB(80)
+    if df is None or len(df) < 81:
+        return None
+
+    # --- 1. Calcul des indicateurs ---
+    # BB Standard (BB Blanche)
     bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
     df['bb20_up'] = bb_20.bollinger_hband()
-    df['bb20_lo'] = bb_20.bollinger_lband()
     df['bb20_mid'] = bb_20.bollinger_mavg()
+    df['bb20_lo'] = bb_20.bollinger_lband()
+
+    # BB Large (BB Jaune, approximant l'UT supérieure)
+    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2)
+    df['bb80_up'] = bb_80.bollinger_hband()
+    df['bb80_mid'] = bb_80.bollinger_mavg()
+    df['bb80_lo'] = bb_80.bollinger_lband()
+
+    last = df.iloc[-1] # Bougie actuelle (de déclenchement potentielle)
     
-    # NOTE: Ceci est un exemple de logique. Vous devez le remplacer par votre propre stratégie.
-    # Par exemple, si le dernier prix de clôture croise la bande basse :
-    last_close = df['close'].iloc[-1]
-    last_bb_lo = df['bb20_lo'].iloc[-1]
+    # --- 2. Définition de la tendance et de la zone neutre ---
+    is_uptrend = last['close'] > last['bb20_mid']
+    is_downtrend = last['close'] < last['bb20_mid']
     
-    if last_close < last_bb_lo:
-        # Signal d'achat (exemple)
-        entry_price = last_close
-        sl_price = entry_price * 0.98  # Stop Loss 2% plus bas
-        tp_price = entry_price * 1.06  # Take Profit 6% plus haut (RR 3:1)
+    dead_zone = last['bb20_mid'] * (MM_DEAD_ZONE_PERCENT / 100)
+    is_in_dead_zone = abs(last['close'] - last['bb20_mid']) < dead_zone
+
+    signal = None
+    tick_size = last['close'] * TICK_RATIO
+
+    # --- 3. STRATÉGIE 1: PATTERN EN TENDANCE ("Extrême Correction") ---
+    if not is_in_dead_zone:
+        # Achat en tendance haussière : Contact avec la borne basse de la BB20
+        if is_uptrend and last['low'] <= last['bb20_lo']:
+            entry_price = last['close']
+            sl_price = last['low'] - (2 * tick_size)
+            tp_price = last['bb20_mid']
+            
+            if entry_price > sl_price and (tp_price - entry_price) / (entry_price - sl_price) >= MIN_RR:
+                signal = {"side": "buy", "regime": "Tendance", "entry": entry_price, "sl": sl_price, "tp": tp_price, "rr": (tp_price - entry_price) / (entry_price - sl_price)}
+
+        # Vente en tendance baissière : Contact avec la borne haute de la BB20
+        elif is_downtrend and last['high'] >= last['bb20_up']:
+            entry_price = last['close']
+            sl_price = last['high'] + (2 * tick_size)
+            tp_price = last['bb20_mid']
+            
+            if entry_price < sl_price and (entry_price - tp_price) / (sl_price - entry_price) >= MIN_RR:
+                signal = {"side": "sell", "regime": "Tendance", "entry": entry_price, "sl": sl_price, "tp": tp_price, "rr": (entry_price - tp_price) / (sl_price - entry_price)}
+
+    # --- 4. STRATÉGIE 2: PATTERN EN CONTRE-TENDANCE ("Double Extrême") ---
+    if not signal:
+        # Achat : Contact avec BB20 basse ET BB80 basse + Réintégration au-dessus de BB20 basse
+        if last['low'] <= last['bb20_lo'] and last['low'] <= last['bb80_lo'] and last['close'] > last['bb20_lo']:
+            entry_price = last['close']
+            sl_price = last['low'] - (2 * tick_size)
+            tp_price = last['bb20_mid']
+
+            if entry_price > sl_price and (tp_price - entry_price) / (entry_price - sl_price) >= MIN_RR:
+                signal = {"side": "buy", "regime": "Contre-tendance", "entry": entry_price, "sl": sl_price, "tp": tp_price, "rr": (tp_price - entry_price) / (entry_price - sl_price)}
+
+        # Vente : Contact avec BB20 haute ET BB80 haute + Réintégration en dessous de BB20 haute
+        elif last['high'] >= last['bb20_up'] and last['high'] >= last['bb80_up'] and last['close'] < last['bb20_up']:
+            entry_price = last['close']
+            sl_price = last['high'] + (2 * tick_size)
+            tp_price = last['bb20_mid']
+
+            if entry_price < sl_price and (entry_price - tp_price) / (sl_price - entry_price) >= MIN_RR:
+                signal = {"side": "sell", "regime": "Contre-tendance", "entry": entry_price, "sl": sl_price, "tp": tp_price, "rr": (entry_price - tp_price) / (sl_price - entry_price)}
+
+    if signal:
+        signal['bb20_mid'] = last['bb20_mid']
+        return signal
         
-        return {
-            "side": "buy",
-            "regime": "Contre-tendance",
-            "entry": entry_price,
-            "sl": sl_price,
-            "tp": tp_price,
-            "rr": 3.0,
-            "bb20_mid": df['bb20_mid'].iloc[-1]
-        }
     return None
 
 # ==============================================================================
@@ -111,11 +146,10 @@ def detect_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 _last_update_id: Optional[int] = None
 _paused = False
 
+# ... (Les fonctions de gestion Telegram process_callback_query, process_message, poll_telegram_updates restent INCHANGÉES) ...
 def process_callback_query(callback_query: Dict):
-    """Gère les clics sur les boutons interactifs."""
     global _paused
     data = callback_query.get('data', '')
-    
     if data == 'pause':
         _paused = True
         notifier.tg_send("⏸️ Bot mis en pause.")
@@ -128,22 +162,17 @@ def process_callback_query(callback_query: Dict):
     elif data.startswith('close_trade_'):
         try:
             trade_id = int(data.split('_')[-1])
-            notifier.tg_send(f"Ordre de fermeture pour le trade #{trade_id} en cours...")
             trader.close_position_manually(create_exchange(), trade_id)
         except (ValueError, IndexError):
             notifier.tg_send("Commande de fermeture invalide.")
-
 def process_message(message: Dict):
-    """Gère les commandes textuelles de l'utilisateur."""
     text = message.get("text", "").strip().lower()
     if text.startswith("/start"):
         notifier.send_main_menu(_paused)
     elif text.startswith("/pos"):
         positions = database.get_open_positions()
         notifier.format_open_positions(positions)
-
 def poll_telegram_updates():
-    """Récupère et distribue les mises à jour de Telegram."""
     global _last_update_id
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
     for upd in updates:
@@ -152,6 +181,7 @@ def poll_telegram_updates():
             process_callback_query(upd['callback_query'])
         elif 'message' in upd:
             process_message(upd['message'])
+# ==============================================================================
 
 def main():
     ex = create_exchange()
@@ -163,11 +193,10 @@ def main():
         trader.RISK_PER_TRADE_PERCENT
     )
     
-    universe = build_universe(ex) # CET APPEL EST MAINTENANT VALIDE
+    universe = build_universe(ex)
     if not universe:
         notifier.tg_send("❌ Impossible de construire l'univers de trading. Arrêt du bot.")
         return
-        
     print(f"Univers de trading chargé avec {len(universe)} paires.")
     
     last_ts_seen = {}
@@ -181,24 +210,28 @@ def main():
                 time.sleep(LOOP_DELAY)
                 continue
             
-            # APPEL À LA FONCTION MANQUANTE DANS TRADER.PY (VOIR CORRECTION CI-DESSOUS)
-            # trader.manage_open_positions(ex) 
+            trader.manage_open_positions(ex)
             
-            print("Scanning de l'univers...")
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Début du scan de l'univers...")
             for symbol in universe:
+                # Récupérer les données pour UNE SEULE unité de temps
                 df = fetch_ohlcv_df(ex, symbol, TIMEFRAME)
+                
                 if df is None or df.empty:
                     continue
                 
                 last_candle_ts = df.index[-1]
                 if symbol in last_ts_seen and last_ts_seen[symbol] == last_candle_ts:
-                    continue # On a déjà vu cette bougie
-                
+                    continue 
                 last_ts_seen[symbol] = last_candle_ts
 
+                # Détecter le signal en utilisant le dataframe unique
                 signal = detect_signal(df)
+                
                 if signal:
-                    print(f"Signal détecté pour {symbol}!")
+                    print(f"✅ Signal '{signal['regime']}' détecté pour {symbol}!")
+                    # Le dataframe `df` contient maintenant toutes les BB calculées,
+                    # il peut être passé directement à la fonction de charting.
                     trader.execute_trade(ex, symbol, signal, df)
 
             print(f"Fin du scan. Prochain scan dans {LOOP_DELAY} secondes.")
