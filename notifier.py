@@ -2,88 +2,81 @@ import os
 import time
 import html
 import requests
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
-# =========================
-# ENV – Telegram
-# =========================
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-# =========================
-# FONCTIONS DE BASE (Corrigées)
-# =========================
+_SIGNALS_BUFFER: List[Dict[str, Any]] = []
+_BUFFER_HORIZON_SEC = 3600
 
-def _escape_html(text: str) -> str:
-    return html.escape(str(text))
+def _escape(text: str) -> str: return html.escape(str(text))
 
 def tg_send(text: str, **kwargs) -> bool:
-    """
-    Envoie un message à Telegram. Gère les erreurs.
-    Le texte doit déjà être formaté en HTML si nécessaire.
-    """
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("Erreur: Token ou Chat ID Telegram manquant.")
-        return False
+    if not TG_TOKEN or not TG_CHAT_ID: return False
     try:
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            **kwargs
-        }
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", **kwargs}
         r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
         return r.json().get("ok", False)
-    except Exception as e:
-        print(f"Erreur d'envoi Telegram: {e}")
-        return False
+    except Exception: return False
 
-# =========================
-# NOUVELLES NOTIFICATIONS FORMATÉES
-# =========================
+def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
+    params = {"timeout": 1}
+    if offset: params["offset"] = offset
+    try:
+        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
+        data = r.json()
+        return data.get("result", []) if data.get("ok") else []
+    except Exception: return []
 
-def tg_send_start_banner(platform_mode: str, trading_mode: str, risk_percent: float):
-    """
-    Envoie une belle bannière de démarrage.
-    """
+def format_start_message(platform: str, trading: str, risk: float):
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    message = (
+    tg_send(
         f"<b>🔔 Darwin Bot Démarré</b>\n\n"
-        f" plateforme: <code>{_escape_html(platform_mode)}</code>\n"
-        f" Mode de trading: <b>{_escape_html(trading_mode)}</b>\n"
-        f" Risque par trade: <code>{risk_percent}%</code>\n\n"
+        f" plateforme: <code>{_escape(platform)}</code>\n"
+        f" Mode: <b>{_escape(trading)}</b>\n"
+        f" Risque: <code>{risk}%</code>\n\n"
         f"<i>{now}</i>"
     )
-    tg_send(message)
 
+def format_config_message(params: Dict[str, Any]) -> str:
+    lines = ["<b>⚙️ Configuration Active</b>"]
+    for key, value in params.items():
+        lines.append(f"• {_escape(key)}: <code>{_escape(value)}</code>")
+    return "\n".join(lines)
 
-def tg_format_trade(symbol: str, signal: Dict[str, Any], quantity: float, mode: str) -> str:
-    """
-    Formate un message de trade (réel ou papier) avec des émojis.
-    """
+def format_mode_message(platform: str, trading: str) -> str:
+    return f"🧭 <b>Mode Actuel</b>\n• Plateforme: <code>{_escape(platform)}</code>\n• Trading: <b>{_escape(trading)}</b>"
+
+def format_stats_message() -> str:
+    return "📈 Les statistiques de performance ne sont pas encore implémentées."
+
+def remember_signal_message(symbol: str, side: str, rr: float):
+    now = int(time.time())
+    _SIGNALS_BUFFER.append({"ts": now, "symbol": symbol, "side": side, "rr": rr})
+    while _SIGNALS_BUFFER and _SIGNALS_BUFFER[0]["ts"] < (now - _BUFFER_HORIZON_SEC):
+        _SIGNALS_BUFFER.pop(0)
+
+def signals_last_hour_text() -> str:
+    if not _SIGNALS_BUFFER: return "🚀 Aucun signal détecté dans la dernière heure."
+    lines = ["<b>🚀 Signaux de la dernière heure</b>"]
+    for s in _SIGNALS_BUFFER:
+        lines.append(f"• <code>{_escape(s['symbol'])}</code> {s['side'].upper()} (RR x{s['rr']:.1f})")
+    return "\n".join(lines)
+
+def format_trade_message(symbol: str, signal: Dict[str, Any], quantity: float, mode: str) -> str:
     side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
     mode_icon = "📝" if mode == 'PAPIER' else "✅"
-
     return (
         f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
-        f" paire: <code>{_escape_html(symbol)}</code>\n"
-        f" Type: <b>{_escape_html(signal['regime'].capitalize())}</b>\n\n"
+        f" paire: <code>{_escape(symbol)}</code>\n"
+        f" Type: <b>{_escape(signal['regime'].capitalize())}</b>\n\n"
         f" Entrée: <code>{signal['entry']:.5f}</code>\n"
         f" SL: <code>{signal['sl']:.5f}</code>\n"
         f" TP: <code>{signal['tp']:.5f}</code>\n\n"
-        f" Quantité: <code>{quantity:.4f}</code>\n"
-        f" RR: <b>x{signal['rr']:.2f}</b>"
+        f" Quantité: <code>{quantity:.4f}</code> | RR: <b>x{signal['rr']:.2f}</b>"
     )
 
-def tg_send_error(title: str, error_message: Any):
-    """
-    Envoie un message d'erreur formaté.
-    """
-    message = (
-        f"❌ <b>Erreur: {_escape_html(title)}</b>\n\n"
-        f"<code>{_escape_html(error_message)}</code>"
-    )
-    tg_send(message)
+def tg_send_error(title: str, error: Any):
+    tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(error)}</code>")
