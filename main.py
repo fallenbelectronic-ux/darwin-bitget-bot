@@ -7,7 +7,7 @@ from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import pytz
-import traceback # Module pour obtenir des détails complets sur les erreurs
+import traceback
 
 import database
 import trader
@@ -26,7 +26,7 @@ MM_DEAD_ZONE_PERCENT = float(os.getenv("MM_DEAD_ZONE_PERCENT", "0.1"))
 TICK_RATIO       = 0.0005
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
 FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"]
-TIMEZONE         = os.getenv("TIMEZONE", "UTC")
+TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
 REPORT_HOUR      = int(os.getenv("REPORT_HOUR", "21"))
 REPORT_WEEKDAY   = int(os.getenv("REPORT_WEEKDAY", "6"))
 
@@ -41,9 +41,7 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
     try:
         markets = ex.load_markets()
         symbols = [m['symbol'] for m in markets.values() if m.get('swap') and m.get('quote') == 'USDT' and m.get('linear')]
-        if not symbols:
-            print("Aucun symbole trouvé via l'API, utilisation de la liste de secours.")
-            return FALLBACK_TESTNET
+        if not symbols: return FALLBACK_TESTNET
         return symbols[:UNIVERSE_SIZE]
     except Exception as e:
         print(f"Impossible de construire l'univers via l'API. Erreur: {e}. Utilisation de la liste de secours.")
@@ -65,7 +63,7 @@ def detect_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if last['low'] <= last['bb20_lo'] and last['low'] <= last['bb80_lo'] and last['close'] > last['bb20_lo']:
             entry, sl, tp = last['close'], last['low']-(2*tick_size), last['bb20_mid']
             if entry > sl and (tp-entry)/(entry-sl) >= MIN_RR: signal = {"side":"buy", "regime":"Contre-tendance", "entry":entry, "sl":sl, "tp":tp, "rr":(tp-entry)/(entry-sl)}
-        elif last['high'] >= last['bb20_up'] and last['high'] >= last['bb80_up'] and last['close'] < last['bb20_up']:
+        elif last['high'] >= last['bb80_up'] and last['high'] >= last['bb80_up'] and last['close'] < last['bb20_up']:
             entry, sl, tp = last['close'], last['high']+(2*tick_size), last['bb20_mid']
             if entry < sl and (entry-tp)/(sl-entry) >= MIN_RR: signal = {"side":"sell", "regime":"Contre-tendance", "entry":entry, "sl":sl, "tp":tp, "rr":(entry-tp)/(sl-entry)}
     if signal: signal['bb20_mid'] = last['bb20_mid']; return signal
@@ -98,18 +96,28 @@ def check_scheduled_reports():
         _last_daily_report_day = now.day; one_day_ago = int(time.time()) - 24 * 60 * 60; trades = database.get_closed_trades_since(one_day_ago); notifier.send_report("📊 Bilan Quotidien (24h)", trades)
     if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
         _last_weekly_report_day = now.day; seven_days_ago = int(time.time()) - 7 * 24 * 60 * 60; trades = database.get_closed_trades_since(seven_days_ago); notifier.send_report("🗓️ Bilan Hebdomadaire", trades)
+
+# ==============================================================================
+# CORRECTION DE L'ERREUR D'INDENTATION
+# ==============================================================================
 def poll_telegram_updates():
+    """Récupère et distribue les mises à jour de Telegram."""
     global _last_update_id
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
-    for upd in updates: _last_update_id = upd.get("update_id", _last_update_id);
-    if 'callback_query' in upd: process_callback_query(upd['callback_query'])
-    elif 'message' in upd: process_message(upd['message'])
+    
+    # La logique de traitement doit être A L'INTERIEUR de la boucle
+    for upd in updates:
+        _last_update_id = upd.get("update_id", _last_update_id)
+        if 'callback_query' in upd:
+            process_callback_query(upd['callback_query'])
+        elif 'message' in upd:
+            process_message(upd['message'])
+# ==============================================================================
 
-# --- NOUVELLE VERSION DE LA FONCTION main() AVEC LOGS DÉTAILLÉS ---
 def main():
     ex = create_exchange()
     database.setup_database()
-    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if trader.PAPER_TRADING_MODE else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
+    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPER" if trader.PAPER_TRADING_MODE else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
     universe = build_universe(ex)
     if not universe:
         notifier.tg_send("❌ Impossible de construire l'univers de trading. Arrêt du bot.")
@@ -119,14 +127,11 @@ def main():
     last_ts_seen = {}
     
     while True:
-        # LOG AJOUTÉ : Marque le début de chaque cycle
         print(f"\n--- [{time.strftime('%Y-%m-%d %H:%M:%S')}] Nouveau cycle de la boucle ---")
         try:
-            # LOG AJOUTÉ : Étape 1
             print("1. Vérification des mises à jour Telegram...")
             poll_telegram_updates()
 
-            # LOG AJOUTÉ : Étape 2
             print("2. Vérification des rapports planifiés...")
             check_scheduled_reports()
             
@@ -135,11 +140,9 @@ def main():
                 time.sleep(LOOP_DELAY)
                 continue
             
-            # LOG AJOUTÉ : Étape 3
             print("3. Gestion des positions ouvertes (TP dynamique)...")
             trader.manage_open_positions(ex)
             
-            # LOG AJOUTÉ : Étape 4 (le message que vous attendiez)
             print(f"4. Début du scan de l'univers ({len(universe)} paires)...")
             for symbol in universe:
                 df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
@@ -161,7 +164,6 @@ def main():
             notifier.tg_send("⛔ Arrêt manuel.")
             break
         except Exception as e:
-            # LOG AMÉLIORÉ : Affiche l'erreur complète pour un diagnostic facile
             print("\n--- ERREUR CRITIQUE DANS LA BOUCLE PRINCIPALE ---")
             error_details = traceback.format_exc()
             print(error_details)
