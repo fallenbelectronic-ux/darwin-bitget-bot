@@ -1,81 +1,68 @@
-# Fichier: trader.py
+# Fichier: notifier.py
 import os
 import time
-import ccxt
+import html
+import requests
+import io
 from typing import Dict, Any
-import pandas as pd
-import database
-import notifier
-import charting
 
-PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() in ("1", "true", "yes")
-RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
-LEVERAGE = 2
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-def get_usdt_balance(ex: ccxt.Exchange) -> float:
+def _escape(text: str) -> str:
+    """Échappe les caractères HTML pour éviter les erreurs de parsing."""
+    return html.escape(str(text))
+
+def tg_send(text: str):
+    """Envoie un message texte simple à Telegram."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Erreur: Token ou Chat ID Telegram manquant.")
+        return
     try:
-        return float(ex.fetch_balance()['total'].get('USDT', 0.0))
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
-        notifier.tg_send_error("Récupération du solde", e)
-        return 0.0
+        print(f"Erreur d'envoi Telegram: {e}")
 
-def calculate_position_size(balance: float, risk_percent: float, entry_price: float, sl_price: float) -> float:
-    if balance <= 0 or entry_price == sl_price: return 0.0
-    risk_amount_usdt = balance * (risk_percent / 100.0)
-    price_diff_per_unit = abs(entry_price - sl_price)
-    return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
+def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str):
+    """Envoie une photo avec une légende à Telegram."""
+    if not photo_buffer:
+        return tg_send(caption)
+    try:
+        files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
+        payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+        requests.post(f"{TELEGRAM_API}/sendPhoto", data=payload, files=files, timeout=20)
+    except Exception as e:
+        tg_send(f"⚠️ Erreur de graphique\n{caption}")
 
-def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
-    max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', 3))
-    if len(database.get_open_positions()) >= max_pos:
-        return
+def format_start_message(platform: str, trading: str, risk: float):
+    """Formate et envoie la bannière de démarrage."""
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"<b>🔔 Darwin Bot Démarré</b>\n\n"
+        f" plateforme: <code>{_escape(platform)}</code>\n"
+        f" Mode: <b>{_escape(trading)}</b>\n"
+        f" Risque: <code>{risk}%</code>\n\n"
+        f"<i>{now}</i>"
+    )
+    tg_send(msg)
 
-    if symbol in database.get_setting('BLACKLIST', []):
-        return
-        
-    if database.is_position_open(symbol):
-        return
-
-    current_risk = RISK_PER_TRADE_PERCENT
-    if database.get_setting('DYNAMIC_RISK_ENABLED', False):
-        pass
-
-    balance = get_usdt_balance(ex)
-    if balance <= 10:
-        return
-    
-    quantity = calculate_position_size(balance, current_risk, signal['entry'], signal['sl'])
-    if quantity <= 0:
-        return
-
-    mode_text = "PAPIER" if PAPER_TRADING_MODE else "RÉEL"
-    trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, current_risk)
-    chart_image = charting.generate_trade_chart(symbol, df, signal)
-
-    if not PAPER_TRADING_MODE:
-        try:
-            ex.set_leverage(LEVERAGE, symbol)
-            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}
-            ex.create_market_order(symbol, signal['side'], quantity, params=params)
-        except Exception as e:
-            notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
-            return
-
-    notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
-    
-    database.create_trade(
-        symbol=symbol,
-        side=signal['side'],
-        regime=signal['regime'],
-        status='OPEN',
-        entry_price=signal['entry'],
-        sl_price=signal['sl'],
-        tp_price=signal['tp'],
-        quantity=quantity,
-        risk_percent=current_risk,
-        open_timestamp=int(time.time()),
-        bb20_mid_at_entry=signal.get('bb20_mid')
+def format_trade_message(symbol: str, signal: Dict[str, Any], quantity: float, mode: str, risk: float) -> str:
+    """Formate le message de notification pour un trade."""
+    side_icon = "📈" if signal['side'] == 'buy' else "📉"
+    mode_icon = "📝" if mode == 'PAPIER' else "✅"
+    return (
+        f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
+        f" paire: <code>{_escape(symbol)}</code>\n"
+        f" Type: <b>{_escape(signal['regime'].capitalize())}</b>\n\n"
+        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
+        f" SL: <code>{signal['sl']:.5f}</code>\n"
+        f" TP: <code>{signal['tp']:.5f}</code>\n\n"
+        f" Quantité: <code>{quantity:.4f}</code>\n"
+        f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
     )
 
-def manage_open_positions(ex: ccxt.Exchange):
-    pass
+def tg_send_error(title: str, error: Any):
+    """Envoie un message d'erreur formaté."""
+    tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(error)}</code>")
