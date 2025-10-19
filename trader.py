@@ -27,23 +27,26 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', 3))
-    if len(database.get_open_positions()) >= max_pos: return
+    if len(database.get_open_positions()) >= max_pos:
+        return
 
-    blacklist = database.get_setting('BLACKLIST', [])
-    if symbol in blacklist: return
+    if symbol in database.get_setting('BLACKLIST', []):
+        return
         
-    if database.is_position_open(symbol): return
+    if database.is_position_open(symbol):
+        return
 
     current_risk = RISK_PER_TRADE_PERCENT
     if database.get_setting('DYNAMIC_RISK_ENABLED', False):
-        # Votre logique de risque dynamique ici
         pass
 
     balance = get_usdt_balance(ex)
-    if balance <= 10: return
+    if balance <= 10:
+        return
     
     quantity = calculate_position_size(balance, current_risk, signal['entry'], signal['sl'])
-    if quantity <= 0: return
+    if quantity <= 0:
+        return
 
     mode_text = "PAPIER" if PAPER_TRADING_MODE else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, current_risk)
@@ -60,7 +63,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
     
-    # --- APPEL CORRIGÉ ---
     database.create_trade(
         symbol=symbol,
         side=signal['side'],
@@ -76,5 +78,4 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     )
 
 def manage_open_positions(ex: ccxt.Exchange):
-    # Votre logique de gestion (BE, etc.) ici
     pass
