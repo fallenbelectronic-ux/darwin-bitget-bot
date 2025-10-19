@@ -1,12 +1,38 @@
 # Fichier: main.py
-import os, time, ccxt, pandas as pd
+import os
+import time
+import ccxt
+import pandas as pd
 from ta.volatility import BollingerBands
-import database, trader, notifier
+from typing import List, Dict, Any, Optional # IMPORT CORRIGÉ
+import database
+import trader
+import notifier
 
-# --- (Toute la section des PARAMS et des fonctions de base (create_exchange, etc.) reste ici) ---
-# ... (copiez-collez cette section depuis la réponse précédente, elle est stable)
+# --- (Toute la section des PARAMS et des fonctions de base (create_exchange, etc.) est stable) ---
+BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
+API_KEY          = os.getenv("BITGET_API_KEY", "")
+API_SECRET       = os.getenv("BITGET_API_SECRET", "")
+PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
+TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
+UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
+MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
+MM80_DEAD_ZONE_PERCENT = float(os.getenv("MM80_DEAD_ZONE_PERCENT", "0.1"))
+LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
+TICK_RATIO       = 0.0005
+FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"]
 
-_last_update_id = None
+def create_exchange():
+    ex = ccxt.bitget({
+        "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASSE,
+        "enableRateLimit": True, "options": {"defaultType": "swap", "testnet": BITGET_TESTNET}
+    })
+    if BITGET_TESTNET: ex.set_sandbox_mode(True)
+    return ex
+    
+# ... (les autres fonctions de base comme fetch_ohlcv_df, build_universe, detect_signal sont ici)
+
+_last_update_id: Optional[int] = None
 _paused = False
 
 def process_callback_query(callback_query: Dict):
@@ -35,7 +61,7 @@ def process_message(message: Dict):
     """Gère les commandes textuelles de l'utilisateur."""
     text = message.get("text", "").strip().lower()
     if text.startswith("/start"):
-        notifier.format_start_message(_paused)
+        notifier.send_main_menu(_paused)
     elif text.startswith("/pos"):
         positions = database.get_open_positions()
         notifier.format_open_positions(positions)
@@ -55,7 +81,12 @@ def main():
     ex = create_exchange()
     database.setup_database()
 
-    print("Bot démarré. Envoyez /start sur Telegram pour afficher le menu.")
+    # APPEL CORRIGÉ
+    notifier.send_start_banner(
+        "TESTNET" if BITGET_TESTNET else "LIVE",
+        "PAPIER" if trader.PAPER_TRADING_MODE else "RÉEL",
+        trader.RISK_PER_TRADE_PERCENT
+    )
     
     universe = build_universe(ex)
     last_ts_seen = {}
@@ -71,14 +102,7 @@ def main():
             
             trader.manage_open_positions(ex)
             
-            for sym in universe:
-                df = fetch_ohlcv_df(ex, sym, TIMEFRAME)
-                if df is None or last_ts_seen.get(sym) == df.index[-1]: continue
-                last_ts_seen[sym] = df.index[-1]
-                
-                sig = detect_signal(df, state, sym)
-                if sig:
-                    trader.execute_trade(ex, sym, sig, df)
+            # ... (la boucle de scan reste ici)
             
             time.sleep(LOOP_DELAY)
 
@@ -89,6 +113,8 @@ def main():
             notifier.tg_send_error("Erreur critique (boucle)", e)
             print(f"Erreur critique: {e}")
             time.sleep(15)
+
+# N'oubliez pas de copier-coller les fonctions de base (fetch_ohlcv, build_universe, etc.) ici
 
 if __name__ == "__main__":
     main()
