@@ -376,6 +376,7 @@ def main():
     universe = build_universe(ex)
     last_ts_seen: Dict[str, pd.Timestamp] = {}
     state: Dict[str, Any] = {}
+    
 
     # Gestion “scan une fois à la clôture” + agrégation des meilleurs signaux par heure
     last_hour_bucket: Optional[pd.Timestamp] = None
