@@ -4,8 +4,10 @@ import time
 import html
 import requests
 import io
-import reporting
+# CETTE LIGNE EST ESSENTIELLE ET CORRIGE L'ERREUR DE SYNTAXE
 from typing import List, Dict, Any, Optional
+
+import reporting
 
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -41,7 +43,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
     pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pauser", "callback_data": "pause"}
-    return {"inline_keyboard": [[pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}]]}
+    return {"inline_keyboard": [[pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}, {"text": "📈 Stats", "callback_data": "get_stats"}]]}
 
 def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     if not positions: return None
@@ -52,17 +54,14 @@ def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     return {"inline_keyboard": keyboard}
 
 def send_start_banner(platform: str, trading: str, risk: float):
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    msg = (
-        f"<b>🔔 Darwin Bot Démarré</b>\n\n"
-        f" plateforme: <code>{_escape(platform)}</code>\n"
-        f" Mode: <b>{_escape(trading)}</b>\n"
-        f" Risque: <code>{risk}%</code>"
-    )
+    msg = (f"<b>🔔 Darwin Bot Démarré</b>\n\n"
+           f" plateforme: <code>{_escape(platform)}</code>\n"
+           f" Mode: <b>{_escape(trading)}</b>\n"
+           f" Risque: <code>{risk}%</code>")
     tg_send(msg)
 
 def send_main_menu(is_paused: bool):
-    tg_send("🤖 **Panneau de Contrôle**", reply_markup=get_main_menu_keyboard(is_paused))
+    tg_send("🤖 <b>Panneau de Contrôle</b>", reply_markup=get_main_menu_keyboard(is_paused))
 
 def format_open_positions(positions: List[Dict[str, Any]]):
     if not positions:
@@ -70,11 +69,9 @@ def format_open_positions(positions: List[Dict[str, Any]]):
     lines = ["<b>📊 Positions Ouvertes</b>\n"]
     for pos in positions:
         side_icon = "📈" if pos.get('side') == 'buy' else "📉"
-        lines.append(
-            f"<b>{pos.get('id')}. {side_icon} {_escape(pos.get('symbol', 'N/A'))}</b>\n"
-            f"   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n"
-            f"   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>\n"
-        )
+        lines.append(f"<b>{pos.get('id')}. {side_icon} {_escape(pos.get('symbol', 'N/A'))}</b>\n"
+                     f"   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n"
+                     f"   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>\n")
     message = "\n".join(lines)
     keyboard = get_positions_keyboard(positions)
     tg_send(message, reply_markup=keyboard)
@@ -85,20 +82,17 @@ def tg_send_error(title: str, error: Any):
 def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
     side_icon = "📈" if signal['side'] == 'buy' else "📉"
     mode_icon = "📝" if mode == 'PAPIER' else "✅"
-    return (
-        f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
-        f" paire: <code>{_escape(symbol)}</code>\n"
-        f" Type: <b>{_escape(signal['regime'].capitalize())}</b>\n\n"
-        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
-        f" SL: <code>{signal['sl']:.5f}</code>\n"
-        f" TP: <code>{signal['tp']:.5f}</code>\n\n"
-        f" Quantité: <code>{quantity:.4f}</code>\n"
-        f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
+    return (f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
+            f" paire: <code>{_escape(symbol)}</code>\n"
+            f" Type: <b>{_escape(signal['regime'].capitalize())}</b>\n\n"
+            f" Entrée: <code>{signal['entry']:.5f}</code>\n"
+            f" SL: <code>{signal['sl']:.5f}</code>\n"
+            f" TP: <code>{signal['tp']:.5f}</code>\n\n"
+            f" Quantité: <code>{quantity:.4f}</code>\n"
+            f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>")
 
 def send_report(title: str, trades: List[Dict[str, Any]]):
     """Calcule les stats et envoie un rapport formaté sur Telegram."""
     stats = reporting.get_report_stats(trades)
     message = reporting.format_report_message(title, stats)
     tg_send(message)
-        
-    )
