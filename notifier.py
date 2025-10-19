@@ -1,187 +1,155 @@
-# ========= notifier.py  (remplacer intégralement ce fichier) =========
-import os
-import time
-from datetime import datetime, timezone, date
-import requests
+import os, time, requests
+from datetime import datetime, timedelta, timezone
 
-# --- ENV
-TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # peut être vide au démarrage ; le bot peut l’annoncer et tu le fixes ensuite
-TZ_NAME    = os.getenv("TIMEZONE", "Europe/Lisbon")
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
 
-API_BASE   = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else None
+# Mémoire des messages (pour purge manuelle et /signals)
+_last_msg_ids         = []           # tous messages envoyés par le bot (IDs)
+_last_hour_signals    = []           # [(ts_utc, msg_id, symbol, sigdict)]
+_MAX_REMEMBERED       = 200
 
-# ---- Utils bas niveau ------------------------------------------------
-def _api_get(method: str, params: dict | None = None, timeout: int = 10):
-    if not API_BASE:
+def _api_url(method):
+    return f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+
+def tg_send(text, remember_for_signals=False):
+    """
+    Envoie un message ; retourne message_id. 
+    Si remember_for_signals=True, il sera visible dans /signals (1h).
+    """
+    if not TG_TOKEN or not TG_CHAT_ID:
         return None
     try:
-        r = requests.get(f"{API_BASE}/{method}", params=params or {}, timeout=timeout)
-        return r.json()
+        r = requests.post(_api_url("sendMessage"), json={
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10).json()
+        if r.get("ok"):
+            msg_id = r["result"]["message_id"]
+            _remember_msg_id(msg_id)
+            if remember_for_signals:
+                _remember_signal(msg_id, text)
+            return msg_id
     except Exception:
-        return None
+        pass
+    return None
 
-def _api_post(method: str, data: dict | None = None, timeout: int = 10):
-    if not API_BASE:
-        return None
-    try:
-        r = requests.post(f"{API_BASE}/{method}", data=data or {}, timeout=timeout)
-        return r.json()
-    except Exception:
-        return None
-
-# ---- Fonctions publiques de santé -----------------------------------
-def tg_delete_webhook():
-    """Supprime un webhook laissé actif (sinon getUpdates ne renvoie rien)."""
-    return _api_get("deleteWebhook")
-
-def tg_get_me():
-    """Renvoie les infos du bot (username, id…)."""
-    return _api_get("getMe")
-
-# ---- Envoi de messages -----------------------------------------------
-def tg_send(text: str, kind: str | None = None, chat_id: str | None = None, disable_preview: bool = True):
-    """
-    Envoie un message Markdown V2 (simple Markdown sécurisé) au chat.
-    kind n’est pas utilisé par l’API, mais sert à nos purges (étiquette logique).
-    """
-    cid = str(chat_id or TG_CHAT_ID or "").strip()
-    if not API_BASE or not cid:
-        # On n'échoue pas brutalement : utile pendant l'initialisation
-        print("[tg_send skipped] chat_id or token missing")
-        return None
-    # On n’ajoute aucun préfixe parasite : filtrage via heuristique plus bas
-    payload = {
-        "chat_id": cid,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": disable_preview,
-    }
-    return _api_post("sendMessage", payload)
-
-# ---- Lecture d’updates (long-poll ou ponctuel) -----------------------
-def tg_get_updates_raw(offset: int | None = None, timeout: int = 50):
-    params = {"timeout": timeout}
-    if offset is not None:
-        params["offset"] = offset
-    return _api_get("getUpdates", params, timeout=timeout+5)
-
-# ---- Suppression ------------------------------------------------------
-def delete_message(message_id: int, chat_id: str | None = None):
-    cid = str(chat_id or TG_CHAT_ID or "").strip()
-    if not cid or not API_BASE:
-        return None
-    return _api_post("deleteMessage", {"chat_id": cid, "message_id": message_id})
-
-# ---- Heuristiques "type" de message (pour purge sélective) -----------
-def _infer_kind_from_text(txt: str) -> str:
-    """
-    Classe grossière pour purge:
-      'signal' si le message contient 'Signal' et des champs Entrée/SL/TP
-      'trade'  si 'Trade exécuté' ou 'Trade clos'
-      sinon 'info'
-    """
-    t = (txt or "").lower()
-    if "signal" in t and ("entrée" in t or "entree" in t) and ("sl" in t and "tp" in t):
-        return "signal"
-    if ("trade exécuté" in t) or ("trade execute" in t) or ("trade clos" in t):
-        return "trade"
-    return "info"
-
-def _is_today_utc(ts: int) -> bool:
-    d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-    return d == date.today()
-
-# ---- Purges ----------------------------------------------------------
-def purge_chat(keep_kinds: tuple[str, ...] = ("signal", "trade"), keep_only_today: bool = True, scan_pages: int = 5):
-    """
-    Supprime un maximum de messages récents envoyés par / à destination du bot,
-    en conservant:
-      - uniquement les 'signal' & 'trade' (par défaut)
-      - et, optionnellement, uniquement ceux d’aujourd’hui (keep_only_today=True)
-    NB : un bot ne peut pas "lister l’historique" ; on re-parcourt les updates récents.
-    """
-    last_id = None
-    kept = 0
-    deleted = 0
-    for _ in range(max(1, scan_pages)):
-        data = tg_get_updates_raw(offset=last_id+1 if last_id else None, timeout=2)
-        if not data or not data.get("ok"):
-            break
-        items = data.get("result", [])
-        if not items:
-            break
-        for upd in items:
-            last_id = upd.get("update_id", last_id)
-            msg = upd.get("message") or upd.get("edited_message") or upd.get("channel_post") or upd.get("edited_channel_post")
-            if not msg:
-                continue
-            # On ne purge que les messages du chat ciblé (si renseigné)
-            chat = msg.get("chat", {})
-            if str(TG_CHAT_ID or chat.get("id")) != str(chat.get("id")):
-                # Si TG_CHAT_ID est vide, on le "fixe" implicitement à ce chat :
-                if not TG_CHAT_ID:
-                    pass
-                else:
-                    continue
-
-            mid  = msg.get("message_id")
-            text = msg.get("text") or ""
-            kind = _infer_kind_from_text(text)
-            ts   = int(msg.get("date", 0))
-
-            keep = True
-            if keep_kinds and kind not in keep_kinds:
-                keep = False
-            if keep_only_today and not _is_today_utc(ts):
-                keep = False
-
-            if not keep and mid:
-                delete_message(mid)
-                deleted += 1
-            else:
-                kept += 1
-
-        # petite pause entre pages
-        time.sleep(0.4)
-
-    tg_send(f"🧹 Purge: *{deleted}* supprimé(s), *{kept}* conservé(s).", kind="info")
-
-
-def purge_last(n: int = 100):
-    """Supprime au mieux les n derniers messages accessibles via getUpdates."""
-    deleted = 0
-    # on récupère un "lot" récent
-    data = tg_get_updates_raw(timeout=2)
-    if not data or not data.get("ok"):
-        tg_send("⚠️ Purge: impossible de lire les updates.", kind="info")
+def send_document(filepath, filename=None):
+    if not TG_TOKEN or not TG_CHAT_ID or not os.path.exists(filepath):
         return
-    items = list(reversed(data.get("result", [])))  # derniers en premier
-    for upd in items:
-        if deleted >= n:
-            break
-        msg = upd.get("message") or upd.get("edited_message") or upd.get("channel_post") or upd.get("edited_channel_post")
-        if not msg:
-            continue
-        chat = msg.get("chat", {})
-        if str(TG_CHAT_ID or chat.get("id")) != str(chat.get("id")):
-            if TG_CHAT_ID:
-                continue
-        mid = msg.get("message_id")
-        if mid:
-            delete_message(mid); deleted += 1
-    tg_send(f"🧹 Purge {n}: *{deleted}* supprimé(s).", kind="info")
+    files = {"document": open(filepath, "rb")}
+    data  = {"chat_id": TG_CHAT_ID}
+    if filename:
+        data["caption"] = filename
+    try:
+        r = requests.post(_api_url("sendDocument"), data=data, files=files, timeout=20).json()
+        if r.get("ok"):
+            _remember_msg_id(r["result"]["message_id"])
+    except Exception:
+        pass
+    finally:
+        try: files["document"].close()
+        except Exception: pass
 
-def purge_last_100():
-    purge_last(100)
+def tg_get_updates(offset=None):
+    url = _api_url("getUpdates")
+    if offset is not None:
+        url += f"?offset={offset}"
+    try:
+        return requests.get(url, timeout=10).json()
+    except Exception:
+        return {"ok": False, "result": []}
 
-def delete_last_100():
-    purge_last_100()
+# ---------- Mémoire messages ----------
+def _remember_msg_id(msg_id):
+    if not msg_id: 
+        return
+    _last_msg_ids.append(int(msg_id))
+    if len(_last_msg_ids) > _MAX_REMEMBERED:
+        del _last_msg_ids[:len(_last_msg_ids)-_MAX_REMEMBERED]
 
-def nightly_signals_purge():
+def _remember_signal(msg_id, text):
+    # texte déjà formaté, mais on mémorise structure minimale
+    ts = datetime.now(timezone.utc)
+    _last_hour_signals.append((ts, msg_id, text))
+    # keep only last hour
+    cutoff = ts - timedelta(hours=1)
+    while _last_hour_signals and _last_hour_signals[0][0] < cutoff:
+        _last_hour_signals.pop(0)
+
+def remember_signal_message(msg_id, symbol, sigdict):
     """
-    À lancer en fin de journée si tu le souhaites :
-    on garde uniquement les signaux & trades *du jour* (tout le reste est supprimé).
+    API appelée par main.notify_signal – garde la structure exploitable si besoin.
     """
-    purge_chat(keep_kinds=("signal","trade"), keep_only_today=True, scan_pages=8)
-# ========= fin notifier.py ============================================
+    ts = datetime.now(timezone.utc)
+    text = (
+        f"{symbol} — {sigdict['side']} ({sigdict['regime']}) "
+        f"RR x{sigdict['rr']:.2f} @ {sigdict['entry']:.6f}"
+    )
+    _last_hour_signals.append((ts, msg_id, text))
+    cutoff = ts - timedelta(hours=1)
+    while _last_hour_signals and _last_hour_signals[0][0] < cutoff:
+        _last_hour_signals.pop(0)
+
+def signals_last_hour_text():
+    ts_now = datetime.now(timezone.utc)
+    cutoff = ts_now - timedelta(hours=1)
+    kept   = [(ts, mid, txt) for (ts, mid, txt) in _last_hour_signals if ts >= cutoff]
+    if not kept:
+        return "Aucun signal durant l’heure écoulée."
+    lines = ["*Signaux de la dernière heure*"]
+    for ts, mid, txt in kept[-20:]:
+        hhmm = ts.astimezone().strftime("%H:%M")
+        lines.append(f"• {hhmm} — {txt}")
+    return "\n".join(lines)
+
+# ---------- Purgers manuels ----------
+def purge_chat(silent=True):
+    """
+    Supprime les messages envoyés par CE bot (connus via _last_msg_ids).
+    Ne touche pas aux messages que le bot n’a pas mémorisés.
+    """
+    deleted=0
+    for mid in list(reversed(_last_msg_ids)):
+        if _delete_message(mid):
+            deleted += 1
+            try: _last_msg_ids.remove(mid)
+            except Exception: pass
+    if not silent:
+        tg_send(f"🧹 Purge: {deleted} supprimé(s).")
+    return deleted
+
+def purge_last_100(silent=True):
+    """
+    Supprime les 100 derniers messages du bot mémorisés.
+    """
+    deleted=0
+    for mid in list(reversed(_last_msg_ids[-100:])):
+        if _delete_message(mid):
+            deleted += 1
+            try: _last_msg_ids.remove(mid)
+            except Exception: pass
+    if not silent:
+        tg_send(f"🧹 Purge(100): {deleted} supprimé(s).")
+    return deleted
+
+def purge_all(silent=True):
+    """
+    Supprime tout ce qui est mémorisé (équivaut à un 'vider' local).
+    """
+    deleted = purge_chat(silent=True)
+    _last_hour_signals.clear()
+    if not silent:
+        tg_send(f"🧹 Purge totale: {deleted} supprimé(s).")
+
+def _delete_message(message_id:int):
+    if not TG_TOKEN or not TG_CHAT_ID or not message_id:
+        return False
+    try:
+        r = requests.post(_api_url("deleteMessage"), json={
+            "chat_id": TG_CHAT_ID, "message_id": int(message_id)
+        }, timeout=10).json()
+        return bool(r.get("ok"))
+    except Exception:
+        return False
