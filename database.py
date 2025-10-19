@@ -1,99 +1,78 @@
+# Fichier: database.py
 import os
+import json
 from typing import List, Dict, Any, Optional
 
-# ==============================================================================
-# INTERFACE DE BASE DE DONNÉES - À IMPLEMENTER PAR VOUS
-# ==============================================================================
-#
-# Ce fichier définit les fonctions que le robot de trading utilisera pour
-# interagir avec votre base de données.
-#
-# Votre tâche est de remplacer les "pass" par la logique de connexion
-# et de requêtage pour VOTRE base de données (PostgreSQL, MySQL, Redis, etc.)
-# en utilisant vos variables d'environnement.
-#
-# Exemple de récupération de vos identifiants :
-# DB_CONNECTION_STRING = os.getenv("DATABASE_URL", "")
-#
+# --- NOTE IMPORTANTE ---
+# Ce fichier est une INTERFACE. Vous devez implémenter la logique de connexion
+# et de requêtage pour votre base de données (PostgreSQL, SQLite, etc.)
 
 def setup_database():
     """
-    Initialise la connexion à la base de données et s'assure que les tables
-    nécessaires existent.
-    Cette fonction est appelée une seule fois au démarrage du bot.
+    Initialise la connexion et crée les tables si elles n'existent pas.
+    - 'trades': stocke chaque transaction.
+    - 'settings': un simple magasin clé-valeur pour la configuration du bot.
     """
-    # VOTRE LOGIQUE ICI
-    # Exemple :
-    # connection = psycopg2.connect(DB_CONNECTION_STRING)
-    # cursor = connection.cursor()
-    # cursor.execute("CREATE TABLE IF NOT EXISTS trades (...)")
-    # connection.commit()
-    print("Base de données connectée (simulation).")
+    # VOTRE LOGIQUE DE CONNEXION ICI
+    # EXEMPLE SQL (pour SQLite):
+    # CREATE TABLE IF NOT EXISTS trades (
+    #     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    #     symbol TEXT NOT NULL,
+    #     side TEXT NOT NULL,
+    #     status TEXT NOT NULL, -- 'OPEN', 'CLOSED_SL', 'CLOSED_TP', 'BREAKEVEN'
+    #     entry_price REAL NOT NULL,
+    #     sl_price REAL NOT NULL,
+    #     tp_price REAL NOT NULL,
+    #     quantity REAL NOT NULL,
+    #     open_timestamp INTEGER NOT NULL,
+    #     close_timestamp INTEGER,
+    #     pnl_percent REAL
+    # );
+    # CREATE TABLE IF NOT EXISTS settings (
+    #     key TEXT PRIMARY KEY,
+    #     value TEXT NOT NULL
+    # );
+    print("Base de données initialisée (simulation).")
     pass
 
+def get_setting(key: str, default: Any = None) -> Any:
+    """ Récupère un paramètre depuis la DB. """
+    # VOTRE LOGIQUE ICI (ex: SELECT value FROM settings WHERE key = ?)
+    # Les valeurs sont stockées en JSON (texte), il faut les décoder.
+    # Ex: return json.loads(value_from_db)
+    return default
 
-def is_position_open(symbol: str) -> bool:
-    """
-    Vérifie s'il existe une position avec le statut 'OPEN' ou 'BREAKEVEN'
-    pour un symbole donné.
-    
-    :param symbol: Le symbole à vérifier (ex: "BTC/USDT:USDT").
-    :return: True si une position est ouverte, False sinon.
-    """
-    # VOTRE LOGIQUE ICI
-    # Exemple :
-    # cursor.execute("SELECT 1 FROM trades WHERE symbol = %s AND status IN ('OPEN', 'BREAKEVEN')", (symbol,))
-    # return cursor.fetchone() is not None
-    return False # Valeur par défaut pour le développement
-
-
-def create_trade(symbol: str, side: str, regime: str, entry_price: float, sl_price: float, tp_price: float, quantity: float):
-    """
-    Enregistre un nouveau trade dans la base de données avec le statut 'OPEN'.
-    """
-    # VOTRE LOGIQUE ICI
-    # Exemple :
-    # cursor.execute(
-    #     "INSERT INTO trades (symbol, side, status, ...) VALUES (%s, %s, 'OPEN', ...)",
-    #     (symbol, side, ...)
-    # )
-    # connection.commit()
-    print(f"DB: Enregistrement du nouveau trade pour {symbol}.")
+def set_setting(key: str, value: Any):
+    """ Met à jour un paramètre. """
+    # VOTRE LOGIQUE ICI (ex: INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?))
+    # Les valeurs doivent être encodées en JSON.
+    # Ex: value_to_db = json.dumps(value)
+    print(f"DB: Paramètre '{key}' mis à jour.")
     pass
 
+# --- Fonctions de Trading ---
 
-def update_trade_status(trade_id: Any, new_status: str):
-    """
-    Met à jour le statut d'un trade existant.
-    Les statuts peuvent être : 'OPEN', 'BREAKEVEN', 'CLOSED_TP', 'CLOSED_SL', 'CLOSED_MANUAL'.
-    
-    :param trade_id: L'identifiant unique du trade dans votre DB.
-    :param new_status: Le nouveau statut.
-    """
-    # VOTRE LOGIQUE ICI
-    print(f"DB: Mise à jour du trade {trade_id} vers le statut {new_status}.")
+def create_trade(**kwargs):
+    """ Enregistre un nouveau trade. """
+    # VOTRE LOGIQUE ICI (ex: INSERT INTO trades (...) VALUES (...))
+    print(f"DB: Enregistrement du trade pour {kwargs.get('symbol')}.")
     pass
-
 
 def get_open_positions() -> List[Dict[str, Any]]:
-    """
-    Récupère toutes les positions qui sont actuellement ouvertes ('OPEN' ou 'BREAKEVEN').
-    
-    :return: Une liste de dictionnaires, où chaque dict représente un trade ouvert.
-             Le format attendu pour chaque dictionnaire est :
-             {
-                 "id": "identifiant_unique_du_trade",
-                 "symbol": "BTC/USDT:USDT",
-                 "side": "buy" ou "sell",
-                 "status": "OPEN" ou "BREAKEVEN",
-                 "entry_price": 12345.67,
-                 "sl_price": 12300.00,
-                 "tp_price": 12500.00,
-                 "quantity": 0.01,
-                 # Ajoutez d'autres champs si nécessaire (ex: bb20_mid pour le BE)
-                 "bb20_mid_at_entry": 9999.99
-             }
-    """
-    # VOTRE LOGIQUE ICI
-    # Renvoyez une liste vide si aucune position n'est ouverte.
-    return [] # Valeur par défaut pour le développement
+    """ Récupère toutes les positions ouvertes ou en break-even. """
+    # VOTRE LOGIQUE ICI (ex: SELECT * FROM trades WHERE status IN ('OPEN', 'BREAKEVEN'))
+    # Doit retourner une liste de dictionnaires.
+    return []
+
+def get_trade_by_id(trade_id: int) -> Optional[Dict[str, Any]]:
+    """ Récupère un trade spécifique par son ID. """
+    # VOTRE LOGIQUE ICI (ex: SELECT * FROM trades WHERE id = ?)
+    return None
+
+def close_trade(trade_id: int, status: str, pnl: float):
+    """ Met à jour un trade comme étant fermé. """
+    # VOTRE LOGIQUE ICI (ex: UPDATE trades SET status = ?, pnl_percent = ?, close_timestamp = ? WHERE id = ?)
+    print(f"DB: Fermeture du trade {trade_id} avec statut {status}.")
+    pass
+
+# ... Ajoutez d'autres fonctions si nécessaire (ex: pour les stats) ...
