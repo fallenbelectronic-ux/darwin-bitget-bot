@@ -5,3 +5,4 @@ requests
 ta
 matplotlib
 mplfinance
+pytz
