@@ -1,155 +1,150 @@
-import os, time, requests
-from datetime import datetime, timedelta, timezone
+# /app/notifier.py
+import os
+import time
+import json
+import requests
+from typing import Any, Dict, List, Optional, Tuple
 
-TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN","")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
+# --- ENV ----------------------------------------------------------------------
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Mémoire des messages (pour purge manuelle et /signals)
-_last_msg_ids         = []           # tous messages envoyés par le bot (IDs)
-_last_hour_signals    = []           # [(ts_utc, msg_id, symbol, sigdict)]
-_MAX_REMEMBERED       = 200
+TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-def _api_url(method):
-    return f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+# Sécurité basique : ne fait rien si token/chat_id manquants
+def _enabled() -> bool:
+    return bool(TG_TOKEN) and bool(TG_CHAT_ID)
 
-def tg_send(text, remember_for_signals=False):
+# --- ENVOI DE MESSAGES --------------------------------------------------------
+def tg_send(
+    text: str,
+    parse_mode: Optional[str] = "Markdown",
+    disable_web_page_preview: bool = True,
+    silent: bool = False,
+) -> Optional[int]:
     """
-    Envoie un message ; retourne message_id. 
-    Si remember_for_signals=True, il sera visible dans /signals (1h).
+    Envoie un message au chat configuré.
+    Retourne le message_id Telegram si succès, sinon None.
     """
-    if not TG_TOKEN or not TG_CHAT_ID:
+    if not _enabled():
+        # Pas de crash si on a pas encore configuré Telegram
+        print("[NOTIFIER] tg_send ignoré (TG_TOKEN ou TG_CHAT_ID manquant).")
         return None
+
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": disable_web_page_preview,
+        "disable_notification": silent,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     try:
-        r = requests.post(_api_url("sendMessage"), json={
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown"
-        }, timeout=10).json()
-        if r.get("ok"):
-            msg_id = r["result"]["message_id"]
-            _remember_msg_id(msg_id)
-            if remember_for_signals:
-                _remember_signal(msg_id, text)
-            return msg_id
-    except Exception:
-        pass
-    return None
+        r = requests.post(url, json=payload, timeout=10)
+        data = r.json()
+        if not data.get("ok"):
+            print("[NOTIFIER] sendMessage error:", data)
+            return None
+        return data["result"]["message_id"]
+    except Exception as e:
+        print("[NOTIFIER] sendMessage exception:", e)
+        return None
 
-def send_document(filepath, filename=None):
-    if not TG_TOKEN or not TG_CHAT_ID or not os.path.exists(filepath):
-        return
-    files = {"document": open(filepath, "rb")}
-    data  = {"chat_id": TG_CHAT_ID}
-    if filename:
-        data["caption"] = filename
-    try:
-        r = requests.post(_api_url("sendDocument"), data=data, files=files, timeout=20).json()
-        if r.get("ok"):
-            _remember_msg_id(r["result"]["message_id"])
-    except Exception:
-        pass
-    finally:
-        try: files["document"].close()
-        except Exception: pass
-
-def tg_get_updates(offset=None):
-    url = _api_url("getUpdates")
-    if offset is not None:
-        url += f"?offset={offset}"
-    try:
-        return requests.get(url, timeout=10).json()
-    except Exception:
-        return {"ok": False, "result": []}
-
-# ---------- Mémoire messages ----------
-def _remember_msg_id(msg_id):
-    if not msg_id: 
-        return
-    _last_msg_ids.append(int(msg_id))
-    if len(_last_msg_ids) > _MAX_REMEMBERED:
-        del _last_msg_ids[:len(_last_msg_ids)-_MAX_REMEMBERED]
-
-def _remember_signal(msg_id, text):
-    # texte déjà formaté, mais on mémorise structure minimale
-    ts = datetime.now(timezone.utc)
-    _last_hour_signals.append((ts, msg_id, text))
-    # keep only last hour
-    cutoff = ts - timedelta(hours=1)
-    while _last_hour_signals and _last_hour_signals[0][0] < cutoff:
-        _last_hour_signals.pop(0)
-
-def remember_signal_message(msg_id, symbol, sigdict):
-    """
-    API appelée par main.notify_signal – garde la structure exploitable si besoin.
-    """
-    ts = datetime.now(timezone.utc)
-    text = (
-        f"{symbol} — {sigdict['side']} ({sigdict['regime']}) "
-        f"RR x{sigdict['rr']:.2f} @ {sigdict['entry']:.6f}"
-    )
-    _last_hour_signals.append((ts, msg_id, text))
-    cutoff = ts - timedelta(hours=1)
-    while _last_hour_signals and _last_hour_signals[0][0] < cutoff:
-        _last_hour_signals.pop(0)
-
-def signals_last_hour_text():
-    ts_now = datetime.now(timezone.utc)
-    cutoff = ts_now - timedelta(hours=1)
-    kept   = [(ts, mid, txt) for (ts, mid, txt) in _last_hour_signals if ts >= cutoff]
-    if not kept:
-        return "Aucun signal durant l’heure écoulée."
-    lines = ["*Signaux de la dernière heure*"]
-    for ts, mid, txt in kept[-20:]:
-        hhmm = ts.astimezone().strftime("%H:%M")
-        lines.append(f"• {hhmm} — {txt}")
-    return "\n".join(lines)
-
-# ---------- Purgers manuels ----------
-def purge_chat(silent=True):
-    """
-    Supprime les messages envoyés par CE bot (connus via _last_msg_ids).
-    Ne touche pas aux messages que le bot n’a pas mémorisés.
-    """
-    deleted=0
-    for mid in list(reversed(_last_msg_ids)):
-        if _delete_message(mid):
-            deleted += 1
-            try: _last_msg_ids.remove(mid)
-            except Exception: pass
-    if not silent:
-        tg_send(f"🧹 Purge: {deleted} supprimé(s).")
-    return deleted
-
-def purge_last_100(silent=True):
-    """
-    Supprime les 100 derniers messages du bot mémorisés.
-    """
-    deleted=0
-    for mid in list(reversed(_last_msg_ids[-100:])):
-        if _delete_message(mid):
-            deleted += 1
-            try: _last_msg_ids.remove(mid)
-            except Exception: pass
-    if not silent:
-        tg_send(f"🧹 Purge(100): {deleted} supprimé(s).")
-    return deleted
-
-def purge_all(silent=True):
-    """
-    Supprime tout ce qui est mémorisé (équivaut à un 'vider' local).
-    """
-    deleted = purge_chat(silent=True)
-    _last_hour_signals.clear()
-    if not silent:
-        tg_send(f"🧹 Purge totale: {deleted} supprimé(s).")
-
-def _delete_message(message_id:int):
-    if not TG_TOKEN or not TG_CHAT_ID or not message_id:
+# --- SUPPRESSION / GESTION DES MESSAGES --------------------------------------
+def tg_delete_message(message_id: int) -> bool:
+    """Supprime un message par ID. Retourne True/False."""
+    if not _enabled():
         return False
     try:
-        r = requests.post(_api_url("deleteMessage"), json={
-            "chat_id": TG_CHAT_ID, "message_id": int(message_id)
-        }, timeout=10).json()
-        return bool(r.get("ok"))
-    except Exception:
+        url = f"{TELEGRAM_API}/deleteMessage"
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "message_id": message_id}, timeout=10)
+        data = r.json()
+        if not data.get("ok"):
+            # Certaines erreurs (message trop ancien, déjà supprimé…) ne sont pas critiques
+            print("[NOTIFIER] deleteMessage:", data)
+            return False
+        return True
+    except Exception as e:
+        print("[NOTIFIER] deleteMessage exception:", e)
+        return False
+
+# Supprime en lot une liste d’IDs (best-effort, continue même en cas d’échec)
+def tg_delete_many(message_ids: List[int]) -> Tuple[int, int]:
+    ok = 0
+    ko = 0
+    for mid in message_ids:
+        if tg_delete_message(mid):
+            ok += 1
+        else:
+            ko += 1
+        # petit throttle pour éviter le flood
+        time.sleep(0.06)
+    return ok, ko
+
+# --- RECEPTION / COMMANDES ----------------------------------------------------
+def tg_get_updates(offset: Optional[int] = None, timeout: int = 0) -> Dict[str, Any]:
+    """
+    Récupère les updates Telegram (polling simple).
+    - offset : update_id à partir duquel lire (ex: last_update_id + 1)
+    - timeout : long-polling en secondes (0 = pas d’attente)
+    Retour JSON complet de l’API Telegram.
+    """
+    if not _enabled():
+        return {"ok": True, "result": []}
+
+    params: Dict[str, Any] = {}
+    if offset is not None:
+        params["offset"] = offset
+    if timeout and timeout > 0:
+        params["timeout"] = int(timeout)
+
+    url = f"{TELEGRAM_API}/getUpdates"
+    try:
+        r = requests.get(url, params=params, timeout=timeout + 10)
+        data = r.json()
+        if not data.get("ok"):
+            print("[NOTIFIER] getUpdates error:", data)
+        return data
+    except Exception as e:
+        print("[NOTIFIER] getUpdates exception:", e)
+        return {"ok": False, "result": [], "error": str(e)}
+
+# --- UTILITAIRES D’AFFICHAGE --------------------------------------------------
+def tg_send_markdown(lines: List[str], silent: bool = False) -> Optional[int]:
+    """Envoie une liste de lignes en Markdown (avec jointure newline)."""
+    text = "\n".join(lines)
+    return tg_send(text, parse_mode="Markdown", silent=silent)
+
+def tg_send_html(lines: List[str], silent: bool = False) -> Optional[int]:
+    """Envoie une liste de lignes en HTML (avec jointure newline)."""
+    text = "\n".join(lines)
+    return tg_send(text, parse_mode="HTML", silent=silent)
+
+# --- PLACEHOLDERS (si besoin par main.py) -------------------------------------
+def tg_pin_message(message_id: int) -> bool:
+    """Facultatif : épingle un message (si le bot a les droits)."""
+    if not _enabled():
+        return False
+    try:
+        url = f"{TELEGRAM_API}/pinChatMessage"
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "message_id": message_id}, timeout=10)
+        data = r.json()
+        return bool(data.get("ok"))
+    except Exception as e:
+        print("[NOTIFIER] pinChatMessage exception:", e)
+        return False
+
+def tg_unpin_all() -> bool:
+    """Facultatif : dés-épingle tous les messages."""
+    if not _enabled():
+        return False
+    try:
+        url = f"{TELEGRAM_API}/unpinAllChatMessages"
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID}, timeout=10)
+        data = r.json()
+        return bool(data.get("ok"))
+    except Exception as e:
+        print("[NOTIFIER] unpinAllChatMessages exception:", e)
         return False
