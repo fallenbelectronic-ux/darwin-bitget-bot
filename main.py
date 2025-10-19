@@ -31,13 +31,14 @@ def create_exchange():
         "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASSE,
         "enableRateLimit": True, "options": {"defaultType": "swap", "testnet": BITGET_TESTNET}
     })
-    if BITGET_TESTNET: ex.set_sandbox_mode(True)
+    if BITGET_TESTNET:
+        ex.set_sandbox_mode(True)
     return ex
 
-def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
+def fetch_ohlcv_df(ex, symbol, timeframe, limit=100):
     try:
         raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not raw or len(raw) < 100: return None
+        if not raw or len(raw) < 81: return None
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
         df.set_index(pd.to_datetime(df["ts"], unit="ms"), inplace=True)
         bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
@@ -45,28 +46,36 @@ def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
         bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
         df["bb80_mid"], df["bb80_up"], df["bb80_lo"] = bb80.bollinger_mavg(), bb80.bollinger_hband(), bb80.bollinger_lband()
         return df
-    except Exception: return None
+    except Exception:
+        return None
 
 def build_universe(ex):
     try:
         ex.load_markets()
         candidates = [m['symbol'] for m in ex.markets.values() if m.get('swap') and m.get('linear') and m.get('settle') == 'USDT' and m.get('quote') == 'USDT']
         tickers = ex.fetch_tickers(candidates if candidates else None)
-        rows = [(s, t.get('quoteVolume', 0.0)) for s, t in tickers.items()]
+        rows = [(s, t.get('quoteVolume', 0.0)) for s, t in tickers.items() if t.get('quoteVolume')]
         if rows:
             return pd.DataFrame(rows, columns=["s", "v"]).sort_values("v", ascending=False).head(UNIVERSE_SIZE)["s"].tolist()
-    except Exception: pass
+    except Exception:
+        pass
     return FALLBACK_TESTNET
 
-def tick_from_price(price: float) -> float: return max(price * TICK_RATIO, 0.01)
-def touched_or_crossed(low, high, band, side): return (low <= band) if side == "buy" else (high >= band)
-def close_inside_bb20(close, lo, up): return lo <= close <= up
+def tick_from_price(price: float) -> float:
+    return max(price * TICK_RATIO, 0.01)
+
+def touched_or_crossed(low, high, band, side):
+    return (low <= band) if side == "buy" else (high >= band)
+
+def close_inside_bb20(close, lo, up):
+    return lo <= close <= up
 
 def detect_signal(df, state, sym):
     if len(df) < 81: return None
     last, prev = df.iloc[-1], df.iloc[-2]
     entry = float(last["close"])
     side = regime = None
+    
     if (entry >= last["bb80_mid"]) and touched_or_crossed(prev["low"], prev["high"], prev["bb20_lo"], "buy"): side, regime = "buy", "trend"
     elif (entry < last["bb80_mid"]) and touched_or_crossed(prev["low"], prev["high"], prev["bb20_up"], "sell"): side, regime = "sell", "trend"
     elif prev["low"] <= min(prev["bb20_lo"], prev["bb80_lo"]): side, regime = "buy", "counter"
@@ -104,11 +113,10 @@ def main():
     universe = build_universe(ex)
     last_ts_seen = {}
     state = {}
-    _paused = False # Simplification
+    _paused = False
 
     while True:
         try:
-            # La gestion des commandes sera réintégrée ici une fois la base stable
             if _paused:
                 time.sleep(LOOP_DELAY)
                 continue
@@ -120,7 +128,7 @@ def main():
                 pass
 
             for sym in universe:
-                df = fetch_ohlcv_df(ex, sym, TIMEFRAME, 300)
+                df = fetch_ohlcv_df(ex, sym, TIMEFRAME)
                 if df is None or last_ts_seen.get(sym) == df.index[-1]:
                     continue
                 last_ts_seen[sym] = df.index[-1]
@@ -138,6 +146,7 @@ def main():
             break
         except Exception as e:
             notifier.tg_send_error("Erreur critique (boucle)", e)
+            print(f"Erreur critique: {e}") # Ajout d'un print pour les logs
             time.sleep(15)
 
 if __name__ == "__main__":
