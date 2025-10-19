@@ -8,9 +8,34 @@ PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() in ("1", "t
 RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
 LEVERAGE = 2
 
+# ==============================================================================
+# FONCTION AJOUTÉE
+# ==============================================================================
+def manage_open_positions(ex: ccxt.Exchange):
+    """
+    Vérifie les positions ouvertes et les gère (ex: trailing stop, clôture, etc.).
+    Cette fonction est un placeholder. Vous devez implémenter la logique de suivi ici.
+    Par exemple, vérifier si le prix actuel a touché un SL ou un TP.
+    """
+    open_positions = database.get_open_positions()
+    if not open_positions:
+        return
+
+    # print(f"Gestion de {len(open_positions)} position(s) ouverte(s)...")
+    for pos in open_positions:
+        # --- VOTRE LOGIQUE DE GESTION DE POSITION ICI ---
+        # 1. Récupérer le prix actuel du marché pour pos['symbol']
+        # 2. Vérifier si le prix a atteint pos['sl_price'] ou pos['tp_price']
+        # 3. Si c'est le cas, appeler une fonction pour clôturer le trade
+        pass
+# ==============================================================================
+
+
 def get_usdt_balance(ex: ccxt.Exchange) -> float:
     try:
-        return float(ex.fetch_balance()['total'].get('USDT', 0.0))
+        # En mode testnet sur Bitget, il faut parfois spécifier 'USDT'
+        balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
+        return float(balance['total'].get('USDT', 0.0))
     except Exception as e:
         notifier.tg_send_error("Récupération du solde", e)
         return 0.0
@@ -23,18 +48,33 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', 3))
-    if len(database.get_open_positions()) >= max_pos: return
-    if symbol in database.get_setting('BLACKLIST', []): return
-    if database.is_position_open(symbol): return
+    
+    # IMPORTANT: Votre DB renvoie toujours [], donc cette condition est toujours vraie.
+    if len(database.get_open_positions()) >= max_pos: 
+        print(f"Nombre maximum de positions ({max_pos}) atteint.")
+        return
+        
+    if symbol in database.get_setting('BLACKLIST', []): 
+        print(f"{symbol} est sur la liste noire.")
+        return
+
+    # IMPORTANT: Votre DB renvoie toujours False, donc cette condition est toujours vraie.
+    if database.is_position_open(symbol): 
+        print(f"Une position est déjà ouverte pour {symbol}.")
+        return
 
     current_risk = RISK_PER_TRADE_PERCENT
     if database.get_setting('DYNAMIC_RISK_ENABLED', False): pass
 
     balance = get_usdt_balance(ex)
-    if balance <= 10: return
+    if balance <= 10:
+        print(f"Solde insuffisant: {balance} USDT")
+        return
     
     quantity = calculate_position_size(balance, current_risk, signal['entry'], signal['sl'])
-    if quantity <= 0: return
+    if quantity <= 0: 
+        print("Quantité calculée est nulle.")
+        return
 
     mode_text = "PAPIER" if PAPER_TRADING_MODE else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, current_risk)
@@ -44,6 +84,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         try:
             ex.set_leverage(LEVERAGE, symbol)
             params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}
+            # Attention, la méthode exacte et les params peuvent varier
             ex.create_market_order(symbol, signal['side'], quantity, params=params)
         except Exception as e:
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
@@ -59,6 +100,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     )
 
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
+    # IMPORTANT: Votre DB renverra toujours None.
     trade = database.get_trade_by_id(trade_id)
     if not trade or trade.get('status') != 'OPEN':
         return notifier.tg_send(f"Trade #{trade_id} déjà fermé ou invalide.")
@@ -67,7 +109,8 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     try:
         close_side = 'sell' if side == 'buy' else 'buy'
         ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True})
-        database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0) # PNL à calculer
+        # PNL doit être calculé en comparant le prix de clôture au prix d'entrée.
+        database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0) 
         notifier.tg_send(f"✅ Position sur {symbol} fermée manuellement.")
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
