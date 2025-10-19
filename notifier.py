@@ -4,6 +4,7 @@ import time
 import html
 import requests
 import io
+import reporting
 from typing import List, Dict, Any, Optional
 
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -93,4 +94,11 @@ def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
         f" TP: <code>{signal['tp']:.5f}</code>\n\n"
         f" Quantité: <code>{quantity:.4f}</code>\n"
         f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
+
+def send_report(title: str, trades: List[Dict[str, Any]]):
+    """Calcule les stats et envoie un rapport formaté sur Telegram."""
+    stats = reporting.get_report_stats(trades)
+    message = reporting.format_report_message(title, stats)
+    tg_send(message)
+        
     )
