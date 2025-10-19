@@ -388,7 +388,7 @@ def main():
                 continue
 
             # Heure courante “bucket” alignée sur les barres H1
-            now_bucket = pd.Timestamp.utcnow().floor("H")
+            now_bucket = pd.Timestamp.utcnow().floor("h")
 
             # Si on change d’heure, on remet l’agrégateur (on signale en direct quand on trouve)
             if last_hour_bucket is None:
