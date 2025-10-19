@@ -342,88 +342,151 @@ def compute_qty(entry, sl, risk_amount):
     diff = abs(entry-sl)
     return risk_amount/diff if diff>0 else 0.0
 
-# =============== TELEGRAM (commandes) ===================
-_last_update_id = None
-PAUSED = False
+# =======================
+# TELEGRAM COMMANDS (robuste)
+# =======================
+_last_update_id = None  # offset pour getUpdates
 
-def fmt_cfg():
-    mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-    return (
-        f"*Config*\n"
-        f"Mode: {mode}\n"
-        f"TF: {TF} | Top: {UNIVERSE_SIZE} | Picks/h: {PICKS_PER_HOUR}\n"
-        f"Risk: {int(RISK_PER_TRADE*100)}% | RR≥{MIN_RR}\n"
-        f"CSV: {TRADES_CSV}"
-    )
+def _cmd_text(msg: dict) -> str:
+    return (msg.get("text") or "").strip()
 
-def poll_telegram_commands():
-    global _last_update_id, PAUSED
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
+def _is_from_allowed_chat(msg: dict) -> bool:
+    # Si TELEGRAM_CHAT_ID est défini, on filtre strictement dessus
     try:
-        url=f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
-        if _last_update_id is not None:
-            url+=f"?offset={_last_update_id+1}"
-        data=requests.get(url,timeout=6).json()
-        if not data.get("ok"): 
-            return
-        for upd in data.get("result",[]):
-            _last_update_id = upd["update_id"]
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg: 
-                continue
-            if str(msg["chat"]["id"]) != str(TG_CHAT_ID):
-                continue
-            text=(msg.get("text") or "").strip().lower()
+        if TG_CHAT_ID:
+            return str(msg["chat"]["id"]) == str(TG_CHAT_ID)
+        # Sinon on accepte tout (utile en test) :
+        return True
+    except Exception:
+        return False
 
+def poll_telegram_commands(ex, active_paper):
+    """
+    Appelée dans la boucle principale. Récupère les updates et traite les commandes.
+    - offset géré proprement (None au premier appel)
+    - ignore les updates d'autres chats si TG_CHAT_ID est défini
+    """
+    global _last_update_id
+    try:
+        # 1) Récupérer les updates
+        offset = _last_update_id + 1 if _last_update_id is not None else None
+        data = tg_get_updates(offset=offset, timeout=0)
+        if not data or not data.get("ok"):
+            return
+
+        updates = data.get("result", [])
+        if not updates:
+            return
+
+        for upd in updates:
+            # Mémorise l’update_id (même si le message n’est pas pour nous)
+            _last_update_id = upd.get("update_id", _last_update_id)
+
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+            if not _is_from_allowed_chat(msg):
+                continue
+
+            text = _cmd_text(msg).lower()
+
+            # --- Routes de commandes ---
             if text.startswith("/start"):
-                tg_send("🔔 Démarrage — PAPER • TF 1h • Risk 1% • RR≥3.0")
+                mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
+                tg_send(f"🔔 Démarrage — *{mode}* • TF {TF} • Risk {int(RISK_PER_TRADE*100)}% • RR≥{MIN_RR}")
 
             elif text.startswith("/config"):
-                tg_send(fmt_cfg())
-
-            elif text.startswith("/signals"):
-                tg_send(signals_last_hour_text())
-
-            elif text.startswith("/pause"):
-                PAUSED=True
-                tg_send("⏸️ Bot en pause.")
-
-            elif text.startswith("/resume"):
-                PAUSED=False
-                tg_send("▶️ Bot relancé.")
-
-            elif text.startswith("/purge100"):
-                purge_last_100(silent=False)
-
-            elif text.startswith("/purgeall"):
-                purge_all(silent=False)
-
-            elif text.startswith("/purge"):
-                purge_chat(silent=False)
-
-            elif text.startswith("/exportcsv"):
-                if os.path.exists(TRADES_CSV):
-                    send_document(TRADES_CSV, "trades.csv")
-                else:
-                    tg_send("Aucun fichier CSV pour l’instant.")
+                mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
+                tg_send(
+                    "*Config*\n"
+                    f"Mode: {mode}\n"
+                    f"TF: {TF}\n"
+                    f"Risk: {int(RISK_PER_TRADE*100)}% | RR≥{MIN_RR}\n"
+                    f"Top: {UNIVERSE_SIZE} | Picks/h: {PICKS}\n"
+                    f"Max trades: {MAX_OPEN_TRADES}\n"
+                    f"CSV: {TRADES_CSV}"
+                )
 
             elif text.startswith("/mode"):
-                mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-                tg_send(f"Mode actuel: *{mode}*")
+                tg_send("Mode actuel : *PAPER*" if DRY_RUN else ("Mode actuel : *TESTNET*" if BITGET_TESTNET else "Mode actuel : *LIVE*"))
 
-            elif text.startswith("/logs"):
-                tg_send("Les logs détaillés sont visibles sur l’hébergeur. (message réduit)")
+            elif text.startswith("/stats"):
+                send_stats()
+
+            elif text.startswith("/report"):
+                daily_report()
+
+            elif text.startswith("/exportcsv"):
+                try:
+                    if os.path.exists(TRADES_CSV):
+                        requests.post(
+                            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+                            data={"chat_id": TG_CHAT_ID},
+                            files={"document": open(TRADES_CSV, "rb")},
+                            timeout=20,
+                        )
+                    else:
+                        tg_send("Aucun fichier CSV trouvé.")
+                except Exception as e:
+                    tg_send(f"⚠️ export CSV: {e}")
+
+            elif text.startswith("/orders"):
+                if DRY_RUN:
+                    if not active_paper:
+                        tg_send("Aucune position (papier).")
+                    else:
+                        lines = ["*Positions (papier)*"]
+                        from datetime import datetime
+                        for sym, p in active_paper.items():
+                            lines.append(
+                                f"• {sym} {'LONG' if p['side']=='buy' else 'SHORT'} | entry {p['entry']:.4f} | SL {p['sl']:.4f} | TP {p['tp']:.4f} | RR x{p['rr']:.2f}"
+                            )
+                        tg_send("\n".join(lines))
+                else:
+                    try:
+                        pos = ex.fetch_positions()
+                        rows=[]
+                        for p in pos:
+                            sz = float(p.get("contracts") or 0)
+                            if abs(sz)>0:
+                                rows.append(f"• {p.get('symbol')} {p.get('side') or ('long' if sz>0 else 'short')} qty {abs(sz)}")
+                        tg_send("*Positions réelles*\n" + ("\n".join(rows) if rows else "Aucune position."))
+                    except Exception as e:
+                        tg_send(f"⚠️ Impossible de lire les positions : {e}")
 
             elif text.startswith("/ping"):
-                tg_send("🛰️ Ping ok.")
+                tg_send("📡 Ping ok.")
 
             elif text.startswith("/version"):
-                tg_send("Bot Bitget — Darwin v1.15")
+                tg_send("🤖 Darwin-Bitget v1.14")
 
-            # /restart n'est pas implémenté ici (hébergeur)
-    except Exception:
-        pass
+            # /restart : à implémenter côté infra (Render API) si tu le souhaites
+            elif text.startswith("/restart"):
+                tg_send("♻️ Redémarrage demandé (non implémenté côté infra).")
+
+            # NB: Les commandes de purge ont été volontairement désactivées. 
+            # Si tu réactives une purge manuelle plus tard, remets le handler ici.
+
+            # Exemples ‘papier’ optionnels :
+            elif text.startswith("/test"):
+                tg_send("🧪 Mode papier: commande /test non-implémentée dans cette build.")
+            elif text.startswith("/closepaper"):
+                tg_send("🧪 Mode papier: /closepaper non-implémentée dans cette build.")
+            elif text.startswith("/closeallpaper"):
+                tg_send("🧪 Mode papier: /closeallpaper non-implémentée dans cette build.")
+
+            elif text.startswith("/pause"):
+                tg_send("⏸️ Pause: non-implémenté (tu peux arrêter le service côté hébergeur).")
+            elif text.startswith("/resume"):
+                tg_send("▶️ Reprise: non-implémenté (le bot tourne déjà).")
+
+            elif text.startswith("/logs"):
+                tg_send("🧾 Derniers logs indisponibles dans cette build.")
+            # ---------------------------
+
+    except Exception as e:
+        # On ne crashe pas le bot pour un souci Telegram
+        print("[TELEGRAM] poll error:", e)
 
 # =============== NOTIFICATIONS SIGNAL ===================
 def notify_signal(symbol, sig):
