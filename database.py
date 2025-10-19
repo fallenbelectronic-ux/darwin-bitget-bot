@@ -128,3 +128,16 @@ def close_trade(trade_id: int, status: str, pnl: float):
     conn.commit()
     conn.close()
     print(f"DB: Trade #{trade_id} fermé avec le statut '{status}'.")
+
+def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
+    """Récupère tous les trades clôturés depuis un certain timestamp."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # On sélectionne les trades dont le statut N'EST PAS 'OPEN' et qui ont été fermés après le timestamp
+    cursor.execute(
+        "SELECT * FROM trades WHERE status != 'OPEN' AND close_timestamp >= ?",
+        (timestamp,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
