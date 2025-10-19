@@ -1,559 +1,398 @@
-import os, time, csv, math, requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
+# main.py
+import os, time, csv, math
 import ccxt
 import pandas as pd
 import numpy as np
 from ta.volatility import BollingerBands, AverageTrueRange
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from notifier import (
-    tg_send, tg_get_updates, remember_signal_message, signals_last_hour_text
+    tg_send, tg_get_updates, remember_signal_message, signals_last_hour_text,
+    tg_send_start_banner, tg_send_signal_card, tg_send_trade_exec
 )
 
 load_dotenv()
 
-# =============== ENV ==================
-TG_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
+# ========= ENV =========
+BITGET_TESTNET  = os.getenv("BITGET_TESTNET", "true").lower() in ("1","true","yes")
+API_KEY         = os.getenv("BITGET_API_KEY", "")
+API_SECRET      = os.getenv("BITGET_API_SECRET", "")
+PASSPHRASE      = os.getenv("BITGET_API_PASSWORD", os.getenv("BITGET_PASSPHRASE",""))
 
-BITGET_TESTNET  = os.getenv("BITGET_TESTNET","true").lower() in ("1","true","yes")
-API_KEY         = os.getenv("BITGET_API_KEY","")
-API_SECRET      = os.getenv("BITGET_API_SECRET","")
-PASSPHRASE      = os.getenv("BITGET_API_PASSWORD") or os.getenv("BITGET_PASSPHRASE")
-
-TF              = os.getenv("TIMEFRAME","1h")
-RISK_PER_TRADE  = float(os.getenv("RISK_PER_TRADE","0.01"))
-MIN_RR          = float(os.getenv("MIN_RR","3"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES","4"))
-PICKS_PER_HOUR  = int(os.getenv("PICKS","4"))         # <= 4 signaux/heure
-UNIVERSE_SIZE   = int(os.getenv("UNIVERSE_SIZE","30")) # Top 30
-LOOP_DELAY      = int(os.getenv("LOOP_DELAY","5"))
-TZ              = os.getenv("TIMEZONE","Europe/Lisbon")
-
-# Paper / Live
+TF              = os.getenv("TIMEFRAME", "1h")
+RISK_PER_TRADE  = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1%
+MIN_RR          = float(os.getenv("MIN_RR", "3.0"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))
+UNIVERSE_SIZE   = int(os.getenv("UNIVERSE_SIZE", "30"))       # top 30 volume
+PICKS_PER_HOUR  = int(os.getenv("PICKS_PER_HOUR", "4"))       # max 4 signaux/heure
+LOOP_DELAY      = int(os.getenv("LOOP_DELAY", "5"))
 DRY_RUN         = os.getenv("DRY_RUN","true").lower() in ("1","true","yes")
 
-# Levier souhaité (cross 2x par défaut)
-WANT_CROSS      = os.getenv("POSITION_MODE","cross")
-MAX_LEVERAGE    = int(os.getenv("MAX_LEVERAGE","2"))
+TRADES_CSV      = os.getenv("TRADES_CSV", "/app/trades.csv")
 
-# CSV de journalisation (clôtures)
-TRADES_CSV      = os.getenv("TRADES_CSV","/app/trades.csv")
-
-# Indicateurs
 ATR_WINDOW      = 14
 SL_ATR_CUSHION  = 0.25
 
-# Règles « réaction rapide » (tendance)
-QUICK_BARS      = 3
-QUICK_PROGRESS  = 0.30
-
-# Fallback testnet
-FALLBACK_TESTNET = [
-    "BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT","LTC/USDT:USDT","BCH/USDT:USDT"
-]
-
-# =============== EXCHANGE =============
+# ========= EXCHANGE =========
 def create_exchange():
     ex = ccxt.bitget({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "password": PASSPHRASE,
+        "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASE,
         "enableRateLimit": True,
-        "options": {"defaultType":"swap", "testnet":BITGET_TESTNET}
+        "options": {"defaultType":"swap","testnet":BITGET_TESTNET}
     })
     if BITGET_TESTNET:
         try: ex.set_sandbox_mode(True)
-        except Exception: pass
+        except: pass
     return ex
 
 def try_set_leverage(ex, symbol, lev=2, mode="cross"):
-    """
-    Applique 2x Cross si possible – silencieux (pas de spam Telegram).
-    """
+    """Applique levier x2 cross quand c'est supporté. Sans spam de logs."""
     try:
-        params = {}
-        if mode.lower() == "cross":
-            params["marginMode"] = "cross"
-        else:
-            params["marginMode"] = "isolated"
-        ex.set_leverage(lev, symbol, params=params)
+        ex.set_leverage(lev, symbol, params={"marginMode": mode})
     except Exception:
-        pass
+        pass  # silencieux
 
-# =============== DATA =================
-def fetch_ohlcv_df(ex, symbol, timeframe, limit=300):
+# ========= DATA / INDICATEURS =========
+def fetch_ohlcv_df(ex, symbol, timeframe="1h", limit=300):
     raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not raw or len(raw) == 0:
-        raise ValueError("No OHLCV")
     df = pd.DataFrame(raw, columns=["ts","open","high","low","close","vol"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("ts", inplace=True)
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms"); df.set_index("ts", inplace=True)
 
     bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
-    df["bb20_mid"] = bb20.bollinger_mavg()
-    df["bb20_up"]  = bb20.bollinger_hband()
-    df["bb20_lo"]  = bb20.bollinger_lband()
+    df["bb20_mid"], df["bb20_up"], df["bb20_lo"] = bb20.bollinger_mavg(), bb20.bollinger_hband(), bb20.bollinger_lband()
 
-    # « BB Jaune » = BB(80,2) sur H1 (équivalent approx. H4)
+    # “BB80/2 sur H1” = proxy du 4h
     bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
-    df["bb80_mid"] = bb80.bollinger_mavg()
-    df["bb80_up"]  = bb80.bollinger_hband()
-    df["bb80_lo"]  = bb80.bollinger_lband()
+    df["bb80_mid"], df["bb80_up"], df["bb80_lo"] = bb80.bollinger_mavg(), bb80.bollinger_hband(), bb80.bollinger_lband()
 
     atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=ATR_WINDOW)
     df["atr"] = atr.average_true_range()
     return df
 
-def filter_working_symbols(ex, symbols, timeframe="1h"):
-    ok=[]
-    for s in symbols:
-        try:
-            ex.fetch_ohlcv(s, timeframe=timeframe, limit=2)
-            ok.append(s)
-        except Exception:
-            pass
-    return ok
-
+# ========= UNIVERS =========
 def build_universe(ex):
-    """
-    Top 30 par volume 24h – swaps USDT linéaires – filtre testnet.
-    """
     try:
         ex.load_markets()
-        candidates=[]
-        for m in ex.markets.values():
-            if (m.get("symbol") and (m.get("type")=="swap" or m.get("swap"))
-                and m.get("linear") and m.get("settle")=="USDT" and m.get("quote")=="USDT"):
-                candidates.append(m["symbol"])
+        candidates = [
+            m["symbol"] for m in ex.markets.values()
+            if (m.get("type")=="swap" or m.get("swap")) and m.get("linear")
+            and m.get("settle")=="USDT" and m.get("quote")=="USDT"
+        ]
     except Exception:
-        candidates=[]
-
+        candidates = []
     rows=[]
     try:
-        tickers=ex.fetch_tickers(candidates if candidates else None)
+        tickers = ex.fetch_tickers(candidates if candidates else None)
         for s,t in tickers.items():
-            if "/USDT" not in s and ":USDT" not in s: 
-                continue
+            if ":USDT" not in s and "/USDT" not in s: continue
             vol = t.get("quoteVolume") or t.get("baseVolume") or 0
             try: vol=float(vol)
             except: vol=0.0
-            rows.append((s, vol))
+            rows.append((s,vol))
     except Exception:
         pass
+    if not rows:
+        # petit fallback minimal si testnet vide
+        return ["BTC/USDT:USDT","ETH/USDT:USDT","XRP/USDT:USDT"]
+    df = pd.DataFrame(rows, columns=["symbol","volume"]).sort_values("volume", ascending=False)
+    uni = df.head(UNIVERSE_SIZE)["symbol"].tolist()
+    return uni
 
-    if rows:
-        df=pd.DataFrame(rows,columns=["symbol","volume"]).sort_values("volume",ascending=False)
-        uni=df.head(UNIVERSE_SIZE)["symbol"].tolist()
-        if BITGET_TESTNET:
-            uni=filter_working_symbols(ex,uni[:max(20,UNIVERSE_SIZE)],timeframe=TF) or FALLBACK_TESTNET
-        return uni
-
-    # Fallback testnet
-    fb=filter_working_symbols(ex, FALLBACK_TESTNET, timeframe=TF)
-    return fb or FALLBACK_TESTNET
-
-# =============== RÈGLES DARWIN =================
-def _contact_recent(df, which, lookback=2):
+# ========= RÈGLES STRATÉGIE =========
+def strong_reaction(candle) -> bool:
     """
-    Contact/traversée avec la borne (bb20_up/lo ou bb80_up/lo) dans les 2 dernières bougies clôturées.
+    Approximation simple des patterns: pinbar/méchée, marubozu, impulsion.
+    On exige au moins une des caractéristiques + close dans/sur BB20.
     """
-    if len(df) < lookback+1: 
-        return False
-    sl = df.iloc[-(lookback+1):-1]  # exclude last (signal) bar
-    if which == "bb20_lo":
-        return any(sl["low"] <= sl["bb20_lo"])
-    if which == "bb20_up":
-        return any(sl["high"] >= sl["bb20_up"])
-    if which == "bb80_lo":
-        return any(sl["low"] <= sl["bb80_lo"])
-    if which == "bb80_up":
-        return any(sl["high"] >= sl["bb80_up"])
+    # sera utilisé en combinaison avec "close dans BB20"
+    body = abs(candle["close"] - candle["open"])
+    rng  = candle["high"] - candle["low"]
+    if rng <= 0: return False
+    # Pinbar / méchée: longue mèche > 30% range
+    upper_wick = candle["high"] - max(candle["close"], candle["open"])
+    lower_wick = min(candle["close"], candle["open"]) - candle["low"]
+    wick_ratio = max(upper_wick, lower_wick) / rng
+    pin_like = wick_ratio >= 0.30
+    # Marubozu / impulsion: corps > 60% du range OU corps très large par rapport à ATR proxy
+    maru_like = (body / rng) >= 0.60
+    return pin_like or maru_like
+
+def close_inside_bb20(candle, lo20, up20) -> bool:
+    return candle["close"] <= up20 and candle["close"] >= lo20
+
+def touched_band(candle, lo, up, which="any", tol=0.0006) -> bool:
+    """Contact sur borne haute/basse (ou both pour double)."""
+    if which in ("any","lower"):
+        if candle["low"] <= (lo * (1+tol)): return True
+    if which in ("any","upper"):
+        if candle["high"] >= (up * (1-tol)): return True
     return False
 
-def _close_inside_bb20(candle):
-    return (candle["close"] <= candle["bb20_up"]) and (candle["close"] >= candle["bb20_lo"])
+def bb20_outside_bb80(prev) -> bool:
+    """Renvoie True si la bande blanche est franchement en dehors de la jaune (enfoncement)."""
+    # blanche au-dessus de la jaune OU en dessous (écarts nets sur bornes)
+    up_out = prev["bb20_up"] > prev["bb80_up"]
+    lo_out = prev["bb20_lo"] < prev["bb80_lo"]
+    return up_out or lo_out
 
-def _reaction_pattern(prev, last):
+def prolonged_double_exit(df, min_bars=4) -> bool:
     """
-    Proxy des patterns (pinbar/méchage/marubozu/gap+impulsion).
-    On exige une mèche significative ou un corps directionnel >= 30% ATR.
+    Sortie prolongée: au moins `min_bars` barres consécutives EN DEHORS
+    des 2 bandes (au-dessus des 2 ou au-dessous des 2).
+    La bougie de réintégration (si elle clôture dedans) ne compte pas.
     """
-    atr = float(last["atr"]) if not np.isnan(last["atr"]) else 0.0
-    rng = float(last["high"]-last["low"])
-    body= abs(float(last["close"]-last["open"]))
-    if atr<=0: 
-        return False
-    # mèche notable : (rng-body) >= 0.3*atr
-    if (rng - body) >= 0.3*atr:
-        return True
-    # corps impulsif >= 0.3*atr
-    if body >= 0.3*atr:
-        return True
-    return False
-
-def _prolonged_double_exit(df, min_bars=4):
-    """
-    Sortie prolongée (>=4 barres) des DEUX bandes.
-    Si la bougie de réintégration clôture DANS BB20, elle NE compte pas pour la série.
-    """
-    if len(df) < min_bars+2:
-        return False
-    # on regarde en remontant tant que close hors des deux bandes
-    cnt=0
-    idx=-2
-    while abs(idx) <= len(df):
-        c=df.iloc[idx]
-        inside_bb20 = _close_inside_bb20(c)
-        up_both  = (c["high"]>=c["bb20_up"] and c["high"]>=c["bb80_up"])
-        low_both = (c["low"] <=c["bb20_lo"] and c["low"] <=c["bb80_lo"])
-        if inside_bb20:
-            break
-        if up_both or low_both:
-            cnt+=1
-            idx-=1
+    cnt = 0
+    # on remonte depuis -2 (la dernière bougie est la bougie clôturée actuelle)
+    i = -2
+    last_side = None
+    while abs(i) <= len(df):
+        c = df.iloc[i]
+        up_both = (c["high"] >= c["bb20_up"]) and (c["high"] >= c["bb80_up"])
+        lo_both = (c["low"]  <= c["bb20_lo"]) and (c["low"]  <= c["bb80_lo"])
+        if up_both:
+            if last_side in (None,"up"): cnt += 1
+            else: break
+            last_side = "up"
+        elif lo_both:
+            if last_side in (None,"down"): cnt += 1
+            else: break
+            last_side = "down"
         else:
+            # si on tombe dedans, on arrête: la réintégration n'est pas comptée
             break
+        i -= 1
     return cnt >= min_bars
 
-def _need_double_reintegration(df, side):
+def detect_signal(df, state:dict, sym:str):
     """
-    Si la BB20 s'est maintenue à l'extérieur de la BB80 durant l'enfoncement,
-    alors en contre-tendance on exige réintégration BB20 ET BB80.
+    Détecte un signal à la dernière bougie CLÔTURÉE (df.iloc[-1]).
+    Retourne None ou dict {side, regime, entry, sl, tp, rr, bullets}.
+    Règles:
+      1) Contact obligatoire (basse -> long ; haute -> short). Fenêtre 1-2 barres max.
+      2) Réaction forte + clôture DANS/SUR la BB20.
+      3) RR >= MIN_RR.
+      4) Contre-tendance stricte: si BB20 est à l'extérieur de BB80 après enfoncement,
+         la bougie de signal doit clôturer À L’INTÉRIEUR des 2 bandes (double réintégration).
+      5) Sortie prolongée: si >=4 barres en dehors des 2 BB, ignorer le 1er signal suivants (cooldown).
     """
-    if len(df)<5: return False
-    prevs = df.iloc[-6:-1]
-    if side=="buy":
-        # bb20_lo bien sous bb80_lo (écart net) pendant la phase
-        return any(prevs["bb20_lo"] < prevs["bb80_lo"] - 1e-12)
-    else:
-        return any(prevs["bb20_up"] > prevs["bb80_up"] + 1e-12)
-
-def detect_signal(df, state, sym, rr_min=3.0):
-    """
-    Détection STRICTE à la clôture de la bougie :
-    - 3 conditions obligatoires :
-        1) contact/traversée récente (<=2 bougies) avec la borne pertinente
-        2) réaction + clôture DANS/SUR la BB20
-        3) RR >= 3
-    - Tendance :
-        • au-dessus de BB80 + contact/traversée BB20 basse + close dans/sur BB20 → LONG
-        • en-dessous de BB80 + contact/traversée BB20 haute + close dans/sur BB20 → SHORT
-    - Contre-tendance :
-        • double extrême + réintégration (close dans/sur BB20) + contact dans les 2 bougies
-        • si « enfoncement » avec BB20 dehors → réintégration des DEUX bandes obligatoire
-    - Sortie prolongée double :
-        • on ignore le premier trade validé après la série (cooldown 1 signal).
-    """
-    if len(df) < 100:  # besoin de profondeur pour BB80
-        return None
-
-    last = df.iloc[-1]
+    if len(df) < 5: return None
+    last = df.iloc[-1]     # bougie qui vient de CLÔTURER
     prev = df.iloc[-2]
+    prev2= df.iloc[-3]
 
-    # Cooldown après sortie prolongée double
-    if _prolonged_double_exit(df, min_bars=4):
-        st = state.setdefault(sym, {})
+    # cooldown “sauter 1er trade” après sortie prolongée
+    st = state.setdefault(sym, {})
+    if st.get("cooldown", False):
+        # on efface le flag et on ignore ce tour (= "sauter le 1er trade")
+        st["cooldown"] = False
+        return None
+    if prolonged_double_exit(df, min_bars=4):
         st["cooldown"] = True
         return None
 
-    if state.get(sym, {}).get("cooldown", False):
-        # on « consomme » la pénalité et on ne prend pas CE premier signal
-        state[sym]["cooldown"] = False
+    bullets = []
+    # fenêtre de contact: prev ou prev2
+    long_contact  = touched_band(prev, prev["bb20_lo"], prev["bb20_up"], "lower") or \
+                    touched_band(prev2, prev2["bb20_lo"], prev2["bb20_up"], "lower")
+    short_contact = touched_band(prev, prev["bb20_lo"], prev["bb20_up"], "upper") or \
+                    touched_band(prev2, prev2["bb20_lo"], prev2["bb20_up"], "upper")
+
+    # réaction + close dans BB20
+    react_ok = strong_reaction(last) and close_inside_bb20(last, last["bb20_lo"], last["bb20_up"])
+    if not react_ok:
         return None
 
+    # détection directionnelle
+    side = None; regime = None
     above80 = last["close"] >= last["bb80_mid"]
 
-    # Conditions communes : réaction + close dans/sur BB20
-    if not _reaction_pattern(prev, last):
-        return None
-    if not _close_inside_bb20(last):
-        return None
-
-    # Détections
-    side=None
-    regime=None
-    notes=[]
-
-    # TENDANCE
-    if above80 and _contact_recent(df,"bb20_lo",lookback=2):
-        side, regime = "buy","trend"
-        notes.append("Contact bande basse BB20")
-    elif (not above80) and _contact_recent(df,"bb20_up",lookback=2):
-        side, regime = "sell","trend"
-        notes.append("Contact bande haute BB20")
-
-    # CONTRE-TENDANCE
-    if side is None:
-        # double extrême = contact simultané BB20 et BB80 côté pertinent (dans les 2 dernières bougies)
-        buy_ct  = _contact_recent(df,"bb20_lo",2) and _contact_recent(df,"bb80_lo",2)
-        sell_ct = _contact_recent(df,"bb20_up",2) and _contact_recent(df,"bb80_up",2)
-        if buy_ct:
-            side, regime = "buy","counter"
-            notes.append("Double extrême côté bas (BB20 & BB80)")
-        elif sell_ct:
-            side, regime = "sell","counter"
-            notes.append("Double extrême côté haut (BB20 & BB80)")
-
-        # si enfoncement « BB20 dehors », exiger réintégration des 2 bandes
-        if side and _need_double_reintegration(df, side):
-            # la bougie de signal doit être revenue dans les 2 enveloppes
-            inside80 = (last["close"] <= last["bb80_up"] and last["close"] >= last["bb80_lo"])
-            if not inside80:
-                return None
-            notes.append("Réintégration stricte BB20+BB80")
-
-    if side is None:
-        return None
-
-    # SL/TP & RR
-    entry = float(last["close"])
-    atr   = float(last["atr"])
-    if side=="buy":
-        sl = min(float(prev["low"]), float(last["low"])) - SL_ATR_CUSHION*atr
-        tp = float(last["bb80_up"]) if regime=="trend" else float(last["bb20_up"])
+    # tentative: on détermine si tendance (au-dessus/sous BB80_mid) ou contre-tendance
+    if long_contact and above80:
+        side, regime = "buy", "trend"
+    elif short_contact and (not above80):
+        side, regime = "sell", "trend"
+    elif long_contact and (not above80):
+        side, regime = "buy", "counter"
+    elif short_contact and above80:
+        side, regime = "sell", "counter"
     else:
-        sl = max(float(prev["high"]), float(last["high"])) + SL_ATR_CUSHION*atr
-        tp = float(last["bb80_lo"]) if regime=="trend" else float(last["bb20_lo"])
-
-    denom = abs(entry-sl)
-    rr = abs((tp-entry)/denom) if denom>0 else 0.0
-    if rr < rr_min:
         return None
 
-    return {
-        "side":side, "regime":regime,
-        "entry":entry, "sl":sl, "tp":tp, "rr":rr,
-        "notes":notes
-    }
+    # contre-tendance stricte: si blanche “en dehors” de la jaune (enfoncement),
+    # on exige une réintégration DANS LES DEUX bandes (bb20 ET bb80) sur la bougie de signal.
+    if regime == "counter" and bb20_outside_bb80(prev):
+        inside_both = (last["close"] <= min(last["bb20_up"], last["bb80_up"])) and \
+                      (last["close"] >= max(last["bb20_lo"], last["bb80_lo"]))
+        if not inside_both:
+            return None
 
-# =============== ORDRES (Paper ou Réel) =================
-def ensure_trades_csv():
-    if not os.path.exists(TRADES_CSV):
-        with open(TRADES_CSV,"w",newline="",encoding="utf-8") as f:
-            csv.writer(f).writerow(
-                ["ts","symbol","side","regime","entry","exit","pnl_pct","rr","result","mode"]
-            )
+    # SL & TP théoriques
+    entry = float(last["close"])
+    atr = float(last["atr"])
+    if side == "buy":
+        sl = float(prev["low"]) - SL_ATR_CUSHION*atr
+        tp = float(last["bb80_up"]) if regime=="trend" else float(last["bb20_up"])
+        bullets.append("Contact bande basse BB20")
+    else:
+        sl = float(prev["high"]) + SL_ATR_CUSHION*atr
+        tp = float(last["bb80_lo"]) if regime=="trend" else float(last["bb20_lo"])
+        bullets.append("Contact bande haute BB20")
 
+    bullets.append("Réaction (pattern fort) & close dans BB20")
+    rr = abs((tp-entry)/(entry-sl)) if entry!=sl else 0.0
+    if rr < MIN_RR:
+        return None
+
+    bullets.append(f"RR x{rr:.2f} (≥ {MIN_RR})")
+    bullets.append("Tendance" if regime=="trend" else "Contre-tendance")
+
+    return {"side":side,"regime":regime,"entry":entry,"sl":sl,"tp":tp,"rr":rr,"bullets":bullets}
+
+# ========= ORDRES (papier) =========
 def compute_qty(entry, sl, risk_amount):
-    diff = abs(entry-sl)
+    diff = abs(entry - sl)
     return risk_amount/diff if diff>0 else 0.0
 
-# =======================
-# TELEGRAM COMMANDS (robuste)
-# =======================
-_last_update_id = None  # offset pour getUpdates
+# ========= COMMANDES TELEGRAM =========
+_last_update_id = None
+_bot_paused = False
 
-def _cmd_text(msg: dict) -> str:
-    return (msg.get("text") or "").strip()
+def handle_commands(ex, universe, active_positions) -> None:
+    """Lit les commandes Telegram et répond. Aucune purge automatique ici."""
+    global _last_update_id, _bot_paused
+    _last_update_id, msgs = tg_get_updates(_last_update_id)
+    for m in msgs:
+        text = (m["text"] or "").strip().lower()
+        if not text: continue
 
-def _is_from_allowed_chat(msg: dict) -> bool:
-    # Si TELEGRAM_CHAT_ID est défini, on filtre strictement dessus
-    try:
-        if TG_CHAT_ID:
-            return str(msg["chat"]["id"]) == str(TG_CHAT_ID)
-        # Sinon on accepte tout (utile en test) :
-        return True
-    except Exception:
-        return False
+        if text.startswith("/start"):
+            mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
+            tg_send_start_banner(mode, TF, int(RISK_PER_TRADE*100), MIN_RR)
 
-def poll_telegram_commands(ex, active_paper):
-    """
-    Appelée dans la boucle principale. Récupère les updates et traite les commandes.
-    - offset géré proprement (None au premier appel)
-    - ignore les updates d'autres chats si TG_CHAT_ID est défini
-    """
-    global _last_update_id
-    try:
-        # 1) Récupérer les updates
-        offset = _last_update_id + 1 if _last_update_id is not None else None
-        data = tg_get_updates(offset=offset, timeout=0)
-        if not data or not data.get("ok"):
-            return
+        elif text.startswith("/mode"):
+            tg_send(f"Mode actuel: *{'PAPER' if DRY_RUN else ('LIVE' if not BITGET_TESTNET else 'TESTNET')}*")
 
-        updates = data.get("result", [])
-        if not updates:
-            return
+        elif text.startswith("/config"):
+            tg_send(
+                "*Config*\n"
+                f"Mode: {'PAPER' if DRY_RUN else ('LIVE' if not BITGET_TESTNET else 'TESTNET')}\n"
+                f"TF: {TF}\nTop: {UNIVERSE_SIZE} | Picks/h: {PICKS_PER_HOUR}\n"
+                f"Risk: {int(RISK_PER_TRADE*100)}% | RR≥{MIN_RR}\nCSV: {TRADES_CSV}"
+            )
 
-        for upd in updates:
-            # Mémorise l’update_id (même si le message n’est pas pour nous)
-            _last_update_id = upd.get("update_id", _last_update_id)
+        elif text.startswith("/stats"):
+            tg_send("Stats: (journalisation locale CSV activée, résumé à développer si besoin)")
 
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
-                continue
-            if not _is_from_allowed_chat(msg):
-                continue
+        elif text.startswith("/report"):
+            tg_send("Rapport (compact) — le chat conserve *trades* et *signaux* du jour.")
 
-            text = _cmd_text(msg).lower()
+        elif text.startswith("/orders"):
+            if not active_positions:
+                tg_send("Aucune position (papier).")
+            else:
+                lines=["*Positions papier*"]
+                for s,p in active_positions.items():
+                    lines.append(f"• {s} {p['side'].upper()} entry {p['entry']:.6f} RR x{p['rr']:.2f}")
+                tg_send("\n".join(lines))
 
-            # --- Routes de commandes ---
-            if text.startswith("/start"):
-                mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-                tg_send(f"🔔 Démarrage — *{mode}* • TF {TF} • Risk {int(RISK_PER_TRADE*100)}% • RR≥{MIN_RR}")
+        elif text.startswith("/test"):
+            tg_send("Test papier: (désactivé par défaut ici).")
 
-            elif text.startswith("/config"):
-                mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
-                tg_send(
-                    "*Config*\n"
-                    f"Mode: {mode}\n"
-                    f"TF: {TF}\n"
-                    f"Risk: {int(RISK_PER_TRADE*100)}% | RR≥{MIN_RR}\n"
-                    f"Top: {UNIVERSE_SIZE} | Picks/h: {PICKS}\n"
-                    f"Max trades: {MAX_OPEN_TRADES}\n"
-                    f"CSV: {TRADES_CSV}"
-                )
+        elif text.startswith("/closeallpaper"):
+            n=len(active_positions); active_positions.clear()
+            tg_send(f"🛑 Papier: {n} position(s) effacée(s).")
 
-            elif text.startswith("/mode"):
-                tg_send("Mode actuel : *PAPER*" if DRY_RUN else ("Mode actuel : *TESTNET*" if BITGET_TESTNET else "Mode actuel : *LIVE*"))
+        elif text.startswith("/pause"):
+            _bot_paused = True; tg_send("⏸️ Bot en pause.")
 
-            elif text.startswith("/stats"):
-                send_stats()
+        elif text.startswith("/resume"):
+            _bot_paused = False; tg_send("▶️ Bot relancé.")
 
-            elif text.startswith("/report"):
-                daily_report()
+        elif text.startswith("/logs"):
+            tg_send("Logs: non exposés ici (hébergeur).")
 
-            elif text.startswith("/exportcsv"):
-                try:
-                    if os.path.exists(TRADES_CSV):
-                        requests.post(
-                            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-                            data={"chat_id": TG_CHAT_ID},
-                            files={"document": open(TRADES_CSV, "rb")},
-                            timeout=20,
-                        )
-                    else:
-                        tg_send("Aucun fichier CSV trouvé.")
-                except Exception as e:
-                    tg_send(f"⚠️ export CSV: {e}")
+        elif text.startswith("/ping"):
+            tg_send("🏓 Ping ok.")
 
-            elif text.startswith("/orders"):
-                if DRY_RUN:
-                    if not active_paper:
-                        tg_send("Aucune position (papier).")
-                    else:
-                        lines = ["*Positions (papier)*"]
-                        from datetime import datetime
-                        for sym, p in active_paper.items():
-                            lines.append(
-                                f"• {sym} {'LONG' if p['side']=='buy' else 'SHORT'} | entry {p['entry']:.4f} | SL {p['sl']:.4f} | TP {p['tp']:.4f} | RR x{p['rr']:.2f}"
-                            )
-                        tg_send("\n".join(lines))
-                else:
-                    try:
-                        pos = ex.fetch_positions()
-                        rows=[]
-                        for p in pos:
-                            sz = float(p.get("contracts") or 0)
-                            if abs(sz)>0:
-                                rows.append(f"• {p.get('symbol')} {p.get('side') or ('long' if sz>0 else 'short')} qty {abs(sz)}")
-                        tg_send("*Positions réelles*\n" + ("\n".join(rows) if rows else "Aucune position."))
-                    except Exception as e:
-                        tg_send(f"⚠️ Impossible de lire les positions : {e}")
+        elif text.startswith("/version"):
+            tg_send("🤖 Darwin-Bitget v1.15")
 
-            elif text.startswith("/ping"):
-                tg_send("📡 Ping ok.")
+        elif text.startswith("/restart"):
+            tg_send("♻️ Redémarrage demandé… (à implémenter côté infra si souhaité)")
 
-            elif text.startswith("/version"):
-                tg_send("🤖 Darwin-Bitget v1.14")
+        elif text.startswith("/signals"):
+            tg_send(signals_last_hour_text())
 
-            # /restart : à implémenter côté infra (Render API) si tu le souhaites
-            elif text.startswith("/restart"):
-                tg_send("♻️ Redémarrage demandé (non implémenté côté infra).")
-
-            # NB: Les commandes de purge ont été volontairement désactivées. 
-            # Si tu réactives une purge manuelle plus tard, remets le handler ici.
-
-            # Exemples ‘papier’ optionnels :
-            elif text.startswith("/test"):
-                tg_send("🧪 Mode papier: commande /test non-implémentée dans cette build.")
-            elif text.startswith("/closepaper"):
-                tg_send("🧪 Mode papier: /closepaper non-implémentée dans cette build.")
-            elif text.startswith("/closeallpaper"):
-                tg_send("🧪 Mode papier: /closeallpaper non-implémentée dans cette build.")
-
-            elif text.startswith("/pause"):
-                tg_send("⏸️ Pause: non-implémenté (tu peux arrêter le service côté hébergeur).")
-            elif text.startswith("/resume"):
-                tg_send("▶️ Reprise: non-implémenté (le bot tourne déjà).")
-
-            elif text.startswith("/logs"):
-                tg_send("🧾 Derniers logs indisponibles dans cette build.")
-            # ---------------------------
-
-    except Exception as e:
-        # On ne crashe pas le bot pour un souci Telegram
-        print("[TELEGRAM] poll error:", e)
-
-# =============== NOTIFICATIONS SIGNAL ===================
-def notify_signal(symbol, sig):
-    emoji = "📈" if sig["regime"]=="trend" else "🔄"
-    side  = "LONG" if sig["side"]=="buy" else "SHORT"
-    bullets = []
-    bullets += sig.get("notes",[])
-    bullets.append("Clôture dans/sur BB20")
-    bullets.append(f"RR x{sig['rr']:.2f} (≥ {MIN_RR})")
-    bullets.append("Tendance" if sig["regime"]=="trend" else "Contre-tendance")
-
-    text = (
-        f"📈 *Signal [PAPER]* `{symbol}` {side}\n"
-        f"Entrée `{sig['entry']:.6f}` | SL `{sig['sl']:.6f}` | TP `{sig['tp']:.6f}`\n"
-        + "\n".join([f"• {b}" for b in bullets])
-    )
-    msg_id = tg_send(text, remember_for_signals=True)
-    # on mémorise pour /signals
-    remember_signal_message(msg_id, symbol, sig)
-
-# =============== MAIN LOOP ==============================
+# ========= MAIN LOOP =========
 def main():
     ex = create_exchange()
-    tg_send("▶️ Bot repris.")
     universe = build_universe(ex)
+    mode = "PAPER" if DRY_RUN else ("LIVE" if not BITGET_TESTNET else "TESTNET")
+    tg_send_start_banner(mode, TF, int(RISK_PER_TRADE*100), MIN_RR)
 
-    # Optionnel : levier 2x cross silencieux
-    for s in universe:
-        try_set_leverage(ex, s, lev=MAX_LEVERAGE, mode=WANT_CROSS)
+    # position papier (simple mémo — ici on n’exécute que des signaux/entrées)
+    active_paper = {}
 
-    last_bar_seen = {}
-    state = {}  # cooldown etc.
+    state = {}                 # pour cooldown “sauter le 1er trade”
+    last_closed_ts = None      # dernière bougie close traitée
+    last_hour_processed = None # pour limiter à 1 vague de signaux par heure
 
     while True:
         try:
-            poll_telegram_commands()
-            if PAUSED:
-                time.sleep(LOOP_DELAY)
-                continue
+            handle_commands(ex, universe, active_paper)
+            if _bot_paused:
+                time.sleep(LOOP_DELAY); continue
 
+            # On regarde l’heure actuelle — on n’émet les signaux qu’à la *clôture* et une fois par heure
             now = datetime.utcnow()
-            # scanning uniquement à la clôture H1 : on compare la dernière barre close
-            candidates = []
 
+            # scan data (on a besoin du ts de la dernière bougie close pour caler l’horloge)
+            # on prend un "leader" pour l’horloge (BTC)
+            leader = universe[0] if universe else "BTC/USDT:USDT"
+            try:
+                df0 = fetch_ohlcv_df(ex, leader, TF, 100)
+            except Exception:
+                time.sleep(LOOP_DELAY); continue
+            ts_close = df0.index[-1]
+
+            # si pas de nouvelle clôture -> pas de signaux
+            if last_closed_ts == ts_close:
+                time.sleep(LOOP_DELAY); continue
+
+            # nouvelle bougie H1 close => fenêtre de travail “une fois par heure”
+            last_closed_ts = ts_close
+
+            # 1) scanner l’univers et construire la liste des signaux candidats
+            candidates = []
             for sym in universe:
                 try:
-                    df = fetch_ohlcv_df(ex, sym, TF, limit=300)
-                except Exception:
-                    continue
-
-                last_ts = df.index[-1]
-                # si pas de nouvelle bougie, skip
-                if last_bar_seen.get(sym) == last_ts:
-                    continue
-
-                # nouvelle clôture !
-                last_bar_seen[sym] = last_ts
-
-                sig = detect_signal(df, state, sym, rr_min=MIN_RR)
-                if sig:
+                    df = fetch_ohlcv_df(ex, sym, TF, 200)
+                    sig = detect_signal(df, state, sym)
+                    if not sig: 
+                        continue
+                    # calcul RR et ordre: on ne place *pas* l’ordre tout de suite
                     candidates.append((sym, sig))
+                except Exception as e:
+                    print("[SCAN]", sym, e)
 
-            # Sélectionne les 4 meilleurs par RR
-            if candidates:
-                candidates.sort(key=lambda x: x[1]["rr"], reverse=True)
-                for sym, sig in candidates[:PICKS_PER_HOUR]:
-                    notify_signal(sym, sig)
-                    # (Si tu veux exécuter des ordres, c’est ici, mais on reste « signaux ».)
+            if not candidates:
+                time.sleep(LOOP_DELAY); continue
+
+            # 2) ne garder que les 4 meilleurs RR
+            candidates.sort(key=lambda x: x[1]["rr"], reverse=True)
+            picks = candidates[:PICKS_PER_HOUR]
+
+            # 3) émission des *signaux* (pas d’entrée intrabarre – l’entrée se fera à l’ouverture suivante)
+            for sym, sig in picks:
+                # message carte
+                mid = tg_send_signal_card(sym, sig["side"], sig["entry"], sig["sl"], sig["tp"], sig["rr"],
+                                          sig["bullets"], sig["regime"], DRY_RUN)
+                remember_signal_message(sym, sig["side"], sig["rr"], mid)
+
+                # si tu veux *vraiment* entrer automatiquement à l’ouverture suivante,
+                # tu peux mémoriser ici et exécuter sur la prochaine itération si ts change.
+                # Pour rester 100% conforme: on n’entre pas ici, on ne fait que signaler.
 
             time.sleep(LOOP_DELAY)
 
@@ -561,9 +400,7 @@ def main():
             tg_send("⛔ Arrêt manuel.")
             break
         except Exception as e:
-            # évite spam – message unique raccourci
-            try: tg_send(f"⚠️ Loop error: {e}")
-            except Exception: pass
+            print("[LOOP ERR]", e)
             time.sleep(5)
 
 if __name__ == "__main__":
