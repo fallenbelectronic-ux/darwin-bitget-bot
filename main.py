@@ -51,6 +51,48 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
         print(f"Impossible de construire l'univers via l'API. Erreur: {e}.")
         return []
 
+def check_pending_signals(ex: ccxt.Exchange, symbol: str, df: pd.DataFrame):
+    """Vérifie si un signal en attente doit être exécuté et re-valide le R/R."""
+    if symbol in state.pending_signals:
+        pending = state.pending_signals[symbol]
+        signal_candle_timestamp = pending['candle_timestamp']
+        current_candle_timestamp = df.index[-1]
+
+        if current_candle_timestamp > signal_candle_timestamp:
+            print(f"  -> NOUVELLE BOUGIE pour {symbol}. Re-validation du R/R pour le signal en attente...")
+            
+            new_entry_price = df['open'].iloc[-1]
+            sl_price = pending['signal']['sl']
+            
+            df_with_indicators = trader._get_indicators(df.copy())
+            if df_with_indicators is None:
+                del state.pending_signals[symbol]
+                return
+            
+            last_indicators = df_with_indicators.iloc[-1]
+            is_long = pending['signal']['side'] == 'buy'
+            new_tp_price = last_indicators['bb80_mid'] if pending['signal']['regime'] == 'Tendance' else \
+                           last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+            
+            new_rr = 0
+            if is_long and (new_entry_price - sl_price) > 0:
+                new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price)
+            elif not is_long and (sl_price - new_entry_price) > 0:
+                new_rr = (new_entry_price - new_tp_price) / (sl_price - new_entry_price)
+            
+            if new_rr >= MIN_RR:
+                print(f"   -> R/R RE-VALIDÉ: {new_rr:.2f} >= {MIN_RR}. Exécution du trade...")
+                pending['signal']['tp'] = new_tp_price
+                pending['signal']['rr'] = new_rr
+                is_taken, reason = trader.execute_trade(ex, symbol, pending['signal'], pending['df'], new_entry_price)
+                if not is_taken:
+                    notifier.send_validated_signal_report(symbol, pending['signal'], is_taken, reason)
+            else:
+                print(f"   -> ÉCHEC: Signal pour {symbol} invalidé. Nouveau R/R ({new_rr:.2f}) < {MIN_RR}.")
+                notifier.send_validated_signal_report(symbol, pending['signal'], False, f"Invalidé: R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}")
+
+            del state.pending_signals[symbol]
+
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """Logique de détection de signal sur la bougie en cours."""
     if df is None or len(df) < 81: return None
@@ -58,25 +100,30 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if df_with_indicators is None: return None
     
     last_candle = df_with_indicators.iloc[-1]
-    is_uptrend = last_candle['close'] > last_candle['bb80_mid']; is_downtrend = last_candle['close'] < last_candle['bb80_mid']
+    is_uptrend = last_candle['close'] > last_candle['bb80_mid']
+    is_downtrend = last_candle['close'] < last_candle['bb80_mid']
     signal = None
 
     if is_uptrend and last_candle['low'] <= last_candle['bb20_lo'] and last_candle['close'] > last_candle['bb20_lo']:
-        entry = (last_candle['open'] + last_candle['close']) / 2; sl, tp = last_candle['low'] - (2 * 0.0005 * last_candle['close']), last_candle['bb80_mid']
+        entry = (last_candle['open'] + last_candle['close']) / 2
+        sl, tp = last_candle['low'] - (2 * 0.0005 * last_candle['close']), last_candle['bb80_mid']
         rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
         if rr >= MIN_RR: signal = {"side": "buy", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
     elif is_downtrend and last_candle['high'] >= last_candle['bb20_up'] and last_candle['close'] < last_candle['bb20_up']:
-        entry = (last_candle['open'] + last_candle['close']) / 2; sl, tp = last_candle['high'] + (2 * 0.0005 * last_candle['close']), last_candle['bb80_mid']
+        entry = (last_candle['open'] + last_candle['close']) / 2
+        sl, tp = last_candle['high'] + (2 * 0.0005 * last_candle['close']), last_candle['bb80_mid']
         rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
         if rr >= MIN_RR: signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
 
     if not signal:
         if last_candle['low'] <= last_candle['bb20_lo'] and last_candle['low'] <= last_candle['bb80_lo'] and last_candle['close'] > last_candle['bb20_lo']:
-            entry = (last_candle['open'] + last_candle['close']) / 2; sl, tp = last_candle['low'] - (2 * 0.0005 * last_candle['close']), last_candle['bb20_up']
+            entry = (last_candle['open'] + last_candle['close']) / 2
+            sl, tp = last_candle['low'] - (2 * 0.0005 * last_candle['close']), last_candle['bb20_up']
             rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
             if rr >= MIN_RR: signal = {"side": "buy", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
         elif last_candle['high'] >= last_candle['bb20_up'] and last_candle['high'] >= last_candle['bb80_up'] and last_candle['close'] < last_candle['bb20_up']:
-            entry = (last_candle['open'] + last_candle['close']) / 2; sl, tp = last_candle['high'] + (2 * 0.0005 * last_candle['close']), last_candle['bb20_lo']
+            entry = (last_candle['open'] + last_candle['close']) / 2
+            sl, tp = last_candle['high'] + (2 * 0.0005 * last_candle['close']), last_candle['bb20_lo']
             rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
             if rr >= MIN_RR: signal = {"side": "sell", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
     
@@ -84,25 +131,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         signal['bb20_mid'] = last_candle['bb20_mid']
         return signal
     return None
-    
-def check_pending_signals(ex: ccxt.Exchange, symbol: str, df: pd.DataFrame):
-    """Vérifie si un signal en attente doit être exécuté."""
-    if symbol in state.pending_signals:
-        pending = state.pending_signals[symbol]
-        signal_candle_timestamp = pending['candle_timestamp']
-        current_candle_timestamp = df.index[-1]
 
-        if current_candle_timestamp > signal_candle_timestamp:
-            print(f"  -> NOUVELLE BOUGIE pour {symbol}. Exécution du signal en attente...")
-            entry_price = df['open'].iloc[-1]
-            is_taken, reason = trader.execute_trade(ex, symbol, pending['signal'], pending['df'], entry_price)
-            if is_taken:
-                print(f"   -> SUCCÈS: Trade en attente pour {symbol} pris.")
-            else:
-                notifier.send_validated_signal_report(symbol, pending['signal'], is_taken, reason)
-                print(f"   -> ÉCHEC: Trade en attente pour {symbol} non pris. Raison: {reason}")
-            del state.pending_signals[symbol]
-            
 def main():
     """Boucle principale du bot."""
     ex = create_exchange()
@@ -164,11 +193,12 @@ def main():
             print("--------------------------------------------------")
             time.sleep(15)
 
-# --- Le reste des fonctions de gestion Telegram, etc. est ici, restauré et propre ---
+# --- GESTION TELEGRAM (COMPLET ET PROPRE) ---
 def cleanup_recent_signals(hours: int = 6):
     global _recent_signals
     seconds_ago = time.time() - (hours * 60 * 60)
     _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+
 def get_recent_signals_message(hours: int) -> str:
     cleanup_recent_signals(hours)
     seconds_ago = time.time() - (hours * 60 * 60)
@@ -181,6 +211,7 @@ def get_recent_signals_message(hours: int) -> str:
         side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
         lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | {s['signal']['regime']} | RR: {s['signal']['rr']:.2f}")
     return "\n".join(lines)
+
 def process_callback_query(callback_query: Dict):
     global _paused
     data = callback_query.get('data', '')
@@ -209,13 +240,32 @@ def process_callback_query(callback_query: Dict):
         notifier.send_strategy_menu('SPLIT')
     elif data == 'back_to_main':
         notifier.send_main_menu(_paused)
+
 def process_message(message: Dict):
     global _paused
     text = message.get("text", "").strip().lower()
     parts = text.split()
     command = parts[0]
+    
     if command == "/start":
-        help_message = ("🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n⚙️ <b>CONFIG</b>\n/config\n/mode\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n📈 <b>TRADING</b>\n/signals\n/recent\n/stats")
+        help_message = (
+            "🤖 <b>PANNEAU DE CONTRÔLE - DARWIN BOT</b>\n\n"
+            "🚦 <b>GESTION DU BOT</b>\n"
+            "/start — Affiche ce message\n"
+            "/pause — Met le scan en pause\n"
+            "/resume — Reprend le scan\n"
+            "/ping — Vérifie si le bot est en ligne\n\n"
+            "⚙️ <b>CONFIGURATION</b>\n"
+            "/config — Affiche la configuration\n"
+            "/mode — Affiche les modes de fonctionnement\n"
+            "/strategy — Change le mode de gestion (NORMAL/SPLIT)\n" # COMMANDE AJOUTÉE
+            "/setuniverse <code>&lt;nombre&gt;</code>\n"
+            "/setmaxpos <code>&lt;nombre&gt;</code>\n\n"
+            "📈 <b>TRADING</b>\n"
+            "/signals — Signaux (1h)\n"
+            "/recent — Signaux (6h)\n"
+            "/stats — Statistiques"
+        )
         notifier.tg_send(help_message)
         notifier.send_main_menu(_paused)
     elif command == "/pause": _paused = True; notifier.tg_send("⏸️ Scan mis en pause.")
@@ -225,6 +275,9 @@ def process_message(message: Dict):
         current_max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS))
         notifier.send_config_message(min_rr=MIN_RR, risk=trader.RISK_PER_TRADE_PERCENT, max_pos=current_max_pos, leverage=trader.LEVERAGE)
     elif command == "/mode": notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=trader.PAPER_TRADING_MODE)
+    elif command == "/strategy": # COMMANDE AJOUTÉE
+        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+        notifier.send_strategy_menu(current_strategy)
     elif command == "/signals": notifier.tg_send(get_recent_signals_message(1))
     elif command == "/recent": notifier.tg_send(get_recent_signals_message(6))
     elif command == "/stats":
@@ -248,6 +301,7 @@ def process_message(message: Dict):
                 notifier.tg_send(f"✅ Nombre max de positions mis à jour à <b>{new_max}</b>.")
             else: notifier.tg_send("❌ Le nombre doit être >= 0.")
         except ValueError: notifier.tg_send("❌ Valeur invalide.")
+
 def poll_telegram_updates():
     global _last_update_id
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
@@ -257,6 +311,7 @@ def poll_telegram_updates():
             process_callback_query(upd['callback_query'])
         elif 'message' in upd:
             process_message(upd['message'])
+            
 def check_scheduled_reports():
     global _last_daily_report_day, _last_weekly_report_day
     try: tz = pytz.timezone(TIMEZONE)
