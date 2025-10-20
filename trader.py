@@ -1,101 +1,96 @@
 # Fichier: trader.py
-import os
-import time
-import ccxt
-import pandas as pd
+import os, time, ccxt, pandas as pd, database, notifier, charting
 from ta.volatility import BollingerBands
 from typing import Dict, Any, Optional
-
-import database
-import notifier
-import charting
-# CORRECTION: Importation depuis le nouveau fichier utils.py
-from utils import fetch_ohlcv_df 
+from utils import fetch_ohlcv_df
 
 # --- PARAMÈTRES ---
 PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "true").lower() in ("1", "true", "yes")
 RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
-LEVERAGE = int(os.getenv("LEVERAGE", "2"))
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")
-TP_UPDATE_THRESHOLD_PERCENT = 0.05 
+LEVERAGE, TIMEFRAME = int(os.getenv("LEVERAGE", "2")), os.getenv("TIMEFRAME", "1h")
+TP_UPDATE_THRESHOLD_PERCENT = 0.05
 
-def _calculate_bb_mid(df: pd.DataFrame) -> Optional[float]:
-    if df is None or len(df) < 20: return None
-    bb = BollingerBands(close=df['close'], window=20, window_dev=2)
-    return bb.bollinger_mavg().iloc[-1]
+def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df is None or len(df) < 81: return None
+    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2); df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
+    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2); df['bb80_mid'] = bb_80.bollinger_mavg()
+    return df
 
 def manage_open_positions(ex: ccxt.Exchange):
     if PAPER_TRADING_MODE: return
-    open_positions = database.get_open_positions()
-    if not open_positions: return
-
-    for pos in open_positions:
-        symbol, trade_id, current_tp = pos['symbol'], pos['id'], pos['tp_price']
-        try:
-            df = fetch_ohlcv_df(ex, symbol, TIMEFRAME)
-            if df is None: continue
-            new_dynamic_tp = _calculate_bb_mid(df)
-            if new_dynamic_tp is None: continue
-            change_percent = (abs(new_dynamic_tp - current_tp) / current_tp) * 100
-            if change_percent < TP_UPDATE_THRESHOLD_PERCENT: continue
-            print(f"Mise à jour du TP requise pour {symbol} (Trade #{trade_id}): {current_tp:.5f} -> {new_dynamic_tp:.5f}")
-            params = {'symbol': symbol, 'takeProfitPrice': f"{new_dynamic_tp:.5f}", 'stopLossPrice': f"{pos['sl_price']:.5f}"}
-            ex.private_post_mix_position_modify_position(params)
-            database.update_trade_tp(trade_id, new_dynamic_tp)
-            notifier.tg_send(f"✅ TP pour <b>{symbol}</b> mis à jour dynamiquement à <code>{new_dynamic_tp:.5f}</code>.")
-        except ccxt.NetworkError as e: print(f"Erreur réseau (gestion {symbol}): {e}")
-        except ccxt.ExchangeError as e: print(f"Erreur d'exchange pour {symbol} (trade peut-être déjà fermé): {e}")
-        except Exception as e:
-            print(f"Erreur inattendue (gestion {symbol}): {e}")
-            notifier.tg_send_error(f"Gestion de {symbol}", e)
-
-def get_usdt_balance(ex: ccxt.Exchange) -> float:
-    try:
-        balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
-        return float(balance['total'].get('USDT', 0.0))
-    except Exception as e:
-        notifier.tg_send_error("Récupération du solde", e)
-        return 0.0
-
-def calculate_position_size(balance: float, risk_percent: float, entry_price: float, sl_price: float) -> float:
-    if balance <= 0 or entry_price == sl_price: return 0.0
-    risk_amount_usdt = balance * (risk_percent / 100.0)
-    price_diff_per_unit = abs(entry_price - sl_price)
-    return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
+    for pos in database.get_open_positions():
+        df = _get_indicators(fetch_ohlcv_df(ex, pos['symbol'], TIMEFRAME))
+        if df is None: continue
+        last_indicators, is_long = df.iloc[-1], pos['side'] == 'buy'
+        
+        # --- GESTION SPLIT : Déclenchement sur la MM20 ---
+        if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
+            try:
+                current_price = ex.fetch_ticker(pos['symbol'])['last']
+                management_trigger_price = last_indicators['bb20_mid']
+                if (is_long and current_price >= management_trigger_price) or (not is_long and current_price <= management_trigger_price):
+                    print(f"Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
+                    qty_to_close, remaining_qty = pos['quantity'] / 2, pos['quantity'] / 2
+                    
+                    ex.create_market_order(pos['symbol'], 'sell' if is_long else 'buy', qty_to_close)
+                    
+                    pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
+                    new_sl_be = pos['entry_price']
+                    
+                    params = {'symbol': pos['symbol'], 'stopLossPrice': f"{new_sl_be:.5f}", 'takeProfitPrice': f"{pos['tp_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    
+                    database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
+                    notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
+            except Exception as e: print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}"); notifier.tg_send_error(f"Gestion SPLIT {pos['symbol']}", e)
+        
+        # --- GESTION NORMALE (ou 2ème partie du SPLIT) : TP DYNAMIQUE ---
+        else:
+            # Pour un trade en tendance, le TP est la MM80. Pour un trade CT, c'est la borne BB20 opposée.
+            new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+            if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
+                try:
+                    print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
+                    params = {'symbol': pos['symbol'], 'takeProfitPrice': f"{new_dynamic_tp:.5f}", 'stopLossPrice': f"{pos['sl_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    database.update_trade_tp(pos['id'], new_dynamic_tp)
+                except Exception as e: print(f"Erreur de mise à jour TP (Dynamique) pour {pos['symbol']}: {e}")
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
-    max_pos = int(os.getenv('MAX_OPEN_POSITIONS', 3))
-    if len(database.get_open_positions()) >= max_pos: return
-    if database.is_position_open(symbol): return
-    current_risk = RISK_PER_TRADE_PERCENT
-    balance = get_usdt_balance(ex)
+    if len(database.get_open_positions()) >= int(os.getenv('MAX_OPEN_POSITIONS', 3)) or database.is_position_open(symbol): return
+    
+    # Lecture de la stratégie active depuis la base de données
+    current_strategy_mode = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+    
+    management_strategy = "NORMAL"
+    if current_strategy_mode == 'SPLIT' and signal['regime'] == 'Contre-tendance':
+        management_strategy = "SPLIT"
+    
+    risk = RISK_PER_TRADE_PERCENT; balance = get_usdt_balance(ex)
     if balance <= 10: return
-    quantity = calculate_position_size(balance, current_risk, signal['entry'], signal['sl'])
+    quantity = calculate_position_size(balance, risk, signal['entry'], signal['sl'])
     if quantity <= 0: return
-    mode_text = "PAPIER" if PAPER_TRADING_MODE else "RÉEL"
-    trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, current_risk)
-    chart_image = charting.generate_trade_chart(symbol, df, signal)
-    if not PAPER_TRADING_MODE:
-        try:
-            ex.set_leverage(LEVERAGE, symbol)
-            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}
-            ex.create_market_order(symbol, signal['side'], quantity, params=params)
-        except Exception as e:
-            notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
-            return
-    notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
-    database.create_trade(symbol=symbol, side=signal['side'], regime=signal['regime'], status='OPEN', entry_price=signal['entry'], sl_price=signal['sl'], tp_price=signal['tp'], quantity=quantity, risk_percent=current_risk, open_timestamp=int(time.time()), bb20_mid_at_entry=signal.get('bb20_mid'))
 
+    trade_message = notifier.format_trade_message(symbol, signal, quantity, "PAPIER" if PAPER_TRADING_MODE else "RÉEL", risk)
+    chart_image = charting.generate_trade_chart(symbol, df, signal)
+
+    if not PAPER_TRADING_MODE:
+        try: ex.set_leverage(LEVERAGE, symbol); params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}; ex.create_market_order(symbol, signal['side'], quantity, params=params)
+        except Exception as e: notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e); return
+
+    notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
+    database.create_trade(symbol, signal['side'], signal['regime'], signal['entry'], signal['sl'], signal['tp'], quantity, risk, int(time.time()), signal.get('bb20_mid'), management_strategy)
+
+# --- Fonctions utilitaires inchangées ---
+def get_usdt_balance(ex: ccxt.Exchange) -> float:
+    try: balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'}); return float(balance['total'].get('USDT', 0.0))
+    except Exception as e: notifier.tg_send_error("Récupération du solde", e); return 0.0
+def calculate_position_size(balance: float, risk_percent: float, entry_price: float, sl_price: float) -> float:
+    if balance <= 0 or entry_price == sl_price: return 0.0; risk_amount_usdt = balance * (risk_percent / 100.0); price_diff_per_unit = abs(entry_price - sl_price); return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     trade = database.get_trade_by_id(trade_id)
-    if not trade or trade.get('status') != 'OPEN':
-        return notifier.tg_send(f"Trade #{trade_id} déjà fermé ou invalide.")
-    symbol, side, quantity = trade['symbol'], trade['side'], trade['quantity']
+    if not trade or trade.get('status') != 'OPEN': return notifier.tg_send(f"Trade #{trade_id} déjà fermé ou invalide.")
     try:
-        if not PAPER_TRADING_MODE:
-            close_side = 'sell' if side == 'buy' else 'buy'
-            ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True})
-        database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
-        notifier.tg_send(f"✅ Position sur {symbol} (Trade #{trade_id}) fermée manuellement.")
-    except Exception as e:
-        notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
+        if not PAPER_TRADING_MODE: ex.create_market_order(trade['symbol'], 'sell' if trade['side'] == 'buy' else 'buy', trade['quantity'], params={'reduceOnly': True})
+        database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0); notifier.tg_send(f"✅ Position sur {trade['symbol']} (Trade #{trade_id}) fermée manuellement.")
+    except Exception as e: notifier.tg_send_error(f"Fermeture manuelle de {trade['symbol']}", e)
