@@ -23,10 +23,35 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT ---
-_last_update_id: Optional[int] = None; _paused = False; _last_daily_report_day, _last_weekly_report_day = -1, -1
+_last_update_id: Optional[int] = None
+_paused = False
+_last_daily_report_day = -1
+_last_weekly_report_day = -1
 _recent_signals: List[Dict] = []
 
-# --- FONCTIONS PRINCIPALES ---
+# ==============================================================================
+# DÉFINITION DE TOUTES LES FONCTIONS AVANT LEUR UTILISATION
+# ==============================================================================
+
+def cleanup_recent_signals(hours: int = 6):
+    """Supprime les signaux de l'historique qui sont plus vieux que `hours`."""
+    global _recent_signals
+    seconds_ago = time.time() - (hours * 60 * 60)
+    _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+
+def get_recent_signals_message(hours: int) -> str:
+    """Génère le message de résumé pour les signaux récents."""
+    cleanup_recent_signals(hours)
+    seconds_ago = time.time() - (hours * 60 * 60)
+    signals_in_period = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+    if not signals_in_period:
+        return f"⏱️ Aucun signal valide détecté dans les {hours} dernières heures."
+    lines = [f"<b>⏱️ {len(signals_in_period)} Signaux ({'dernière heure' if hours == 1 else f'{hours}h'})</b>\n"]
+    for s in signals_in_period:
+        ts = datetime.fromtimestamp(s['timestamp'], tz=timezone.utc).astimezone(pytz.timezone(TIMEZONE)).strftime('%H:%M')
+        side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
+        lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | {s['signal']['regime']} | RR: {s['signal']['rr']:.2f}")
+    return "\n".join(lines)
 
 def create_exchange():
     """Initialise et retourne l'objet d'échange CCXT."""
@@ -60,10 +85,8 @@ def check_pending_signals(ex: ccxt.Exchange, symbol: str, df: pd.DataFrame):
 
         if current_candle_timestamp > signal_candle_timestamp:
             print(f"  -> NOUVELLE BOUGIE pour {symbol}. Re-validation du R/R pour le signal en attente...")
-            
             new_entry_price = df['open'].iloc[-1]
             sl_price = pending['signal']['sl']
-            
             df_with_indicators = trader._get_indicators(df.copy())
             if df_with_indicators is None:
                 del state.pending_signals[symbol]
@@ -90,7 +113,6 @@ def check_pending_signals(ex: ccxt.Exchange, symbol: str, df: pd.DataFrame):
             else:
                 print(f"   -> ÉCHEC: Signal pour {symbol} invalidé. Nouveau R/R ({new_rr:.2f}) < {MIN_RR}.")
                 notifier.send_validated_signal_report(symbol, pending['signal'], False, f"Invalidé: R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}")
-
             del state.pending_signals[symbol]
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -131,92 +153,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         signal['bb20_mid'] = last_candle['bb20_mid']
         return signal
     return None
-
-def main():
-    """Boucle principale du bot."""
-    ex = create_exchange()
-    database.setup_database()
-    if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
-    if not database.get_setting('UNIVERSE_SIZE'): database.set_setting('UNIVERSE_SIZE', UNIVERSE_SIZE)
-    if not database.get_setting('MAX_OPEN_POSITIONS'): database.set_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
-    if not database.get_setting('PAPER_TRADING_MODE'): database.set_setting('PAPER_TRADING_MODE', os.getenv("PAPER_TRADING_MODE", "true").lower())
-    
-    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if database.get_setting('PAPER_TRADING_MODE') == 'true' else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
-    universe = build_universe(ex)
-    if not universe:
-        notifier.tg_send("❌ Impossible de construire l'univers de trading.")
-        return
-    
-    print(f"Univers de trading chargé avec {len(universe)} paires.")
-    
-    while True:
-        print(f"\n--- [{time.strftime('%Y-%m-%d %H:%M:%S')}] Nouveau cycle de la boucle ---")
-        try:
-            cleanup_recent_signals() # APPEL CORRIGÉ
-            poll_telegram_updates()
-            check_scheduled_reports()
-            
-            if _paused:
-                time.sleep(LOOP_DELAY)
-                continue
-            
-            trader.manage_open_positions(ex)
-            
-            print(f"4. Début du scan de l'univers ({len(universe)} paires)...")
-            for symbol in universe:
-                df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
-                if df is None or len(df) < 81:
-                    continue
-                
-                check_pending_signals(ex, symbol, df)
-                
-                signal = detect_signal(symbol, df)
-                if signal and symbol not in state.pending_signals:
-                    print(f"✅✅✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
-                    state.pending_signals[symbol] = {
-                        'signal': signal, 
-                        'df': df.copy(), 
-                        'candle_timestamp': df.index[-1]
-                    }
-                    notifier.send_validated_signal_report(symbol, signal, False, "En attente de la clôture horaire.")
-                    _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-
-            print(f"--- Fin du cycle. Attente de {LOOP_DELAY} secondes. ---")
-            time.sleep(LOOP_DELAY)
-        
-        except KeyboardInterrupt:
-            notifier.tg_send("⛔ Arrêt manuel.")
-            break
-        except Exception:
-            print("\n--- ERREUR CRITIQUE DANS LA BOUCLE PRINCIPALE ---")
-            error_details = traceback.format_exc()
-            print(error_details)
-            notifier.tg_send_error("Erreur critique (boucle)", error_details)
-            print("--------------------------------------------------")
-            time.sleep(15)
-
-# ==============================================================================
-# FONCTIONS MANQUANTES RESTAURÉES
-# ==============================================================================
-def cleanup_recent_signals(hours: int = 6):
-    """Supprime les signaux de l'historique qui sont plus vieux que `hours`."""
-    global _recent_signals
-    seconds_ago = time.time() - (hours * 60 * 60)
-    _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
-
-def get_recent_signals_message(hours: int) -> str:
-    """Génère le message de résumé pour les signaux récents."""
-    cleanup_recent_signals(hours)
-    seconds_ago = time.time() - (hours * 60 * 60)
-    signals_in_period = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
-    if not signals_in_period:
-        return f"⏱️ Aucun signal valide détecté dans les {hours} dernières heures."
-    lines = [f"<b>⏱️ {len(signals_in_period)} Signaux ({'dernière heure' if hours == 1 else f'{hours}h'})</b>\n"]
-    for s in signals_in_period:
-        ts = datetime.fromtimestamp(s['timestamp'], tz=timezone.utc).astimezone(pytz.timezone(TIMEZONE)).strftime('%H:%M')
-        side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
-        lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | {s['signal']['regime']} | RR: {s['signal']['rr']:.2f}")
-    return "\n".join(lines)
 
 def process_callback_query(callback_query: Dict):
     """Gère les clics sur les boutons interactifs de Telegram."""
@@ -263,12 +199,7 @@ def process_message(message: Dict):
     parts = text.split()
     command = parts[0]
     if command == "/start":
-        help_message = (
-            "🤖 <b>PANNEAU DE CONTRÔLE - DARWIN BOT</b>\n\n"
-            "🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
-            "⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n"
-            "📈 <b>TRADING</b>\n/signals\n/recent\n/stats\n/pos"
-        )
+        help_message = ("🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n📈 <b>TRADING</b>\n/signals\n/recent\n/stats\n/pos")
         notifier.tg_send(help_message)
         notifier.send_main_menu(_paused)
     elif command == "/pause": _paused = True; notifier.tg_send("⏸️ Scan mis en pause.")
@@ -333,6 +264,69 @@ def check_scheduled_reports():
         _last_weekly_report_day = now.day
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("🗓️ Bilan Hebdomadaire", trades)
+
+def main():
+    """Boucle principale du bot."""
+    ex = create_exchange()
+    database.setup_database()
+    if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+    if not database.get_setting('UNIVERSE_SIZE'): database.set_setting('UNIVERSE_SIZE', UNIVERSE_SIZE)
+    if not database.get_setting('MAX_OPEN_POSITIONS'): database.set_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+    if not database.get_setting('PAPER_TRADING_MODE'): database.set_setting('PAPER_TRADING_MODE', os.getenv("PAPER_TRADING_MODE", "true").lower())
+    
+    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if database.get_setting('PAPER_TRADING_MODE') == 'true' else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
+    universe = build_universe(ex)
+    if not universe:
+        notifier.tg_send("❌ Impossible de construire l'univers de trading.")
+        return
+    
+    print(f"Univers de trading chargé avec {len(universe)} paires.")
+    
+    while True:
+        print(f"\n--- [{time.strftime('%Y-%m-%d %H:%M:%S')}] Nouveau cycle de la boucle ---")
+        try:
+            cleanup_recent_signals()
+            poll_telegram_updates()
+            check_scheduled_reports()
+            
+            if _paused:
+                time.sleep(LOOP_DELAY)
+                continue
+            
+            trader.manage_open_positions(ex)
+            
+            print(f"4. Début du scan de l'univers ({len(universe)} paires)...")
+            for symbol in universe:
+                df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
+                if df is None or len(df) < 81:
+                    continue
+                
+                check_pending_signals(ex, symbol, df)
+                
+                signal = detect_signal(symbol, df)
+                if signal and symbol not in state.pending_signals:
+                    print(f"✅✅✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
+                    state.pending_signals[symbol] = {
+                        'signal': signal, 
+                        'df': df.copy(), 
+                        'candle_timestamp': df.index[-1]
+                    }
+                    notifier.send_validated_signal_report(symbol, signal, False, "En attente de la clôture horaire.")
+                    _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+
+            print(f"--- Fin du cycle. Attente de {LOOP_DELAY} secondes. ---")
+            time.sleep(LOOP_DELAY)
+        
+        except KeyboardInterrupt:
+            notifier.tg_send("⛔ Arrêt manuel.")
+            break
+        except Exception:
+            print("\n--- ERREUR CRITIQUE DANS LA BOUCLE PRINCIPALE ---")
+            error_details = traceback.format_exc()
+            print(error_details)
+            notifier.tg_send_error("Erreur critique (boucle)", error_details)
+            print("--------------------------------------------------")
+            time.sleep(15)
 
 if __name__ == "__main__":
     main()
