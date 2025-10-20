@@ -19,34 +19,22 @@ import state
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
 API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
-# MODIFICATION : On ne cherche plus qu'un seul nom, le plus standard.
-PASSPHRASSE      = os.getenv("BITGET_PASSWORD", "")
+# Accepte les deux noms de variables pour la passphrase pour une robustesse maximale
+PASSPHRASSE      = os.getenv("BITGET_PASSPHRASSE", "") or os.getenv("BITGET_PASSWORD", "")
 
 TIMEFRAME, UNIVERSE_SIZE, MIN_RR = os.getenv("TIMEFRAME", "1h"), int(os.getenv("UNIVERSE_SIZE", "30")), float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT ---
+_last_update_id: Optional[int] = None
+_paused = False
+_last_daily_report_day = -1
+_last_weekly_report_day = -1
+_recent_signals: List[Dict] = []
 
-# --- FONCTIONS ---
-def create_exchange():
-    """Initialise et retourne l'objet d'échange CCXT."""
-    # On revient à la version simple, l'API v2 n'était pas la solution.
-    ex = ccxt.bitget({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "password": PASSPHRASSE, # CCXT utilise le terme 'password' pour la passphrase
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-            "testnet": BITGET_TESTNET
-        }
-    })
-    if BITGET_TESTNET:
-        ex.set_sandbox_mode(True)
-    return ex
 # ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS AVANT LEUR UTILISATION
+# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES AVANT LA BOUCLE `main`
 # ==============================================================================
 
 def cleanup_recent_signals(hours: int = 6):
