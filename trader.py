@@ -17,6 +17,17 @@ LEVERAGE = int(os.getenv("LEVERAGE", "2"))
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 TP_UPDATE_THRESHOLD_PERCENT = 0.05
 
+def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
+    """Récupère le solde USDT. Retourne None en cas d'erreur."""
+    try:
+        # On augmente le timeout pour les requêtes réseau sensibles
+        ex.options['recvWindow'] = 10000
+        balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
+        return float(balance['total'].get('USDT', 0.0))
+    except Exception as e:
+        notifier.tg_send_error("Récupération du solde", e)
+        return None
+
 def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Calcule et ajoute tous les indicateurs techniques nécessaires."""
     if df is None or len(df) < 81:
