@@ -130,112 +130,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return signal
     return None
 
-def process_callback_query(callback_query: Dict):
-    """Gère les clics sur les boutons interactifs de Telegram."""
-    global _paused
-    data = callback_query.get('data', '')
-    if data == 'pause': _paused = True; notifier.tg_send("⏸️ Scan mis en pause.")
-    elif data == 'resume': _paused = False; notifier.tg_send("▶️ Reprise du scan.")
-    elif data == 'list_positions': notifier.format_open_positions(database.get_open_positions())
-    elif data == 'get_recent_signals': notifier.tg_send(get_recent_signals_message(6))
-    elif data.startswith('close_trade_'):
-        try: trade_id = int(data.split('_')[-1]); trader.close_position_manually(create_exchange(), trade_id)
-        except (ValueError, IndexError): notifier.tg_send("Commande de fermeture invalide.")
-    elif data == 'get_stats':
-        ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
-        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
-    elif data == 'manage_strategy':
-        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
-        notifier.send_strategy_menu(current_strategy)
-    elif data == 'switch_to_NORMAL':
-        database.set_setting('STRATEGY_MODE', 'NORMAL'); notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>."); notifier.send_strategy_menu('NORMAL')
-    elif data == 'switch_to_SPLIT':
-        database.set_setting('STRATEGY_MODE', 'SPLIT'); notifier.tg_send("✅ Stratégie changée en <b>SPLIT</b>."); notifier.send_strategy_menu('SPLIT')
-    elif data == 'switch_to_REAL':
-        database.set_setting('PAPER_TRADING_MODE', 'false'); notifier.tg_send("🚨 <b>ATTENTION:</b> Bot en mode <b>RÉEL</b>."); 
-        notifier.send_mode_message(BITGET_TESTNET, False)
-    elif data == 'switch_to_PAPER':
-        database.set_setting('PAPER_TRADING_MODE', 'true'); notifier.tg_send("✅ Bot en mode <b>PAPIER</b>."); 
-        notifier.send_mode_message(BITGET_TESTNET, True)
-    elif data == 'back_to_main': notifier.send_main_menu(_paused)
-
-def process_message(message: Dict):
-    """Gère les commandes textuelles de Telegram."""
-    global _paused
-    text = message.get("text", "").strip().lower(); parts = text.split(); command = parts[0]
-    if command == "/start":
-        help_message = (
-            "🤖 <b>PANNEAU DE CONTRÔLE - DARWIN BOT</b>\n\n"
-            "🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
-            "⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n"
-            "📈 <b>TRADING</b>\n/signals\n/recent\n/stats\n/pos"
-        )
-        notifier.tg_send(help_message); notifier.send_main_menu(_paused)
-    elif command == "/pause": _paused = True; notifier.tg_send("⏸️ Scan mis en pause.")
-    elif command == "/resume": _paused = False; notifier.tg_send("▶️ Reprise du scan.")
-    elif command == "/ping": notifier.tg_send("🛰️ Pong ! Le bot est en ligne.")
-    elif command == "/config":
-        current_max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS))
-        notifier.send_config_message(min_rr=MIN_RR, risk=trader.RISK_PER_TRADE_PERCENT, max_pos=current_max_pos, leverage=trader.LEVERAGE)
-    elif command == "/mode":
-        current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
-        notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
-    elif command == "/strategy":
-        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
-        notifier.send_strategy_menu(current_strategy)
-    elif command == "/signals": notifier.tg_send(get_recent_signals_message(1))
-    elif command == "/recent": notifier.tg_send(get_recent_signals_message(6))
-    elif command == "/stats":
-        ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
-        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
-    elif command == "/pos": notifier.format_open_positions(database.get_open_positions())
-    elif command == "/setuniverse":
-        if len(parts) < 2: notifier.tg_send("Usage: <code>/setuniverse &lt;nombre&gt;</code>"); return
-        try:
-            new_size = int(parts[1])
-            if new_size > 0: database.set_setting('UNIVERSE_SIZE', new_size); notifier.tg_send(f"✅ Taille du scan mise à jour à <b>{new_size}</b> paires.\n<i>(Sera appliqué au prochain redémarrage)</i>")
-            else: notifier.tg_send("❌ Le nombre doit être > 0.")
-        except ValueError: notifier.tg_send("❌ Valeur invalide.")
-    elif command == "/setmaxpos":
-        if len(parts) < 2: notifier.tg_send("Usage: <code>/setmaxpos &lt;nombre&gt;</code>"); return
-        try:
-            new_max = int(parts[1])
-            if new_max >= 0: database.set_setting('MAX_OPEN_POSITIONS', new_max); notifier.tg_send(f"✅ Nombre max de positions mis à jour à <b>{new_max}</b>.")
-            else: notifier.tg_send("❌ Le nombre doit être >= 0.")
-        except ValueError: notifier.tg_send("❌ Valeur invalide.")
-
-def poll_telegram_updates():
-    """Récupère et distribue les mises à jour de Telegram."""
-    global _last_update_id
-    updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
-    for upd in updates:
-        _last_update_id = upd.get("update_id", _last_update_id)
-        if 'callback_query' in upd:
-            process_callback_query(upd['callback_query'])
-        elif 'message' in upd:
-            process_message(upd['message'])
-            
-def check_scheduled_reports():
-    """Vérifie s'il est temps d'envoyer les rapports planifiés."""
-    global _last_daily_report_day, _last_weekly_report_day
-    try: tz = pytz.timezone(TIMEZONE)
-    except pytz.UnknownTimeZoneError: tz = pytz.timezone("UTC")
-    now = datetime.now(tz)
-    
-    if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
-        _last_daily_report_day = now.day
-        ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 24 * 60 * 60)
-        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
-    
-    if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
-        _last_weekly_report_day = now.day
-        ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
-        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
-
 def main():
     """Boucle principale du bot."""
     ex = create_exchange()
@@ -298,6 +192,146 @@ def main():
             notifier.tg_send_error("Erreur critique (boucle)", error_details)
             print("--------------------------------------------------")
             time.sleep(15)
+
+# --- GESTION TELEGRAM (COMPLET ET PROPRE) ---
+def cleanup_recent_signals(hours: int = 6):
+    global _recent_signals
+    seconds_ago = time.time() - (hours * 60 * 60)
+    _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+
+def get_recent_signals_message(hours: int) -> str:
+    cleanup_recent_signals(hours)
+    seconds_ago = time.time() - (hours * 60 * 60)
+    signals_in_period = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+    if not signals_in_period:
+        return f"⏱️ Aucun signal valide détecté dans les {hours} dernières heures."
+    lines = [f"<b>⏱️ {len(signals_in_period)} Signaux ({'dernière heure' if hours == 1 else f'{hours}h'})</b>\n"]
+    for s in signals_in_period:
+        ts = datetime.fromtimestamp(s['timestamp'], tz=timezone.utc).astimezone(pytz.timezone(TIMEZONE)).strftime('%H:%M')
+        side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
+        lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | {s['signal']['regime']} | RR: {s['signal']['rr']:.2f}")
+    return "\n".join(lines)
+
+def process_callback_query(callback_query: Dict):
+    global _paused
+    data = callback_query.get('data', '')
+    if data == 'pause': _paused = True; notifier.tg_send("⏸️ Scan mis en pause.")
+    elif data == 'resume': _paused = False; notifier.tg_send("▶️ Reprise du scan.")
+    elif data == 'list_positions': notifier.format_open_positions(database.get_open_positions())
+    elif data == 'get_recent_signals': notifier.tg_send(get_recent_signals_message(6))
+    elif data.startswith('close_trade_'):
+        try:
+            trade_id = int(data.split('_')[-1])
+            trader.close_position_manually(create_exchange(), trade_id)
+        except (ValueError, IndexError): notifier.tg_send("Commande de fermeture invalide.")
+    elif data == 'get_stats':
+        ex = create_exchange()
+        balance = trader.get_usdt_balance(ex)
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
+        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
+    elif data == 'manage_strategy':
+        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+        notifier.send_strategy_menu(current_strategy)
+    elif data == 'switch_to_NORMAL':
+        database.set_setting('STRATEGY_MODE', 'NORMAL')
+        notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>.")
+        notifier.send_strategy_menu('NORMAL')
+    elif data == 'switch_to_SPLIT':
+        database.set_setting('STRATEGY_MODE', 'SPLIT')
+        notifier.tg_send("✅ Stratégie changée en <b>SPLIT</b>.")
+        notifier.send_strategy_menu('SPLIT')
+    elif data == 'switch_to_REAL':
+        database.set_setting('PAPER_TRADING_MODE', 'false')
+        notifier.tg_send("🚨 <b>ATTENTION:</b> Bot en mode <b>RÉEL</b>.")
+        notifier.send_mode_message(BITGET_TESTNET, False)
+    elif data == 'switch_to_PAPER':
+        database.set_setting('PAPER_TRADING_MODE', 'true')
+        notifier.tg_send("✅ Bot en mode <b>PAPIER</b>.")
+        notifier.send_mode_message(BITGET_TESTNET, True)
+    elif data == 'back_to_main':
+        notifier.send_main_menu(_paused)
+
+def process_message(message: Dict):
+    global _paused
+    text = message.get("text", "").strip().lower()
+    parts = text.split()
+    command = parts[0]
+    
+    if command == "/start":
+        help_message = (
+            "🤖 <b>PANNEAU DE CONTRÔLE - DARWIN BOT</b>\n\n"
+            "🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
+            "⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n"
+            "📈 <b>TRADING</b>\n/signals\n/recent\n/stats\n/pos"
+        )
+        notifier.tg_send(help_message)
+        notifier.send_main_menu(_paused)
+    elif command == "/pause": _paused = True; notifier.tg_send("⏸️ Scan mis en pause.")
+    elif command == "/resume": _paused = False; notifier.tg_send("▶️ Reprise du scan.")
+    elif command == "/ping": notifier.tg_send("🛰️ Pong ! Le bot est en ligne.")
+    elif command == "/config":
+        current_max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS))
+        notifier.send_config_message(min_rr=MIN_RR, risk=trader.RISK_PER_TRADE_PERCENT, max_pos=current_max_pos, leverage=trader.LEVERAGE)
+    elif command == "/mode":
+        current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+        notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
+    elif command == "/strategy":
+        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+        notifier.send_strategy_menu(current_strategy)
+    elif command == "/signals": notifier.tg_send(get_recent_signals_message(1))
+    elif command == "/recent": notifier.tg_send(get_recent_signals_message(6))
+    elif command == "/stats":
+        ex = create_exchange()
+        balance = trader.get_usdt_balance(ex)
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+    elif command == "/pos": notifier.format_open_positions(database.get_open_positions())
+    elif command == "/setuniverse":
+        if len(parts) < 2: notifier.tg_send("Usage: <code>/setuniverse &lt;nombre&gt;</code>"); return
+        try:
+            new_size = int(parts[1])
+            if new_size > 0:
+                database.set_setting('UNIVERSE_SIZE', new_size)
+                notifier.tg_send(f"✅ Taille du scan mise à jour à <b>{new_size}</b> paires.\n<i>(Sera appliqué au prochain redémarrage)</i>")
+            else: notifier.tg_send("❌ Le nombre doit être > 0.")
+        except ValueError: notifier.tg_send("❌ Valeur invalide.")
+    elif command == "/setmaxpos":
+        if len(parts) < 2: notifier.tg_send("Usage: <code>/setmaxpos &lt;nombre&gt;</code>"); return
+        try:
+            new_max = int(parts[1])
+            if new_max >= 0:
+                database.set_setting('MAX_OPEN_POSITIONS', new_max)
+                notifier.tg_send(f"✅ Nombre max de positions mis à jour à <b>{new_max}</b>.")
+            else: notifier.tg_send("❌ Le nombre doit être >= 0.")
+        except ValueError: notifier.tg_send("❌ Valeur invalide.")
+
+def poll_telegram_updates():
+    global _last_update_id
+    updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
+    for upd in updates:
+        _last_update_id = upd.get("update_id", _last_update_id)
+        if 'callback_query' in upd:
+            process_callback_query(upd['callback_query'])
+        elif 'message' in upd:
+            process_message(upd['message'])
+
+def check_scheduled_reports():
+    global _last_daily_report_day, _last_weekly_report_day
+    try: tz = pytz.timezone(TIMEZONE)
+    except pytz.UnknownTimeZoneError: tz = pytz.timezone("UTC")
+    now = datetime.now(tz)
+    if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
+        _last_daily_report_day = now.day
+        ex = create_exchange()
+        balance = trader.get_usdt_balance(ex)
+        trades = database.get_closed_trades_since(int(time.time()) - 24 * 60 * 60)
+        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
+    if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
+        _last_weekly_report_day = now.day
+        ex = create_exchange()
+        balance = trader.get_usdt_balance(ex)
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
+        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
 
 if __name__ == "__main__":
     main()
