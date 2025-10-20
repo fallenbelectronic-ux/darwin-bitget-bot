@@ -19,12 +19,15 @@ import state
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
 API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
-# Accepte les deux noms de variables pour la passphrase pour une robustesse maximale
-PASSPHRASSE      = os.getenv("BITGET_PASSPHRASSE", "") or os.getenv("BITGET_PASSWORD", "")
-
-TIMEFRAME, UNIVERSE_SIZE, MIN_RR = os.getenv("TIMEFRAME", "1h"), int(os.getenv("UNIVERSE_SIZE", "30")), float(os.getenv("MIN_RR", "3.0"))
+PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
+TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
+UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
+MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
-LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
+LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
+TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
+REPORT_HOUR      = int(os.getenv("REPORT_HOUR", "21"))
+REPORT_WEEKDAY   = int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT ---
 _last_update_id: Optional[int] = None
@@ -34,11 +37,12 @@ _last_weekly_report_day = -1
 _recent_signals: List[Dict] = []
 
 # ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES AVANT LA BOUCLE `main`
+# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
 # ==============================================================================
 
 def cleanup_recent_signals(hours: int = 6):
     """Supprime les signaux de l'historique qui sont plus vieux que `hours`."""
+    # CORRECTION : Le mot-clé 'global' est essentiel pour modifier la variable
     global _recent_signals
     seconds_ago = time.time() - (hours * 60 * 60)
     _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
