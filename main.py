@@ -17,37 +17,31 @@ import state
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
-API_KEY, API_SECRET, PASSPHRASSE = os.getenv("BITGET_API_KEY", ""), os.getenv("BITGET_API_SECRET", ""), os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
+API_KEY          = os.getenv("BITGET_API_KEY", "")
+API_SECRET       = os.getenv("BITGET_API_SECRET", "")
+# MODIFICATION : On ne cherche plus qu'un seul nom, le plus standard.
+PASSPHRASSE      = os.getenv("BITGET_PASSWORD", "")
+
 TIMEFRAME, UNIVERSE_SIZE, MIN_RR = os.getenv("TIMEFRAME", "1h"), int(os.getenv("UNIVERSE_SIZE", "30")), float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT ---
-_last_update_id: Optional[int] = None
-_paused = False
-_last_daily_report_day = -1
-_last_weekly_report_day = -1
-_recent_signals: List[Dict] = []
 
-# ==============================================================================
-# MODIFICATION POUR FORCER L'API v2
-# ==============================================================================
+# --- FONCTIONS ---
 def create_exchange():
-    """Initialise et retourne l'objet d'échange CCXT en forçant l'API v2."""
+    """Initialise et retourne l'objet d'échange CCXT."""
+    # On revient à la version simple, l'API v2 n'était pas la solution.
     ex = ccxt.bitget({
         "apiKey": API_KEY,
         "secret": API_SECRET,
-        "password": PASSPHRASSE,
+        "password": PASSPHRASSE, # CCXT utilise le terme 'password' pour la passphrase
         "enableRateLimit": True,
         "options": {
             "defaultType": "swap",
-            "testnet": BITGET_TESTNET,
-            "broker": "YOUR_BROKER_ID"  # Remplacez par votre ID de Broker si vous en avez un
+            "testnet": BITGET_TESTNET
         }
     })
-    # Forcer l'utilisation de l'API v2 pour toutes les requêtes
-    ex.set_api_version('v2')
-    
     if BITGET_TESTNET:
         ex.set_sandbox_mode(True)
     return ex
