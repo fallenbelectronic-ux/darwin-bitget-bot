@@ -14,7 +14,7 @@ import trader
 import notifier
 import utils
 
-# --- PARAMÈTRES ---
+# --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
 API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
@@ -30,21 +30,26 @@ TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
 REPORT_HOUR      = int(os.getenv("REPORT_HOUR", "21"))
 REPORT_WEEKDAY   = int(os.getenv("REPORT_WEEKDAY", "6"))
 
+# --- VARIABLES D'ÉTAT ---
 _last_update_id: Optional[int] = None
 _paused = False
 _last_daily_report_day = -1
 _last_weekly_report_day = -1
 
+# --- FONCTIONS PRINCIPALES ---
+
 def create_exchange():
-    ex = ccxt.bitget({"apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASSE, "enableRateLimit": True, "options": {"defaultType": "swap", "testnet": BITGET_TESTNET}})
-    if BITGET_TESTNET: ex.set_sandbox_mode(True)
+    """Initialise et retourne l'objet d'échange CCXT."""
+    ex = ccxt.bitget({
+        "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASSE,
+        "enableRateLimit": True, "options": {"defaultType": "swap", "testnet": BITGET_TESTNET}
+    })
+    if BITGET_TESTNET:
+        ex.set_sandbox_mode(True)
     return ex
 
-# ==============================================================================
-# CORRECTION DE LA SYNTAXERROR
-# ==============================================================================
 def build_universe(ex: ccxt.Exchange) -> List[str]:
-    """Construit la liste des paires à trader, version claire et corrigée."""
+    """Construit la liste des paires à trader."""
     print("Construction de l'univers de trading...")
     try:
         markets = ex.load_markets()
@@ -61,103 +66,235 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
         print(f"Impossible de construire l'univers via l'API. Erreur: {e}. Utilisation de la liste de secours.")
         return FALLBACK_TESTNET
 
-# --- Le reste du fichier est identique à la version stable précédente ---
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    if df is None or len(df) < 81: return None
+    """Logique de détection de signal de la stratégie Darwin."""
+    if df is None or len(df) < 81:
+        return None
+
     df = trader._get_indicators(df.copy())
-    if df is None: return None
+    if df is None:
+        return None
+
     last = df.iloc[-1]
-    is_uptrend = last['close'] > last['bb80_mid']; is_downtrend = last['close'] < last['bb80_mid']
-    is_in_dead_zone = abs(last['close'] - last['bb80_mid']) < (last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100))
-    signal, tick_size = None, last['close'] * TICK_RATIO
+
+    # Définition de la tendance via la MM80
+    is_uptrend = last['close'] > last['bb80_mid']
+    is_downtrend = last['close'] < last['bb80_mid']
+    dead_zone = last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100)
+    is_in_dead_zone = abs(last['close'] - last['bb80_mid']) < dead_zone
+    
+    signal = None
+    tick_size = last['close'] * TICK_RATIO
+
+    # Stratégie 1: Tendance
     if not is_in_dead_zone:
+        # Achat en tendance (Tendance de fond haussière, contact BB20 basse)
         if is_uptrend and last['low'] <= last['bb20_lo'] and last['close'] > last['bb20_lo']:
-            entry = (last['open'] + last['close']) / 2; sl, tp = last['low'] - (2 * tick_size), last['bb20_up']
+            entry = (last['open'] + last['close']) / 2
+            sl = last['low'] - (2 * tick_size)
+            tp = last['bb20_up']  # Objectif: Borne BB20 opposée
             rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
-            if rr >= MIN_RR: signal = {"side": "buy", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-            else: print(f"  -> INFO: Setup d'ACHAT (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+            if rr >= MIN_RR:
+                signal = {"side": "buy", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+            else:
+                print(f"  -> INFO: Setup d'ACHAT (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+        # Vente en tendance (Tendance de fond baissière, contact BB20 haute)
         elif is_downtrend and last['high'] >= last['bb20_up'] and last['close'] < last['bb20_up']:
-            entry = (last['open'] + last['close']) / 2; sl, tp = last['high'] + (2 * tick_size), last['bb20_lo']
+            entry = (last['open'] + last['close']) / 2
+            sl = last['high'] + (2 * tick_size)
+            tp = last['bb20_lo']  # Objectif: Borne BB20 opposée
             rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
-            if rr >= MIN_RR: signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-            else: print(f"  -> INFO: Setup de VENTE (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+            if rr >= MIN_RR:
+                signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+            else:
+                print(f"  -> INFO: Setup de VENTE (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+
+    # Stratégie 2: Contre-tendance
     if not signal:
+        # Achat en contre-tendance (Double extrême bas)
         if last['low'] <= last['bb20_lo'] and last['low'] <= last['bb80_lo'] and last['close'] > last['bb20_lo']:
-            entry = (last['open'] + last['close']) / 2; sl, tp = last['low'] - (2 * tick_size), last['bb20_up']
+            entry = (last['open'] + last['close']) / 2
+            sl = last['low'] - (2 * tick_size)
+            tp = last['bb20_up']  # Objectif: Borne BB20 opposée
             rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
-            if rr >= MIN_RR: signal = {"side": "buy", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-            else: print(f"  -> INFO: Setup d'ACHAT (Contre-tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+            if rr >= MIN_RR:
+                signal = {"side": "buy", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+            else:
+                print(f"  -> INFO: Setup d'ACHAT (Contre-tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+        # Vente en contre-tendance (Double extrême haut)
         elif last['high'] >= last['bb20_up'] and last['high'] >= last['bb80_up'] and last['close'] < last['bb20_up']:
-            entry = (last['open'] + last['close']) / 2; sl, tp = last['high'] + (2 * tick_size), last['bb20_lo']
+            entry = (last['open'] + last['close']) / 2
+            sl = last['high'] + (2 * tick_size)
+            tp = last['bb20_lo']  # Objectif: Borne BB20 opposée
             rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
-            if rr >= MIN_RR: signal = {"side": "sell", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-            else: print(f"  -> INFO: Setup de VENTE (Contre-tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
-    if signal: signal['bb20_mid'] = last['bb20_mid']; return signal
+            if rr >= MIN_RR:
+                signal = {"side": "sell", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+            else:
+                print(f"  -> INFO: Setup de VENTE (Contre-tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+
+    if signal:
+        signal['bb20_mid'] = last['bb20_mid']
+        return signal
     return None
+
 def process_callback_query(callback_query: Dict):
-    global _paused; data = callback_query.get('data', '')
-    if data == 'pause': _paused = True; notifier.tg_send("⏸️ Bot mis en pause.")
-    elif data == 'resume': _paused = False; notifier.tg_send("▶️ Bot relancé.")
-    elif data == 'list_positions': notifier.format_open_positions(database.get_open_positions())
+    """Gère les clics sur les boutons interactifs de Telegram."""
+    global _paused
+    data = callback_query.get('data', '')
+
+    if data == 'pause':
+        _paused = True
+        notifier.tg_send("⏸️ Bot mis en pause.")
+    elif data == 'resume':
+        _paused = False
+        notifier.tg_send("▶️ Bot relancé.")
+    elif data == 'list_positions':
+        notifier.format_open_positions(database.get_open_positions())
     elif data.startswith('close_trade_'):
-        try: trade_id = int(data.split('_')[-1]); trader.close_position_manually(create_exchange(), trade_id)
-        except (ValueError, IndexError): notifier.tg_send("Commande de fermeture invalide.")
+        try:
+            trade_id = int(data.split('_')[-1])
+            trader.close_position_manually(create_exchange(), trade_id)
+        except (ValueError, IndexError):
+            notifier.tg_send("Commande de fermeture invalide.")
     elif data == 'get_stats':
-        notifier.tg_send("📊 Calcul du bilan hebdomadaire..."); seven_days_ago = int(time.time()) - 7*24*60*60; trades = database.get_closed_trades_since(seven_days_ago); notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades)
+        notifier.tg_send("📊 Calcul du bilan hebdomadaire...")
+        seven_days_ago = int(time.time()) - 7 * 24 * 60 * 60
+        trades = database.get_closed_trades_since(seven_days_ago)
+        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades)
     elif data == 'manage_strategy':
-        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper()); notifier.send_strategy_menu(current_strategy)
+        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+        notifier.send_strategy_menu(current_strategy)
     elif data == 'switch_to_NORMAL':
-        database.set_setting('STRATEGY_MODE', 'NORMAL'); notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>."); notifier.send_strategy_menu('NORMAL')
+        database.set_setting('STRATEGY_MODE', 'NORMAL')
+        notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>.")
+        notifier.send_strategy_menu('NORMAL')
     elif data == 'switch_to_SPLIT':
-        database.set_setting('STRATEGY_MODE', 'SPLIT'); notifier.tg_send("✅ Stratégie changée en <b>SPLIT</b>."); notifier.send_strategy_menu('SPLIT')
-    elif data == 'back_to_main': notifier.send_main_menu(_paused)
+        database.set_setting('STRATEGY_MODE', 'SPLIT')
+        notifier.tg_send("✅ Stratégie changée en <b>SPLIT</b>.")
+        notifier.send_strategy_menu('SPLIT')
+    elif data == 'back_to_main':
+        notifier.send_main_menu(_paused)
+
 def process_message(message: Dict):
+    """Gère les commandes textuelles de Telegram."""
     text = message.get("text", "").strip().lower()
-    if text.startswith(("/start", "/menu")): notifier.send_main_menu(_paused)
-    elif text.startswith("/pos"): notifier.format_open_positions(database.get_open_positions())
-    elif text.startswith("/stats"): notifier.tg_send("📊 Calcul du bilan hebdomadaire..."); seven_days_ago = int(time.time()) - 7*24*60*60; trades = database.get_closed_trades_since(seven_days_ago); notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades)
+    if text.startswith(("/start", "/menu")):
+        notifier.send_main_menu(_paused)
+    elif text.startswith("/pos"):
+        notifier.format_open_positions(database.get_open_positions())
+    elif text.startswith("/stats"):
+        notifier.tg_send("📊 Calcul du bilan hebdomadaire...")
+        seven_days_ago = int(time.time()) - 7 * 24 * 60 * 60
+        trades = database.get_closed_trades_since(seven_days_ago)
+        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades)
+
 def poll_telegram_updates():
-    global _last_update_id; updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
-    for upd in updates: _last_update_id = upd.get("update_id", _last_update_id)
-    if 'callback_query' in upd: process_callback_query(upd['callback_query'])
-    elif 'message' in upd: process_message(upd['message'])
+    """Récupère et distribue les mises à jour de Telegram."""
+    global _last_update_id
+    updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
+    for upd in updates:
+        _last_update_id = upd.get("update_id", _last_update_id)
+        if 'callback_query' in upd:
+            process_callback_query(upd['callback_query'])
+        elif 'message' in upd:
+            process_message(upd['message'])
+
 def check_scheduled_reports():
-    global _last_daily_report_day, _last_weekly_report_day; try: tz = pytz.timezone(TIMEZONE)
-    except pytz.UnknownTimeZoneError: tz = pytz.timezone("UTC");
+    """Vérifie s'il est temps d'envoyer les rapports planifiés."""
+    global _last_daily_report_day, _last_weekly_report_day
+    
+    # Correction de la SyntaxError: le 'try' doit être sur une nouvelle ligne.
+    try:
+        tz = pytz.timezone(TIMEZONE)
+    except pytz.UnknownTimeZoneError:
+        tz = pytz.timezone("UTC")
+    
     now = datetime.now(tz)
-    if now.hour == REPORT_HOUR and now.day != _last_daily_report_day: _last_daily_report_day = now.day; one_day_ago = int(time.time()) - 24*60*60; trades = database.get_closed_trades_since(one_day_ago); notifier.send_report("📊 Bilan Quotidien (24h)", trades)
-    if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day: _last_weekly_report_day = now.day; seven_days_ago = int(time.time()) - 7*24*60*60; trades = database.get_closed_trades_since(seven_days_ago); notifier.send_report("🗓️ Bilan Hebdomadaire", trades)
+    
+    # Rapport Quotidien
+    if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
+        _last_daily_report_day = now.day
+        one_day_ago = int(time.time()) - 24 * 60 * 60
+        trades = database.get_closed_trades_since(one_day_ago)
+        notifier.send_report("📊 Bilan Quotidien (24h)", trades)
+    
+    # Rapport Hebdomadaire
+    if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
+        _last_weekly_report_day = now.day
+        seven_days_ago = int(time.time()) - 7 * 24 * 60 * 60
+        trades = database.get_closed_trades_since(seven_days_ago)
+        notifier.send_report("🗓️ Bilan Hebdomadaire", trades)
+
 def main():
-    ex = create_exchange(); database.setup_database()
-    if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
-    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if trader.PAPER_TRADING_MODE else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
+    """Boucle principale du bot."""
+    ex = create_exchange()
+    database.setup_database()
+
+    # Initialise la stratégie dans la DB au premier lancement
+    if not database.get_setting('STRATEGY_MODE'):
+        default_strategy = os.getenv('STRATEGY_MODE', 'NORMAL').upper()
+        database.set_setting('STRATEGY_MODE', default_strategy)
+
+    notifier.send_start_banner(
+        "TESTNET" if BITGET_TESTNET else "LIVE",
+        "PAPIER" if trader.PAPER_TRADING_MODE else "RÉEL",
+        trader.RISK_PER_TRADE_PERCENT
+    )
     universe = build_universe(ex)
-    if not universe: notifier.tg_send("❌ Impossible de construire l'univers de trading. Arrêt du bot."); return
+    if not universe:
+        notifier.tg_send("❌ Impossible de construire l'univers de trading. Arrêt du bot.")
+        return
+    
     print(f"Univers de trading chargé avec {len(universe)} paires.")
     last_ts_seen = {}
+
     while True:
         print(f"\n--- [{time.strftime('%Y-%m-%d %H:%M:%S')}] Nouveau cycle de la boucle ---")
         try:
-            print("1. Vérification des mises à jour Telegram..."); poll_telegram_updates()
-            print("2. Vérification des rapports planifiés..."); check_scheduled_reports()
-            if _paused: print("   -> Bot en pause, attente..."); time.sleep(LOOP_DELAY); continue
-            print("3. Gestion des positions ouvertes..."); trader.manage_open_positions(ex)
+            print("1. Vérification des mises à jour Telegram...")
+            poll_telegram_updates()
+            
+            print("2. Vérification des rapports planifiés...")
+            check_scheduled_reports()
+
+            if _paused:
+                print("   -> Bot en pause, attente...")
+                time.sleep(LOOP_DELAY)
+                continue
+            
+            print("3. Gestion des positions ouvertes...")
+            trader.manage_open_positions(ex)
+            
             print(f"4. Début du scan de l'univers ({len(universe)} paires)...")
             for symbol in universe:
                 df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
-                if df is None or df.empty: continue
+                if df is None or df.empty:
+                    continue
+                
                 last_candle_ts = df.index[-1]
-                if symbol in last_ts_seen and last_ts_seen[symbol] == last_candle_ts: continue 
+                if symbol in last_ts_seen and last_ts_seen[symbol] == last_candle_ts:
+                    continue
+                
                 last_ts_seen[symbol] = last_candle_ts
                 signal = detect_signal(symbol, df)
+                
                 if signal:
                     print(f"✅✅✅ Signal '{signal['regime']}' DÉTECTÉ ET VALIDÉ pour {symbol}!")
                     trader.execute_trade(ex, symbol, signal, df)
-            print(f"--- Fin du cycle. Attente de {LOOP_DELAY} secondes. ---"); time.sleep(LOOP_DELAY)
-        except KeyboardInterrupt: notifier.tg_send("⛔ Arrêt manuel."); break
+
+            print(f"--- Fin du cycle. Attente de {LOOP_DELAY} secondes. ---")
+            time.sleep(LOOP_DELAY)
+
+        except KeyboardInterrupt:
+            notifier.tg_send("⛔ Arrêt manuel.")
+            break
         except Exception:
-            print("\n--- ERREUR CRITIQUE DANS LA BOUCLE PRINCIPALE ---"); error_details = traceback.format_exc(); print(error_details); notifier.tg_send_error("Erreur critique (boucle)", error_details)
-            print("--------------------------------------------------"); time.sleep(15)
+            print("\n--- ERREUR CRITIQUE DANS LA BOUCLE PRINCIPALE ---")
+            error_details = traceback.format_exc()
+            print(error_details)
+            notifier.tg_send_error("Erreur critique (boucle)", error_details)
+            print("--------------------------------------------------")
+            time.sleep(15)
 
 if __name__ == "__main__":
     main()
