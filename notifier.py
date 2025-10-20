@@ -12,10 +12,6 @@ TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-def _escape(text: str) -> str:
-    """Échappe les caractères spéciaux HTML."""
-    return html.escape(str(text))
-
 def tg_send(text: str, reply_markup: Optional[Dict] = None):
     """Envoie un message texte simple sur Telegram."""
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -28,39 +24,23 @@ def tg_send(text: str, reply_markup: Optional[Dict] = None):
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
 
-def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
-    """Envoie une notification de mise à breakeven."""
+def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str):
+    """Envoie un rapport de signal validé, avec le statut d'exécution."""
+    side_icon = "📈" if signal['side'] == 'buy' else "📉"
+    status_icon = "✅" if is_taken else "❌"
+    status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
+    
     message = (
-        f"<b>⚙️ Gestion de Trade sur {_escape(symbol)}</b>\n\n"
-        f"✅ <b>MM20 atteinte !</b> Prise de profit partielle.\n"
-        f"   - Gain réalisé: <code>{pnl_realised:.2f} USDT</code>\n\n"
-        f"🛡️ <b>Trade sécurisé à Breakeven.</b>\n"
-        f"   - Quantité restante: <code>{remaining_qty:.4f}</code>"
+        f"<b>{status_icon} Signal Validé {side_icon}</b>\n\n"
+        f" paire: <code>{html.escape(symbol)}</code>\n"
+        f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
+        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
+        f" SL: <code>{signal['sl']:.5f}</code>\n"
+        f" TP: <code>{signal['tp']:.5f}</code>\n"
+        f" RR: <b>x{signal['rr']:.2f}</b>\n\n"
+        f"{status_text}"
     )
     tg_send(message)
-
-def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str):
-    """Envoie un message avec une image sur Telegram."""
-    if not photo_buffer:
-        return tg_send(caption)
-    try:
-        files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
-        payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-        requests.post(f"{TELEGRAM_API}/sendPhoto", data=payload, files=files, timeout=20)
-    except Exception:
-        tg_send(f"⚠️ Erreur de graphique\n{caption}")
-
-def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Récupère les mises à jour du bot Telegram."""
-    params = {"timeout": 1}
-    if offset:
-        params["offset"] = offset
-    try:
-        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
-        data = r.json()
-        return data.get("result", []) if data.get("ok") else []
-    except Exception:
-        return []
 
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
     """Retourne le clavier du menu principal."""
@@ -68,12 +48,39 @@ def get_main_menu_keyboard(is_paused: bool) -> Dict:
     return {
         "inline_keyboard": [
             [pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}],
-            [{"text": "⚙️ Stratégie", "callback_data": "manage_strategy"}, {"text": "📈 Stats", "callback_data": "get_stats"}]
+            [{"text": "⚙️ Stratégie", "callback_data": "manage_strategy"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
+            [{"text": "⏱️ Signaux Récents (6h)", "callback_data": "get_recent_signals"}]
         ]
     }
 
+def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
+    """Envoie une notification de mise à breakeven."""
+    message = (
+        f"<b>⚙️ Gestion de Trade sur {html.escape(symbol)}</b>\n\n"
+        f"✅ <b>MM20 atteinte !</b> Prise de profit partielle.\n"
+        f"   - Gain réalisé: <code>{pnl_realised:.2f} USDT</code>\n\n"
+        f"🛡️ <b>Trade sécurisé à Breakeven.</b>\n"
+        f"   - Quantité restante: <code>{remaining_qty:.4f}</code>"
+    )
+    tg_send(message)
+
+# --- Le reste du fichier est inchangé et nettoyé ---
+def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str):
+    if not photo_buffer: return tg_send(caption)
+    try:
+        files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
+        payload = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+        requests.post(f"{TELEGRAM_API}/sendPhoto", data=payload, files=files, timeout=20)
+    except Exception: tg_send(f"⚠️ Erreur de graphique\n{caption}")
+def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
+    params = {"timeout": 1};
+    if offset: params["offset"] = offset
+    try:
+        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
+        data = r.json()
+        return data.get("result", []) if data.get("ok") else []
+    except Exception: return []
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
-    """Retourne le clavier du menu de stratégie."""
     buttons = []
     if current_strategy == 'NORMAL':
         buttons.append([{"text": "✅ NORMAL", "callback_data": "no_change"}, {"text": "Activer: SPLIT", "callback_data": "switch_to_SPLIT"}])
@@ -81,77 +88,33 @@ def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
         buttons.append([{"text": "Activer: NORMAL", "callback_data": "switch_to_NORMAL"}, {"text": "✅ SPLIT", "callback_data": "no_change"}])
     buttons.append([{"text": "⬅️ Retour", "callback_data": "back_to_main"}])
     return {"inline_keyboard": buttons}
-
 def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
-    """Retourne le clavier pour la gestion des positions ouvertes."""
-    if not positions:
-        return None
+    if not positions: return None
     keyboard = []
     for pos in positions:
         keyboard.append([{"text": f"❌ Clôturer Trade #{pos.get('id', 0)}", "callback_data": f"close_trade_{pos.get('id', 0)}"}])
     return {"inline_keyboard": keyboard}
-
 def send_start_banner(platform: str, trading: str, risk: float):
-    """Envoie la bannière de démarrage."""
-    tg_send(
-        f"<b>🔔 Darwin Bot Démarré</b>\n\n"
-        f" plateforme: <code>{_escape(platform)}</code>\n"
-        f" Mode: <b>{_escape(trading)}</b>\n"
-        f" Risque: <code>{risk}%</code>"
-    )
-
-def send_main_menu(is_paused: bool):
-    """Envoie le menu principal."""
-    tg_send("🤖 <b>Panneau de Contrôle</b>", reply_markup=get_main_menu_keyboard(is_paused))
-
+    tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n plateforme: <code>{html.escape(platform)}</code>\n Mode: <b>{html.escape(trading)}</b>\n Risque: <code>{risk}%</code>")
+def send_main_menu(is_paused: bool): tg_send("🤖 <b>Panneau de Contrôle</b>", reply_markup=get_main_menu_keyboard(is_paused))
 def send_strategy_menu(current_strategy: str):
-    """Envoie le menu de sélection de stratégie."""
-    message = (
-        f"<b>⚙️ Gestion de la Stratégie</b>\n\n"
-        f"Définit comment les trades de <b>contre-tendance</b> sont gérés.\n\n"
-        f"Stratégie Actuelle: <b><code>{current_strategy}</code></b>"
-    )
+    message = (f"<b>⚙️ Gestion de la Stratégie</b>\n\nDéfinit comment les trades de <b>contre-tendance</b> sont gérés.\n\nStratégie Actuelle: <b><code>{current_strategy}</code></b>")
     tg_send(message, reply_markup=get_strategy_menu_keyboard(current_strategy))
-
 def format_open_positions(positions: List[Dict[str, Any]]):
-    """Formate et envoie la liste des positions ouvertes."""
-    if not positions:
-        return tg_send("📊 Aucune position n'est actuellement ouverte.")
-    
+    if not positions: return tg_send("📊 Aucune position n'est actuellement ouverte.")
     lines = ["<b>📊 Positions Ouvertes</b>\n"]
     for pos in positions:
         side_icon = "📈" if pos.get('side') == 'buy' else "📉"
-        lines.append(
-            f"<b>{pos.get('id')}. {side_icon} {_escape(pos.get('symbol', 'N/A'))}</b>\n"
-            f"   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n"
-            f"   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>\n"
-        )
-    
-    message = "\n".join(lines)
-    keyboard = get_positions_keyboard(positions)
-    tg_send(message, reply_markup=keyboard)
-
-def tg_send_error(title: str, error: Any):
-    """Envoie un message d'erreur formaté."""
-    tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(error)}</code>")
-
+        lines.append(f"<b>{pos.get('id')}. {side_icon} {html.escape(pos.get('symbol', 'N/A'))}</b>\n   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>\n")
+    tg_send("\n".join(lines), reply_markup=get_positions_keyboard(positions))
+def tg_send_error(title: str, error: Any): tg_send(f"❌ <b>Erreur: {html.escape(title)}</b>\n<code>{html.escape(error)}</code>")
 def send_report(title: str, trades: List[Dict[str, Any]]):
-    """Calcule les stats et envoie un rapport."""
     stats = reporting.get_report_stats(trades)
     message = reporting.format_report_message(title, stats)
     tg_send(message)
-
 def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
-    """Formate le message d'un nouveau trade."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    mode_icon = "📝" if mode == 'PAPIER' else "✅"
-    return (
-        f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
-        f" paire: <code>{_escape(symbol)}</code>\n"
-        f" Type: <b>{_escape(signal['regime'].capitalize())}</b>\n\n"
-        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
-        f" SL: <code>{signal['sl']:.5f}</code>\n"
-        f" TP: <code>{signal['tp']:.5f}</code>\n\n"
-        f" Quantité: <code>{quantity:.4f}</code>\n"
-        f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
-    )
+    side_icon = "📈" if signal['side'] == 'buy' else "📉"; mode_icon = "📝" if mode == 'PAPIER' else "✅"
+    return (f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
+            f" paire: <code>{html.escape(symbol)}</code>\n Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
+            f" Entrée: <code>{signal['entry']:.5f}</code>\n SL: <code>{signal['sl']:.5f}</code>\n TP: <code>{signal['tp']:.5f}</code>\n\n"
+            f" Quantité: <code>{quantity:.4f}</code>\n Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>")
