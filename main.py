@@ -15,18 +15,20 @@ import notifier
 import utils
 
 # --- PARAMÈTRES GLOBAUX ---
-BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
-API_KEY          = os.getenv("BITGET_API_KEY", "")
-API_SECRET       = os.getenv("BITGET_API_SECRET", "")
-PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
-TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
-UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
-MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
+BITGET_TESTNET = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
+API_KEY        = os.getenv("BITGET_API_KEY", "")
+API_SECRET     = os.getenv("BITGET_API_SECRET", "")
+# CORRECTION : Le code cherche maintenant les deux orthographes possibles pour la passphrase
+PASSPHRASSE    = os.getenv("BITGET_PASSPHRASSE", "") or os.getenv("BITGET_PASSPHRASE", "")
+
+TIMEFRAME      = os.getenv("TIMEFRAME", "1h")
+UNIVERSE_SIZE  = int(os.getenv("UNIVERSE_SIZE", "30"))
+MIN_RR         = float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
-LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
-TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
-REPORT_HOUR      = int(os.getenv("REPORT_HOUR", "21"))
-REPORT_WEEKDAY   = int(os.getenv("REPORT_WEEKDAY", "6"))
+LOOP_DELAY     = int(os.getenv("LOOP_DELAY", "5"))
+TIMEZONE       = os.getenv("TIMEZONE", "Europe/Lisbon")
+REPORT_HOUR    = int(os.getenv("REPORT_HOUR", "21"))
+REPORT_WEEKDAY = int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT ---
 _last_update_id: Optional[int] = None
@@ -269,7 +271,6 @@ def main():
     ex = create_exchange()
     database.setup_database()
 
-    # Initialiser les paramètres dans la DB s'ils n'existent pas
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
     if not database.get_setting('UNIVERSE_SIZE'):
