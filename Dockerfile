@@ -7,8 +7,8 @@ ENV PYTHONUNBUFFERED=1
 
 # --- Installation des dépendances en tant que ROOT ---
 COPY requirements.txt .
-# On ignore l'avertissement car l'installation par root est intentionnelle ici
-RUN pip install --no-cache-dir --upgrade pip && \
+# On ajoute le drapeau "ignore" aux DEUX commandes pip pour un log propre
+RUN pip install --no-cache-dir --root-user-action ignore --upgrade pip && \
     pip install --no-cache-dir --root-user-action ignore -r requirements.txt
 
 # --- Création de l'utilisateur et copie du code ---
