@@ -75,6 +75,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     
                     database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
                     notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
+            
             except Exception as e:
                 print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
                 notifier.tg_send_error(f"Gestion SPLIT {pos['symbol']}", e)
@@ -90,7 +91,11 @@ def manage_open_positions(ex: ccxt.Exchange):
             if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
                 try:
                     print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
-                    params = {'symbol': pos['symbol'], 'takeProfitPrice': f"{new_dynamic_tp:.5f}", 'stopLossPrice': f"{pos['sl_price']:.5f}"}
+                    params = {
+                        'symbol': pos['symbol'],
+                        'takeProfitPrice': f"{new_dynamic_tp:.5f}",
+                        'stopLossPrice': f"{pos['sl_price']:.5f}"
+                    }
                     ex.private_post_mix_position_modify_position(params)
                     database.update_trade_tp(pos['id'], new_dynamic_tp)
                 except Exception as e:
@@ -98,7 +103,8 @@ def manage_open_positions(ex: ccxt.Exchange):
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame) -> Tuple[bool, str]:
     """Tente d'exécuter un trade et retourne un statut (succès/échec) et un message."""
-    max_pos = int(os.getenv('MAX_OPEN_POSITIONS', 3))
+    max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
+    
     if len(database.get_open_positions()) >= max_pos:
         return False, f"Rejeté: Nombre maximum de positions ({max_pos}) atteint."
     if database.is_position_open(symbol):
@@ -130,7 +136,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
     database.create_trade(symbol, signal['side'], signal['regime'], signal['entry'], signal['sl'], signal['tp'], quantity, RISK_PER_TRADE_PERCENT, int(time.time()), signal.get('bb20_mid'), management_strategy)
     
-    # On génère le graphique seulement si le trade est pris
     chart_image = charting.generate_trade_chart(symbol, df, signal)
     mode_text = "PAPIER" if PAPER_TRADING_MODE else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
