@@ -1,5 +1,6 @@
 # Fichier: main.py
 import os
+import sys
 import time
 import ccxt
 import pandas as pd
@@ -20,9 +21,7 @@ BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", 
 API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
 PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
-TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
-UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
-MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
+TIMEFRAME, UNIVERSE_SIZE, MIN_RR = os.getenv("TIMEFRAME", "1h"), int(os.getenv("UNIVERSE_SIZE", "30")), float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
 TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
@@ -40,9 +39,29 @@ _recent_signals: List[Dict] = []
 # DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
 # ==============================================================================
 
+def startup_checks():
+    """Vérifie que toutes les variables d'environnement critiques sont présentes."""
+    print("Vérification des configurations au démarrage...")
+    required_keys = ['BITGET_API_KEY', 'BITGET_API_SECRET']
+    
+    # La passphrase est requise pour les opérations privées
+    if not os.getenv('BITGET_PASSPHRASSE') and not os.getenv('BITGET_API_PASSWORD'):
+        error_msg = "❌ ERREUR DE DÉMARRAGE : La variable d'environnement 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
+        print(error_msg)
+        notifier.tg_send(error_msg)
+        sys.exit(1) # Arrête le script proprement
+
+    for key in required_keys:
+        if not os.getenv(key):
+            error_msg = f"❌ ERREUR DE DÉMARRAGE : La variable d'environnement '{key}' est manquante."
+            print(error_msg)
+            notifier.tg_send(error_msg)
+            sys.exit(1)
+    
+    print("✅ Toutes les configurations nécessaires sont présentes.")
+
 def cleanup_recent_signals(hours: int = 6):
     """Supprime les signaux de l'historique qui sont plus vieux que `hours`."""
-    # CORRECTION : Le mot-clé 'global' est essentiel pour modifier la variable
     global _recent_signals
     seconds_ago = time.time() - (hours * 60 * 60)
     _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
@@ -284,6 +303,9 @@ def check_scheduled_reports():
 
 def main():
     """Boucle principale du bot."""
+    # La vérification est la TOUTE première chose que l'on fait
+    startup_checks()
+
     ex = create_exchange()
     database.setup_database()
     if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
