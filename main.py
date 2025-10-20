@@ -6,7 +6,7 @@ import pandas as pd
 import traceback
 from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 
 import database
@@ -22,10 +22,7 @@ PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PAS
 TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
 UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
 MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
-MM_DEAD_ZONE_PERCENT = float(os.getenv("MM_DEAD_ZONE_PERCENT", "0.1"))
-TICK_RATIO       = 0.0005
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
-FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
 REPORT_HOUR      = int(os.getenv("REPORT_HOUR", "21"))
 REPORT_WEEKDAY   = int(os.getenv("REPORT_WEEKDAY", "6"))
@@ -35,8 +32,15 @@ _last_update_id: Optional[int] = None
 _paused = False
 _last_daily_report_day = -1
 _last_weekly_report_day = -1
+_recent_signals: List[Dict] = []
 
 # --- FONCTIONS PRINCIPALES ---
+
+def cleanup_recent_signals():
+    """Supprime les signaux de l'historique qui ont plus de 6 heures."""
+    global _recent_signals
+    six_hours_ago = time.time() - (6 * 60 * 60)
+    _recent_signals = [s for s in _recent_signals if s['timestamp'] >= six_hours_ago]
 
 def create_exchange():
     """Initialise et retourne l'objet d'échange CCXT."""
@@ -53,69 +57,58 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
     print("Construction de l'univers de trading...")
     try:
         markets = ex.load_markets()
-        symbols = [
-            m['symbol'] for m in markets.values()
-            if m.get('swap') and m.get('quote') == 'USDT' and m.get('linear')
-        ]
-        if symbols:
-            return symbols[:UNIVERSE_SIZE]
-        else:
-            print("Aucun symbole trouvé via l'API, utilisation de la liste de secours.")
-            return FALLBACK_TESTNET
+        symbols = [m['symbol'] for m in markets.values() if m.get('swap') and m.get('quote') == 'USDT' and m.get('linear')]
+        return symbols[:UNIVERSE_SIZE] if symbols else []
     except Exception as e:
-        print(f"Impossible de construire l'univers via l'API. Erreur: {e}. Utilisation de la liste de secours.")
-        return FALLBACK_TESTNET
+        print(f"Impossible de construire l'univers via l'API. Erreur: {e}.")
+        return []
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Logique de détection de signal de la stratégie Darwin."""
+    """Logique de détection de signal de la stratégie Darwin, version corrigée."""
     if df is None or len(df) < 81:
         return None
 
     df = trader._get_indicators(df.copy())
     if df is None:
         return None
-
+    
     last = df.iloc[-1]
 
     # Définition de la tendance via la MM80
     is_uptrend = last['close'] > last['bb80_mid']
     is_downtrend = last['close'] < last['bb80_mid']
-    dead_zone = last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100)
-    is_in_dead_zone = abs(last['close'] - last['bb80_mid']) < dead_zone
     
     signal = None
-    tick_size = last['close'] * TICK_RATIO
-
+    
     # Stratégie 1: Tendance
-    if not is_in_dead_zone:
-        # Achat en tendance (Tendance de fond haussière, contact BB20 basse)
-        if is_uptrend and last['low'] <= last['bb20_lo'] and last['close'] > last['bb20_lo']:
-            entry = (last['open'] + last['close']) / 2
-            sl = last['low'] - (2 * tick_size)
-            tp = last['bb20_up']  # Objectif: Borne BB20 opposée
-            rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
-            if rr >= MIN_RR:
-                signal = {"side": "buy", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-            else:
-                print(f"  -> INFO: Setup d'ACHAT (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
-        # Vente en tendance (Tendance de fond baissière, contact BB20 haute)
-        elif is_downtrend and last['high'] >= last['bb20_up'] and last['close'] < last['bb20_up']:
-            entry = (last['open'] + last['close']) / 2
-            sl = last['high'] + (2 * tick_size)
-            tp = last['bb20_lo']  # Objectif: Borne BB20 opposée
-            rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
-            if rr >= MIN_RR:
-                signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-            else:
-                print(f"  -> INFO: Setup de VENTE (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+    # Achat en tendance (Tendance de fond haussière, contact BB20 basse)
+    if is_uptrend and last['low'] <= last['bb20_lo'] and last['close'] > last['bb20_lo']:
+        entry = (last['open'] + last['close']) / 2
+        sl = last['low'] - (2 * 0.0005 * last['close'])
+        tp = last['bb80_mid']  # CORRECTION: Le TP en tendance est la MM80
+        rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
+        if rr >= MIN_RR:
+            signal = {"side": "buy", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+        else:
+            print(f"  -> INFO: Setup d'ACHAT (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
+    # Vente en tendance (Tendance de fond baissière, contact BB20 haute)
+    elif is_downtrend and last['high'] >= last['bb20_up'] and last['close'] < last['bb20_up']:
+        entry = (last['open'] + last['close']) / 2
+        sl = last['high'] + (2 * 0.0005 * last['close'])
+        tp = last['bb80_mid']  # CORRECTION: Le TP en tendance est la MM80
+        rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
+        if rr >= MIN_RR:
+            signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+        else:
+            print(f"  -> INFO: Setup de VENTE (Tendance) pour {symbol} rejeté. Ratio RR: {rr:.2f} (Min: {MIN_RR})")
 
     # Stratégie 2: Contre-tendance
     if not signal:
         # Achat en contre-tendance (Double extrême bas)
         if last['low'] <= last['bb20_lo'] and last['low'] <= last['bb80_lo'] and last['close'] > last['bb20_lo']:
             entry = (last['open'] + last['close']) / 2
-            sl = last['low'] - (2 * tick_size)
-            tp = last['bb20_up']  # Objectif: Borne BB20 opposée
+            sl = last['low'] - (2 * 0.0005 * last['close'])
+            tp = last['bb20_up']  # Le TP en contre-tendance est la borne BB20 opposée
             rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
             if rr >= MIN_RR:
                 signal = {"side": "buy", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
@@ -124,8 +117,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         # Vente en contre-tendance (Double extrême haut)
         elif last['high'] >= last['bb20_up'] and last['high'] >= last['bb80_up'] and last['close'] < last['bb20_up']:
             entry = (last['open'] + last['close']) / 2
-            sl = last['high'] + (2 * tick_size)
-            tp = last['bb20_lo']  # Objectif: Borne BB20 opposée
+            sl = last['high'] + (2 * 0.0005 * last['close'])
+            tp = last['bb20_lo']  # Le TP en contre-tendance est la borne BB20 opposée
             rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
             if rr >= MIN_RR:
                 signal = {"side": "sell", "regime": "Contre-tendance", "entry": entry, "sl": sl, "tp": tp, "rr": rr}
@@ -142,7 +135,18 @@ def process_callback_query(callback_query: Dict):
     global _paused
     data = callback_query.get('data', '')
 
-    if data == 'pause':
+    if data == 'get_recent_signals':
+        cleanup_recent_signals()
+        if not _recent_signals:
+            notifier.tg_send("⏱️ Aucun signal valide détecté dans les 6 dernières heures.")
+            return
+        lines = [f"<b>⏱️ {len(_recent_signals)} Signaux Récents (6h)</b>\n"]
+        for s in _recent_signals:
+            ts = datetime.fromtimestamp(s['timestamp'], tz=timezone.utc).astimezone(pytz.timezone(TIMEZONE)).strftime('%H:%M')
+            side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
+            lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | {s['signal']['regime']} | RR: {s['signal']['rr']:.2f}")
+        notifier.tg_send("\n".join(lines))
+    elif data == 'pause':
         _paused = True
         notifier.tg_send("⏸️ Bot mis en pause.")
     elif data == 'resume':
@@ -202,44 +206,30 @@ def poll_telegram_updates():
 def check_scheduled_reports():
     """Vérifie s'il est temps d'envoyer les rapports planifiés."""
     global _last_daily_report_day, _last_weekly_report_day
-    
-    # Correction de la SyntaxError: le 'try' doit être sur une nouvelle ligne.
     try:
         tz = pytz.timezone(TIMEZONE)
     except pytz.UnknownTimeZoneError:
         tz = pytz.timezone("UTC")
-    
     now = datetime.now(tz)
     
-    # Rapport Quotidien
     if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
         _last_daily_report_day = now.day
-        one_day_ago = int(time.time()) - 24 * 60 * 60
-        trades = database.get_closed_trades_since(one_day_ago)
+        trades = database.get_closed_trades_since(int(time.time()) - 24 * 60 * 60)
         notifier.send_report("📊 Bilan Quotidien (24h)", trades)
     
-    # Rapport Hebdomadaire
     if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
         _last_weekly_report_day = now.day
-        seven_days_ago = int(time.time()) - 7 * 24 * 60 * 60
-        trades = database.get_closed_trades_since(seven_days_ago)
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("🗓️ Bilan Hebdomadaire", trades)
 
 def main():
     """Boucle principale du bot."""
     ex = create_exchange()
     database.setup_database()
-
-    # Initialise la stratégie dans la DB au premier lancement
     if not database.get_setting('STRATEGY_MODE'):
-        default_strategy = os.getenv('STRATEGY_MODE', 'NORMAL').upper()
-        database.set_setting('STRATEGY_MODE', default_strategy)
-
-    notifier.send_start_banner(
-        "TESTNET" if BITGET_TESTNET else "LIVE",
-        "PAPIER" if trader.PAPER_TRADING_MODE else "RÉEL",
-        trader.RISK_PER_TRADE_PERCENT
-    )
+        database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+    
+    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if trader.PAPER_TRADING_MODE else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
     universe = build_universe(ex)
     if not universe:
         notifier.tg_send("❌ Impossible de construire l'univers de trading. Arrêt du bot.")
@@ -247,13 +237,13 @@ def main():
     
     print(f"Univers de trading chargé avec {len(universe)} paires.")
     last_ts_seen = {}
-
+    
     while True:
         print(f"\n--- [{time.strftime('%Y-%m-%d %H:%M:%S')}] Nouveau cycle de la boucle ---")
         try:
+            cleanup_recent_signals()
             print("1. Vérification des mises à jour Telegram...")
             poll_telegram_updates()
-            
             print("2. Vérification des rapports planifiés...")
             check_scheduled_reports()
 
@@ -280,11 +270,14 @@ def main():
                 
                 if signal:
                     print(f"✅✅✅ Signal '{signal['regime']}' DÉTECTÉ ET VALIDÉ pour {symbol}!")
-                    trader.execute_trade(ex, symbol, signal, df)
+                    _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+                    
+                    is_taken, reason = trader.execute_trade(ex, symbol, signal, df)
+                    notifier.send_validated_signal_report(symbol, signal, is_taken, reason)
 
             print(f"--- Fin du cycle. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
-
+        
         except KeyboardInterrupt:
             notifier.tg_send("⛔ Arrêt manuel.")
             break
