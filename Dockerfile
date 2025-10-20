@@ -7,9 +7,9 @@ ENV PYTHONUNBUFFERED=1
 
 # --- Installation des dépendances en tant que ROOT ---
 COPY requirements.txt .
-# Met à jour pip et installe les paquets
+# On ignore l'avertissement car l'installation par root est intentionnelle ici
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir --root-user-action ignore -r requirements.txt
 
 # --- Création de l'utilisateur et copie du code ---
 COPY . .
@@ -18,6 +18,5 @@ RUN useradd --create-home appuser && chown -R appuser:appuser /app
 # --- Changer pour l'utilisateur non-root ---
 USER appuser
 
-# --- La commande de démarrage est maintenant gérée par Render ---
-# On laisse une commande par défaut au cas où
+# --- La commande de démarrage est gérée par Render ---
 CMD ["python", "-u", "main.py"]
