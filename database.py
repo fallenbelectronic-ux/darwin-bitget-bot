@@ -19,21 +19,11 @@ def setup_database():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            regime TEXT,
-            status TEXT NOT NULL,
-            entry_price REAL NOT NULL,
-            sl_price REAL NOT NULL,
-            tp_price REAL NOT NULL,
-            quantity REAL NOT NULL,
-            risk_percent REAL,
-            pnl REAL DEFAULT 0.0,
-            open_timestamp INTEGER NOT NULL,
-            close_timestamp INTEGER,
-            bb20_mid_at_entry REAL,
-            management_strategy TEXT DEFAULT 'NORMAL',
-            breakeven_status TEXT DEFAULT 'PENDING'
+            symbol TEXT NOT NULL, side TEXT NOT NULL, regime TEXT, status TEXT NOT NULL,
+            entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL,
+            quantity REAL NOT NULL, risk_percent REAL, pnl REAL DEFAULT 0.0,
+            open_timestamp INTEGER NOT NULL, close_timestamp INTEGER, bb20_mid_at_entry REAL,
+            management_strategy TEXT DEFAULT 'NORMAL', breakeven_status TEXT DEFAULT 'PENDING' 
         );
     ''')
     cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);')
