@@ -30,6 +30,28 @@ _last_weekly_report_day = -1
 _recent_signals: List[Dict] = []
 
 # ==============================================================================
+# MODIFICATION POUR FORCER L'API v2
+# ==============================================================================
+def create_exchange():
+    """Initialise et retourne l'objet d'échange CCXT en forçant l'API v2."""
+    ex = ccxt.bitget({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": PASSPHRASSE,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+            "testnet": BITGET_TESTNET,
+            "broker": "YOUR_BROKER_ID"  # Remplacez par votre ID de Broker si vous en avez un
+        }
+    })
+    # Forcer l'utilisation de l'API v2 pour toutes les requêtes
+    ex.set_api_version('v2')
+    
+    if BITGET_TESTNET:
+        ex.set_sandbox_mode(True)
+    return ex
+# ==============================================================================
 # DÉFINITION DE TOUTES LES FONCTIONS AVANT LEUR UTILISATION
 # ==============================================================================
 
