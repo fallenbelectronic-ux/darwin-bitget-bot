@@ -1,5 +1,5 @@
 # Fichier: reporting.py
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 def get_report_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Calcule les statistiques de performance à partir d'une liste de trades."""
@@ -30,7 +30,7 @@ def get_report_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_win": avg_win, "avg_loss": avg_loss
     }
 
-def format_report_message(title: str, stats: Dict[str, Any], balance: float) -> str:
+def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[float]) -> str:
     """Met en forme le message de rapport pour Telegram, en incluant le solde."""
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
     
@@ -48,78 +48,4 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: float) -> 
         f"🎯 <b>Taux de réussite :</b> <code>{stats['win_rate']:.2f}%</code>\n\n"
         f"💰 <b>Profit & Loss Net :</b> <code>{stats['total_pnl']:.2f} USDT</code>\n"
         f"🏆 <b>Profit Factor :</b> <code>{pf_str}</code>"
-    )```
-
-#### **3. Fichier `notifier.py` (Version Finale Professionnelle)**
-
-```python
-# Fichier: notifier.py
-import os
-import time
-import html
-import requests
-import io
-from typing import List, Dict, Any, Optional
-
-import reporting
-
-TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
-
-def tg_send(text: str, reply_markup: Optional[Dict] = None):
-    """Envoie un message texte simple sur Telegram."""
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    try:
-        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        if reply_markup: payload['reply_markup'] = reply_markup
-        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Erreur d'envoi Telegram: {e}")
-
-def send_report(title: str, trades: List[Dict[str, Any]], balance: float):
-    """Calcule les stats et envoie un rapport."""
-    stats = reporting.get_report_stats(trades)
-    message = reporting.format_report_message(title, stats, balance)
-    tg_send(message)
-
-def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str):
-    """Envoie un rapport de signal validé, avec le statut d'exécution."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    status_icon = "✅" if is_taken else "❌"
-    status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
-    message = ( f"<b>{status_icon} Signal Validé {side_icon}</b>\n\n"
-               f" paire: <code>{html.escape(symbol)}</code>\n Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
-               f" Entrée: <code>{signal['entry']:.5f}</code>\n SL: <code>{signal['sl']:.5f}</code>\n TP: <code>{signal['tp']:.5f}</code>\n"
-               f" RR: <b>x{signal['rr']:.2f}</b>\n\n{status_text}" )
-    tg_send(message)
-
-# --- Le reste du fichier est identique à la version stable et propre précédente ---
-def send_config_message(min_rr: float, risk: float, max_pos: int, leverage: int):
-    # ...
-def send_mode_message(is_testnet: bool, is_paper: bool):
-    # ...
-def get_main_menu_keyboard(is_paused: bool) -> Dict:
-    # ...
-def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
-    # ...
-def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str):
-    # ...
-def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
-    # ...
-def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
-    # ...
-def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
-    # ...
-def send_start_banner(platform: str, trading: str, risk: float):
-    # ...
-def send_main_menu(is_paused: bool):
-    # ...
-def send_strategy_menu(current_strategy: str):
-    # ...
-def format_open_positions(positions: List[Dict[str, Any]]):
-    # ...
-def tg_send_error(title: str, error: Any):
-    # ...
-def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
-    # ...
+    )
