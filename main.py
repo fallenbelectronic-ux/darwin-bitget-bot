@@ -33,7 +33,7 @@ _recent_signals: List[Dict] = []
 _lock = threading.Lock()
 
 # ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS
+# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
 # ==============================================================================
 
 def startup_checks():
@@ -98,8 +98,10 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         if df_with_indicators is None: continue
         
         last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
-        new_tp_price = last_indicators['bb80_mid'] if pending['signal']['regime'] == 'Tendance' else \
-                       last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+        new_tp_price = last_indicators['bb80_up'] if is_long and pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb80_lo'] if not is_long and pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb20_up'] if is_long and pending['signal']['regime'] == 'Contre-tendance' else \
+                       last_indicators['bb20_lo']
         
         new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price) if is_long and (new_entry_price - sl_price) > 0 else \
                  (new_entry_price - new_tp_price) / (sl_price - new_entry_price) if not is_long and (sl_price - new_entry_price) > 0 else 0
@@ -149,7 +151,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     regime = "Tendance" if buy_tendance else "Contre-tendance"
                     entry = (last_candle['open'] + last_candle['close']) / 2
                     sl = contact_candle['low'] - (contact_candle['atr'] * 0.25)
-                    tp = last_candle['bb80_mid'] if regime == 'Tendance' else last_candle['bb20_up']
+                    tp = last_candle['bb80_up'] if regime == 'Tendance' else last_candle['bb20_up']
                     rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
                     if rr >= MIN_RR: signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
 
@@ -165,7 +167,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     regime = "Tendance" if sell_tendance else "Contre-tendance"
                     entry = (last_candle['open'] + last_candle['close']) / 2
                     sl = contact_candle['high'] + (contact_candle['atr'] * 0.25)
-                    tp = last_candle['bb80_mid'] if regime == 'Tendance' else last_candle['bb20_lo']
+                    tp = last_candle['bb80_lo'] if regime == 'Tendance' else last_candle['bb20_lo']
                     rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
                     if rr >= MIN_RR: signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
 
@@ -300,8 +302,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                     with _lock:
                         state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
                         _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-                    # Aucune notification ici, tout se passe à la clôture.
-
+            
             print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
         
