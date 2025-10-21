@@ -84,46 +84,27 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
     except Exception as e:
         print(f"Impossible de construire l'univers via l'API. Erreur: {e}."); return []
 
-def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
-    if not state.pending_signals: return
-    print(f"  -> NOUVELLE BOUGIE détectée. Analyse de {len(state.pending_signals)} signaux en attente...")
-    
-    validated_signals = []
-    for symbol, pending in list(state.pending_signals.items()):
-        df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
-        if df is None or df.index[-1] <= pending['candle_timestamp']: continue
-
-        new_entry_price = df['open'].iloc[-1]; sl_price = pending['signal']['sl']
-        df_with_indicators = trader._get_indicators(df.copy())
-        if df_with_indicators is None: continue
-        
-        last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
-        new_tp_price = last_indicators['bb80_mid'] if pending['signal']['regime'] == 'Tendance' else \
-                       last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
-        
-        new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price) if is_long and (new_entry_price - sl_price) > 0 else \
-                 (new_entry_price - new_tp_price) / (sl_price - new_entry_price) if not is_long and (sl_price - new_entry_price) > 0 else 0
-
-        if new_rr >= MIN_RR:
-            pending['signal']['tp'] = new_tp_price; pending['signal']['rr'] = new_rr
-            pending['new_entry_price'] = new_entry_price
-            pending['signal']['symbol'] = symbol # Assurer que le symbole est présent
-            validated_signals.append(pending)
-        else:
-            print(f"   -> Signal pour {symbol} invalidé. R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}.")
-            notifier.send_validated_signal_report(symbol, pending['signal'], False, f"Invalidé: R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}")
-
-    state.pending_signals.clear()
-    if not validated_signals:
-        print("   -> Aucun signal n'a passé la re-validation du R/R."); return
-
-    best_signal_data = sorted(validated_signals, key=lambda x: x['signal']['rr'], reverse=True)[0]
-    symbol = best_signal_data['signal']['symbol']
-    print(f"   -> MEILLEUR SIGNAL SÉLECTIONNÉ: {symbol} avec un R/R de {best_signal_data['signal']['rr']:.2f}")
-
-    is_taken, reason = trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
-    if not is_taken:
-        notifier.send_validated_signal_report(symbol, best_signal_data['signal'], is_taken, reason)
+def check_pending_signals(ex: ccxt.Exchange, symbol: str, df: pd.DataFrame):
+    if symbol in state.pending_signals:
+        pending = state.pending_signals[symbol]; signal_candle_timestamp = pending['candle_timestamp']; current_candle_timestamp = df.index[-1]
+        if current_candle_timestamp > signal_candle_timestamp:
+            print(f"  -> NOUVELLE BOUGIE pour {symbol}. Re-validation du R/R...")
+            new_entry_price, sl_price = df['open'].iloc[-1], pending['signal']['sl']
+            df_with_indicators = trader._get_indicators(df.copy())
+            if df_with_indicators is None: del state.pending_signals[symbol]; return
+            last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
+            new_tp_price = last_indicators['bb80_mid'] if pending['signal']['regime'] == 'Tendance' else \
+                           last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+            new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price) if is_long and (new_entry_price - sl_price) > 0 else \
+                     (new_entry_price - new_tp_price) / (sl_price - new_entry_price) if not is_long and (sl_price - new_entry_price) > 0 else 0
+            if new_rr >= MIN_RR:
+                print(f"   -> R/R RE-VALIDÉ: {new_rr:.2f} >= {MIN_RR}. Exécution..."); pending['signal']['tp'] = new_tp_price; pending['signal']['rr'] = new_rr
+                is_taken, reason = trader.execute_trade(ex, symbol, pending['signal'], pending['df'], new_entry_price)
+                if not is_taken: notifier.send_validated_signal_report(symbol, pending['signal'], is_taken, reason)
+            else:
+                print(f"   -> ÉCHEC: Signal pour {symbol} invalidé. R/R ({new_rr:.2f}) < {MIN_RR}.")
+                notifier.send_validated_signal_report(symbol, pending['signal'], False, f"Invalidé: R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}")
+            del state.pending_signals[symbol]
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if df is None or len(df) < 83: return None
@@ -318,7 +299,10 @@ def main():
     """Point d'entrée principal du bot."""
     startup_checks()
     ex = create_exchange(); database.setup_database()
-    # ... (initialisation des settings)
+    if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+    if not database.get_setting('UNIVERSE_SIZE'): database.set_setting('UNIVERSE_SIZE', UNIVERSE_SIZE)
+    if not database.get_setting('MAX_OPEN_POSITIONS'): database.set_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+    if not database.get_setting('PAPER_TRADING_MODE'): database.set_setting('PAPER_TRADING_MODE', os.getenv("PAPER_TRADING_MODE", "true").lower())
     
     notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if database.get_setting('PAPER_TRADING_MODE') == 'true' else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
     universe = build_universe(ex)
