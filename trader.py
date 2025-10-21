@@ -3,7 +3,7 @@ import os
 import time
 import ccxt
 import pandas as pd
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 from typing import Dict, Any, Optional, Tuple
 
 import database
@@ -21,6 +21,8 @@ def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Calcule et ajoute tous les indicateurs techniques nécessaires."""
     if df is None or len(df) < 81:
         return None
+    
+    # Bandes de Bollinger
     bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
     df['bb20_up'] = bb_20.bollinger_hband()
     df['bb20_mid'] = bb_20.bollinger_mavg()
@@ -30,6 +32,9 @@ def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     df['bb80_up'] = bb_80.bollinger_hband()
     df['bb80_mid'] = bb_80.bollinger_mavg()
     df['bb80_lo'] = bb_80.bollinger_lband()
+    
+    # Indicateur de volatilité
+    df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
     
     return df
 
@@ -47,19 +52,15 @@ def manage_open_positions(ex: ccxt.Exchange):
         last_indicators = df.iloc[-1]
         is_long = pos['side'] == 'buy'
 
-        # --- GESTION DE LA STRATÉGIE "SPLIT" (Breakeven) ---
         if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
             try:
                 current_price = ex.fetch_ticker(pos['symbol'])['last']
                 management_trigger_price = last_indicators['bb20_mid']
-
                 if (is_long and current_price >= management_trigger_price) or \
                    (not is_long and current_price <= management_trigger_price):
                     
                     print(f"Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
-                    qty_to_close = pos['quantity'] / 2
-                    remaining_qty = pos['quantity'] - qty_to_close
-
+                    qty_to_close, remaining_qty = pos['quantity'] / 2, pos['quantity'] / 2
                     ex.create_market_order(pos['symbol'], 'sell' if is_long else 'buy', qty_to_close)
                     
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
@@ -73,12 +74,9 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
                 notifier.tg_send_error(f"Gestion SPLIT {pos['symbol']}", e)
-        
-        # --- GESTION DU TAKE PROFIT DYNAMIQUE ---
         else:
             new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else \
                              last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
-
             if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
                 try:
                     print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
@@ -107,11 +105,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     if not is_paper_mode:
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            params = {
-                'stopLoss': {'triggerPrice': signal['sl']},
-                'takeProfit': {'triggerPrice': signal['tp']},
-                'tradeSide': 'open' 
-            }
+            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}, 'tradeSide': 'open'}
             order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
             if order and 'price' in order and order['price']:
                 final_entry_price = float(order['price'])
