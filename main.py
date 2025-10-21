@@ -1,5 +1,6 @@
 # Fichier: main.py
 import os
+import sys
 import time
 import ccxt
 import pandas as pd
@@ -17,7 +18,9 @@ import state
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
-API_KEY, API_SECRET, PASSPHRASSE = os.getenv("BITGET_API_KEY", ""), os.getenv("BITGET_API_SECRET", ""), os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
+API_KEY          = os.getenv("BITGET_API_KEY", "")
+API_SECRET       = os.getenv("BITGET_API_SECRET", "")
+PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
 TIMEFRAME, UNIVERSE_SIZE, MIN_RR = os.getenv("TIMEFRAME", "1h"), int(os.getenv("UNIVERSE_SIZE", "30")), float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
@@ -26,7 +29,51 @@ LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", 
 _last_update_id: Optional[int] = None; _paused = False; _last_daily_report_day, _last_weekly_report_day = -1, -1
 _recent_signals: List[Dict] = []
 
-# --- FONCTIONS PRINCIPALES ---
+# ==============================================================================
+# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
+# ==============================================================================
+
+def startup_checks():
+    """Vérifie que toutes les variables d'environnement critiques sont présentes."""
+    print("Vérification des configurations au démarrage...")
+    required_keys = ['BITGET_API_KEY', 'BITGET_API_SECRET']
+    
+    # La passphrase est requise pour les opérations privées
+    if not os.getenv('BITGET_PASSPHRASSE') and not os.getenv('BITGET_API_PASSWORD'):
+        error_msg = "❌ ERREUR DE DÉMARRAGE : La variable d'environnement 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
+        print(error_msg)
+        notifier.tg_send(error_msg)
+        sys.exit(1) # Arrête le script proprement
+
+    for key in required_keys:
+        if not os.getenv(key):
+            error_msg = f"❌ ERREUR DE DÉMARRAGE : La variable d'environnement '{key}' est manquante."
+            print(error_msg)
+            notifier.tg_send(error_msg)
+            sys.exit(1)
+    
+    print("✅ Toutes les configurations nécessaires sont présentes.")
+
+def cleanup_recent_signals(hours: int = 6):
+    """Supprime les signaux de l'historique qui sont plus vieux que `hours`."""
+    global _recent_signals
+    seconds_ago = time.time() - (hours * 60 * 60)
+    _recent_signals = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+
+def get_recent_signals_message(hours: int) -> str:
+    """Génère le message de résumé pour les signaux récents."""
+    cleanup_recent_signals(hours)
+    seconds_ago = time.time() - (hours * 60 * 60)
+    signals_in_period = [s for s in _recent_signals if s['timestamp'] >= seconds_ago]
+    if not signals_in_period:
+        return f"⏱️ Aucun signal valide détecté dans les {hours} dernières heures."
+    lines = [f"<b>⏱️ {len(signals_in_period)} Signaux ({'dernière heure' if hours == 1 else f'{hours}h'})</b>\n"]
+    for s in signals_in_period:
+        ts = datetime.fromtimestamp(s['timestamp'], tz=timezone.utc).astimezone(pytz.timezone(TIMEZONE)).strftime('%H:%M')
+        side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
+        lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | {s['signal']['regime']} | RR: {s['signal']['rr']:.2f}")
+    return "\n".join(lines)
+
 def create_exchange():
     """Initialise et retourne l'objet d'échange CCXT."""
     ex = ccxt.bitget({
@@ -250,6 +297,7 @@ def check_scheduled_reports():
 
 def main():
     """Boucle principale du bot."""
+    startup_checks()
     ex = create_exchange()
     database.setup_database()
     if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
