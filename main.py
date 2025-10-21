@@ -6,7 +6,7 @@ import ccxt
 import pandas as pd
 import traceback
 import threading
-from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
@@ -107,7 +107,7 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         if new_rr >= MIN_RR:
             pending['signal']['tp'] = new_tp_price; pending['signal']['rr'] = new_rr
             pending['new_entry_price'] = new_entry_price
-            pending['signal']['symbol'] = symbol # Assurer que le symbole est présent
+            pending['signal']['symbol'] = symbol
             validated_signals.append(pending)
         else:
             print(f"   -> Signal pour {symbol} invalidé. R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}.")
