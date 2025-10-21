@@ -80,25 +80,28 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             rejection_reason = f"Rejeté: Erreur de vérification de position ({e})."
 
     if rejection_reason:
-        notifier.send_validated_signal_report(symbol, signal, False, rejection_reason)
+        notifier.send_validated_signal_report(symbol, signal, False, rejection_reason, is_control_only=True)
         return
 
     balance = get_usdt_balance(ex)
     if balance is None: 
-        notifier.send_validated_signal_report(symbol, signal, False, "Rejeté: Erreur de solde (Clés API?).")
+        notifier.send_validated_signal_report(symbol, signal, False, "Rejeté: Erreur de solde (Clés API?).", is_control_only=True)
         return
     if balance <= 10: 
-        notifier.send_validated_signal_report(symbol, signal, False, f"Rejeté: Solde insuffisant ({balance:.2f} USDT).")
+        reason = f"Rejeté: Solde insuffisant ({balance:.2f} USDT)."
+        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
         return
     
     quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, signal['sl'])
     if quantity <= 0:
-        notifier.send_validated_signal_report(symbol, signal, False, f"Rejeté: Quantité calculée nulle ({quantity}).")
+        reason = f"Rejeté: Quantité calculée nulle ({quantity})."
+        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
         return
         
     notional_value = quantity * entry_price
     if notional_value < MIN_NOTIONAL_VALUE:
-        notifier.send_validated_signal_report(symbol, signal, False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < minimum requis ({MIN_NOTIONAL_VALUE} USDT).")
+        reason = f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < minimum requis ({MIN_NOTIONAL_VALUE} USDT)."
+        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
         return
         
     final_entry_price = entry_price
@@ -113,13 +116,15 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             if not position or float(position.get('stopLossPrice', 0)) == 0:
                 print("🚨 ALERTE SÉCURITÉ : SL non détecté ! Clôture d'urgence.")
                 ex.create_market_order(symbol, 'sell' if signal['side'] == 'buy' else 'buy', quantity, params={'reduceOnly': True})
-                notifier.send_validated_signal_report(symbol, signal, False, "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée.")
+                reason = "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
+                notifier.send_validated_signal_report(symbol, signal, False, reason)
                 return
             
             if order and 'price' in order and order['price']: final_entry_price = float(order['price'])
         except Exception as e:
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
-            notifier.send_validated_signal_report(symbol, signal, False, f"Erreur d'exécution: {e}")
+            reason = f"Erreur d'exécution: {e}"
+            notifier.send_validated_signal_report(symbol, signal, False, reason)
             return
 
     signal['entry'] = final_entry_price
