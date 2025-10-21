@@ -17,25 +17,20 @@ LEVERAGE = int(os.getenv("LEVERAGE", "2"))
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 TP_UPDATE_THRESHOLD_PERCENT = 0.05
 
-def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
-    """Récupère le solde USDT. Retourne None en cas d'erreur."""
-    try:
-        # On augmente le timeout pour les requêtes réseau sensibles
-        ex.options['recvWindow'] = 10000
-        balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
-        return float(balance['total'].get('USDT', 0.0))
-    except Exception as e:
-        notifier.tg_send_error("Récupération du solde", e)
-        return None
-
 def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Calcule et ajoute tous les indicateurs techniques nécessaires."""
     if df is None or len(df) < 81:
         return None
     bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
-    df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
+    df['bb20_up'] = bb_20.bollinger_hband()
+    df['bb20_mid'] = bb_20.bollinger_mavg()
+    df['bb20_lo'] = bb_20.bollinger_lband()
+    
     bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2)
-    df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb_80.bollinger_hband(), bb_80.bollinger_mavg(), bb_80.bollinger_lband()
+    df['bb80_up'] = bb_80.bollinger_hband()
+    df['bb80_mid'] = bb_80.bollinger_mavg()
+    df['bb80_lo'] = bb_80.bollinger_lband()
+    
     return df
 
 def manage_open_positions(ex: ccxt.Exchange):
@@ -56,11 +51,14 @@ def manage_open_positions(ex: ccxt.Exchange):
             try:
                 current_price = ex.fetch_ticker(pos['symbol'])['last']
                 management_trigger_price = last_indicators['bb20_mid']
+
                 if (is_long and current_price >= management_trigger_price) or \
                    (not is_long and current_price <= management_trigger_price):
                     
                     print(f"Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
-                    qty_to_close, remaining_qty = pos['quantity'] / 2, pos['quantity'] / 2
+                    qty_to_close = pos['quantity'] / 2
+                    remaining_qty = pos['quantity'] - qty_to_close
+
                     ex.create_market_order(pos['symbol'], 'sell' if is_long else 'buy', qty_to_close)
                     
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
@@ -77,6 +75,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         else:
             new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else \
                              last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+
             if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
                 try:
                     print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
@@ -105,7 +104,13 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     if not is_paper_mode:
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            order = ex.create_market_order(symbol, signal['side'], quantity)
+            # CORRECTION : Ajout du paramètre pour le mode One-Way (Unilateral)
+            params = {
+                'stopLoss': {'triggerPrice': signal['sl']},
+                'takeProfit': {'triggerPrice': signal['tp']},
+                'tradeSide': 'open' # Nécessaire pour spécifier l'ouverture en One-Way
+            }
+            order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
             if order and 'price' in order and order['price']:
                 final_entry_price = float(order['price'])
         except Exception as e:
@@ -131,6 +136,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT. Retourne None en cas d'erreur."""
     try:
+        ex.options['recvWindow'] = 10000
         balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
         return float(balance['total'].get('USDT', 0.0))
     except Exception as e:
