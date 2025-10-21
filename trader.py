@@ -47,6 +47,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         last_indicators = df.iloc[-1]
         is_long = pos['side'] == 'buy'
 
+        # --- GESTION DE LA STRATÉGIE "SPLIT" (Breakeven) ---
         if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
             try:
                 current_price = ex.fetch_ticker(pos['symbol'])['last']
@@ -72,6 +73,8 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
                 notifier.tg_send_error(f"Gestion SPLIT {pos['symbol']}", e)
+        
+        # --- GESTION DU TAKE PROFIT DYNAMIQUE ---
         else:
             new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else \
                              last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
@@ -104,11 +107,10 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     if not is_paper_mode:
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            # CORRECTION : Ajout du paramètre pour le mode One-Way (Unilateral)
             params = {
                 'stopLoss': {'triggerPrice': signal['sl']},
                 'takeProfit': {'triggerPrice': signal['tp']},
-                'tradeSide': 'open' # Nécessaire pour spécifier l'ouverture en One-Way
+                'tradeSide': 'open' 
             }
             order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
             if order and 'price' in order and order['price']:
