@@ -17,15 +17,34 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
     """Envoie un message texte. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
-    if not TG_TOKEN or not target_chat_id:
-        return
+    if not TG_TOKEN or not target_chat_id: return
     try:
         payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
+        if reply_markup: payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
+
+def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
+    """Envoie un rapport de signal validé, avec le statut d'exécution."""
+    side_icon = "📈" if signal['side'] == 'buy' else "📉"
+    side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
+    status_icon = "✅" if is_taken else "❌"
+    status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
+    
+    message = (
+        f"<b>{status_icon} Signal {side_icon} {side_text} {'Pris' if is_taken else 'Rejeté'}</b>\n\n"
+        f" paire: <code>{html.escape(symbol)}</code>\n"
+        f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
+        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
+        f" SL: <code>{signal['sl']:.5f}</code>\n"
+        f" TP: <code>{signal['tp']:.5f}</code>\n"
+        f" RR: <b>x{signal['rr']:.2f}</b>\n\n"
+        f"{status_text}"
+    )
+    
+    target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
+    tg_send(message, chat_id=target_chat_id)
 
 def send_confirmed_signal_notification(symbol: str, signal: Dict):
     """Envoie une notification pour un signal 100% confirmé, avant la sélection."""
@@ -37,24 +56,7 @@ def send_confirmed_signal_notification(symbol: str, signal: Dict):
         f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n"
         f" RR à l'ouverture: <b>x{signal['rr']:.2f}</b>"
     )
-    # Envoyer sur le canal d'alertes, ou le canal principal si non défini
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
-
-def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str):
-    """Envoie un rapport de signal (utilisé pour les rejets finaux)."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
-    status_icon = "❌"
-    status_text = f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
-    message = (
-        f"<b>{status_icon} Signal {side_icon} {side_text} Rejeté</b>\n\n"
-        f" paire: <code>{html.escape(symbol)}</code>\n"
-        f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n"
-        f" RR calculé: <b>x{signal['rr']:.2f}</b>\n\n"
-        f"{status_text}"
-    )
-    # Les rejets sont envoyés sur le canal de contrôle principal
-    tg_send(message, chat_id=TG_CHAT_ID)
 
 def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
     """Formate le message pour un trade réellement ouvert."""
@@ -116,9 +118,7 @@ def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
     """Envoie un message avec photo. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
     if not target_chat_id: return
-
-    if not photo_buffer:
-        return tg_send(caption, chat_id=target_chat_id)
+    if not photo_buffer: return tg_send(caption, chat_id=target_chat_id)
     try:
         files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
         payload = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
