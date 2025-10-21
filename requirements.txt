@@ -6,3 +6,5 @@ ta
 matplotlib
 mplfinance
 pytz
+tabulate
+scipy
