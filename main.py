@@ -32,10 +32,6 @@ _last_weekly_report_day = -1
 _recent_signals: List[Dict] = []
 _lock = threading.Lock()
 
-# ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
-# ==============================================================================
-
 def startup_checks():
     """Vérifie la présence des variables d'environnement critiques au démarrage."""
     print("Vérification des configurations au démarrage...")
