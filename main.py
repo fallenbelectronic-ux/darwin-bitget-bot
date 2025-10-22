@@ -49,6 +49,29 @@ def startup_checks():
             print(error_msg); notifier.tg_send(error_msg); sys.exit(1)
     print("✅ Configurations nécessaires présentes.")
 
+def sync_positions_on_startup(ex: ccxt.Exchange):
+    """Compare les positions de l'exchange avec la DB locale au démarrage."""
+    print("Synchronisation des positions au démarrage...")
+    try:
+        exchange_positions = ex.fetch_positions()
+        open_exchange_symbols = {p['info']['symbol'] for p in exchange_positions if p.get('contracts') and float(p['contracts']) > 0}
+        
+        db_positions = database.get_open_positions()
+        open_db_symbols = {p['symbol'].replace('/', '') for p in db_positions}
+        
+        ghost_symbols = open_exchange_symbols - open_db_symbols
+        
+        if ghost_symbols:
+            message = "⚠️ <b>Positions Fantômes Détectées !</b>\nCes positions sont ouvertes sur l'exchange mais inconnues du bot :\n\n"
+            for symbol in ghost_symbols:
+                message += f"- <code>{symbol}</code>\n"
+            notifier.tg_send(message)
+        
+        print(f"Synchronisation terminée. {len(ghost_symbols)} position(s) fantôme(s) trouvée(s).")
+    except Exception as e:
+        print(f"Erreur durant la synchronisation des positions: {e}")
+        notifier.tg_send_error("Synchronisation Positions", e)
+
 def cleanup_recent_signals(hours: int = 6):
     global _recent_signals
     seconds_ago = time.time() - (hours * 60 * 60)
