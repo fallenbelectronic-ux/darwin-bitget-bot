@@ -23,15 +23,9 @@ ATR_TRAILING_MULTIPLIER = 2.0
 
 def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Calcule et ajoute tous les indicateurs techniques nécessaires."""
-    if df is None or len(df) < 81:
-        return None
-    
-    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
-    df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
-    
-    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2)
-    df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb_80.bollinger_hband(), bb_80.bollinger_mavg(), bb_80.bollinger_lband()
-    
+    if df is None or len(df) < 81: return None
+    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2); df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
+    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2); df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb_80.bollinger_hband(), bb_80.bollinger_mavg(), bb_80.bollinger_lband()
     df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
     df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
     return df
@@ -40,22 +34,14 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
     """Vérifie si la bougie de réaction est une bougie de décision valide."""
     body = abs(candle['close'] - candle['open'])
     if body == 0: return False
-    
-    wick_high = candle['high'] - max(candle['open'], candle['close'])
-    wick_low = min(candle['open'], candle['close']) - candle['low']
-    total_size = candle['high'] - candle['low']
-
-    if body < total_size * 0.15:
-        return False
-
+    wick_high = candle['high'] - max(candle['open'], candle['close']); wick_low = min(candle['open'], candle['close']) - candle['low']; total_size = candle['high'] - candle['low']
+    if body < total_size * 0.15: return False
     if side == 'buy':
         if candle['close'] <= candle['open']: return False
         if wick_high > body * 2.0: return False
-            
     if side == 'sell':
         if candle['close'] >= candle['open']: return False
         if wick_low > body * 2.0: return False
-            
     return True
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -122,7 +108,7 @@ def close_position_programmatically(ex: ccxt.Exchange, trade: Dict, reason: str,
             exit_price = ex.fetch_ticker(trade['symbol'])['last']
         except Exception as e:
             print(f"Impossible de récupérer le prix de sortie pour {trade['symbol']}: {e}")
-            return # On ne peut pas continuer sans prix de sortie
+            return
 
     if not is_paper_mode:
         try:
