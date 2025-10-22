@@ -63,69 +63,68 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
             
     return True
 
-def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float):
-    """Tente d'exécuter un trade et envoie les notifications appropriées."""
+def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
+    """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
     
-    rejection_reason = None
-    if len(database.get_open_positions()) >= max_pos: rejection_reason = f"Rejeté: Max positions ({max_pos}) atteint."
-    elif database.is_position_open(symbol): rejection_reason = "Rejeté: Position déjà ouverte (DB)."
-    else:
-        try:
-            positions = ex.fetch_positions([symbol])
-            if any(float(p.get('contracts', 0)) > 0 for p in positions):
-                rejection_reason = "Rejeté: Position déjà ouverte (Exchange)."
-        except Exception as e:
-            rejection_reason = f"Rejeté: Erreur de vérification de position ({e})."
-
-    if rejection_reason:
-        notifier.send_validated_signal_report(symbol, signal, False, rejection_reason, is_control_only=True)
-        return
+    # --- Vérifications Pré-Trade ---
+    if len(database.get_open_positions()) >= max_pos:
+        return False, f"Rejeté: Max positions ({max_pos}) atteint."
+    if database.is_position_open(symbol):
+        return False, "Rejeté: Position déjà ouverte (DB)."
+    
+    try:
+        positions = ex.fetch_positions([symbol])
+        if any(p for p in positions if p.get('contracts') and float(p['contracts']) > 0):
+            return False, "Rejeté: Position déjà ouverte (vérifié sur l'exchange)."
+    except Exception as e:
+        return False, f"Rejeté: Erreur de vérification de position ({e})."
 
     balance = get_usdt_balance(ex)
-    if balance is None: 
-        notifier.send_validated_signal_report(symbol, signal, False, "Rejeté: Erreur de solde (Clés API?).", is_control_only=True)
-        return
-    if balance <= 10: 
-        reason = f"Rejeté: Solde insuffisant ({balance:.2f} USDT)."
-        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
-        return
+    if balance is None:
+        return False, "Rejeté: Erreur de solde (Clés API?)."
+    if balance <= 10:
+        return False, f"Rejeté: Solde insuffisant ({balance:.2f} USDT)."
     
     quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, signal['sl'])
     if quantity <= 0:
-        reason = f"Rejeté: Quantité calculée nulle ({quantity})."
-        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
-        return
-        
+        return False, f"Rejeté: Quantité calculée nulle ({quantity})."
+    
     notional_value = quantity * entry_price
     if notional_value < MIN_NOTIONAL_VALUE:
-        reason = f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < minimum requis ({MIN_NOTIONAL_VALUE} USDT)."
-        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
-        return
-        
+        return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < minimum requis ({MIN_NOTIONAL_VALUE} USDT)."
+    
+    # --- Exécution de l'ordre ---
     final_entry_price = entry_price
     if not is_paper_mode:
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}
-            order = ex.create_order(symbol, 'market', signal['side'], quantity, params=params)
+            
+            market = ex.market(symbol)
+            params = {
+                'symbol': market['id'],
+                'marginCoin': market['quote'],
+                'side': signal['side'],
+                'orderType': 'market',
+                'size': ex.amount_to_precision(symbol, quantity),
+                'presetTakeProfitPrice': ex.price_to_precision(symbol, signal['tp']),
+                'presetStopLossPrice': ex.price_to_precision(symbol, signal['sl']),
+            }
+            order = ex.private_post_mix_order_place_order(params)
             
             time.sleep(3)
             position = ex.fetch_position(symbol)
             if not position or float(position.get('stopLossPrice', 0)) == 0:
                 print("🚨 ALERTE SÉCURITÉ : SL non détecté ! Clôture d'urgence.")
                 ex.create_market_order(symbol, 'sell' if signal['side'] == 'buy' else 'buy', quantity, params={'reduceOnly': True})
-                reason = "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
-                notifier.send_validated_signal_report(symbol, signal, False, reason)
-                return
+                return False, "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
             
-            if order and 'price' in order and order['price']: final_entry_price = float(order['price'])
+            final_entry_price = entry_price
+
         except Exception as e:
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
-            reason = f"Erreur d'exécution: {e}"
-            notifier.send_validated_signal_report(symbol, signal, False, reason)
-            return
+            return False, f"Erreur d'exécution: {e}"
 
     signal['entry'] = final_entry_price
     
@@ -136,12 +135,12 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         
     database.create_trade(symbol, signal['side'], signal['regime'], final_entry_price, signal['sl'], signal['tp'], quantity, RISK_PER_TRADE_PERCENT, int(time.time()), signal.get('bb20_mid'), management_strategy)
     
-    notifier.send_validated_signal_report(symbol, signal, True, "Position ouverte avec succès.")
-    
     chart_image = charting.generate_trade_chart(symbol, df, signal)
     mode_text = "PAPIER" if is_paper_mode else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message, chat_id=notifier.TG_ALERTS_CHAT_ID or notifier.TG_CHAT_ID)
+    
+    return True, "Position ouverte avec succès."
 
 def manage_open_positions(ex: ccxt.Exchange):
     """Gère les positions ouvertes selon leur stratégie."""
