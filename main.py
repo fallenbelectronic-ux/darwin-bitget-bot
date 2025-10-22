@@ -10,7 +10,6 @@ import database
 import trader
 import notifier
 import utils
-import reporting
 
 # --- PARAMÈTRES ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
@@ -45,9 +44,7 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
     try:
         ex.load_markets()
         tickers = ex.fetch_tickers()
-        # Filtre pour ne garder que les contrats perpétuels USDT avec un volume
         swap_tickers = {s: t for s, t in tickers.items() if ':USDT' in s and t.get('quoteVolume')}
-        # Trie les symboles par volume de citation (quoteVolume) en ordre décroissant
         sorted_symbols = sorted(swap_tickers, key=lambda s: swap_tickers[s]['quoteVolume'], reverse=True)
         print(f"Top {UNIVERSE_SIZE} paires par volume sélectionnées.")
         return sorted_symbols[:UNIVERSE_SIZE]
@@ -61,19 +58,14 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     
     last, prev = df.iloc[-1], df.iloc[-2]
     
-    # --- Filtre 1: Réintégration obligatoire ---
-    if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']):
-        return None
+    if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']): return None
     
-    # --- Filtre 2: Zone neutre autour de la MM80 ---
     dead_zone = last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100.0)
-    if abs(last['close'] - last['bb80_mid']) < dead_zone:
-        return None
+    if abs(last['close'] - last['bb80_mid']) < dead_zone: return None
     
     signal = None
     tick = last['close'] * TICK_RATIO
     
-    # --- Pattern 1: Tendance (Extrême Correction) ---
     is_above_mm80 = last['close'] > last['bb80_mid']
     touched_bb20_low = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_up'], "sell")
@@ -87,7 +79,6 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
         if (sl - entry) > 0 and (entry - tp) / (sl - entry) >= MIN_RR:
             signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": (entry-tp)/(sl-entry)}
 
-    # --- Pattern 2: Contre-Tendance (Double Extrême) ---
     if not signal:
         touched_double_low = prev['low'] <= min(prev['bb20_lo'], prev['bb80_lo'])
         touched_double_high = prev['high'] >= max(prev['bb20_up'], prev['bb80_up'])
