@@ -16,13 +16,20 @@ RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "2"))
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 TP_UPDATE_THRESHOLD_PERCENT = 0.05
-MIN_NOTIONAL_VALUE = 5.0 
+MIN_NOTIONAL_VALUE = 5.0
+MIN_RR = float(os.getenv("MIN_RR", "3.0"))
 
 def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Calcule et ajoute tous les indicateurs techniques nécessaires."""
-    if df is None or len(df) < 81: return None
-    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2); df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
-    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2); df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb_80.bollinger_hband(), bb_80.bollinger_mavg(), bb_80.bollinger_lband()
+    if df is None or len(df) < 81:
+        return None
+    
+    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
+    df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
+    
+    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2)
+    df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb_80.bollinger_hband(), bb_80.bollinger_mavg(), bb_80.bollinger_lband()
+    
     df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
     return df
 
@@ -30,14 +37,22 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
     """Vérifie si la bougie de réaction est une bougie de décision valide."""
     body = abs(candle['close'] - candle['open'])
     if body == 0: return False
-    wick_high = candle['high'] - max(candle['open'], candle['close']); wick_low = min(candle['open'], candle['close']) - candle['low']; total_size = candle['high'] - candle['low']
-    if body < total_size * 0.15: return False
+    
+    wick_high = candle['high'] - max(candle['open'], candle['close'])
+    wick_low = min(candle['open'], candle['close']) - candle['low']
+    total_size = candle['high'] - candle['low']
+
+    if body < total_size * 0.15:
+        return False
+
     if side == 'buy':
         if candle['close'] <= candle['open']: return False
         if wick_high > body * 2.0: return False
+            
     if side == 'sell':
         if candle['close'] >= candle['open']: return False
         if wick_low > body * 2.0: return False
+            
     return True
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -92,14 +107,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             return signal
     return None
 
-def close_position_programmatically(ex: ccxt.Exchange, trade_id: int, reason: str):
+def close_position_programmatically(ex: ccxt.Exchange, trade: Dict, reason: str):
     """Clôture une position pour une raison spécifique (ex: signal inverse)."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
-    trade = database.get_trade_by_id(trade_id)
-    if not trade or trade.get('status') != 'OPEN':
-        return
     
-    print(f"Clôture programmée du trade #{trade_id} sur {trade['symbol']}. Raison: {reason}")
+    print(f"Clôture programmée du trade #{trade['id']} sur {trade['symbol']}. Raison: {reason}")
     exit_price = ex.fetch_ticker(trade['symbol'])['last']
     
     if not is_paper_mode:
@@ -109,7 +121,7 @@ def close_position_programmatically(ex: ccxt.Exchange, trade_id: int, reason: st
             notifier.tg_send_error(f"Clôture programmée {trade['symbol']}", e)
             return
     
-    database.close_trade(trade_id, status=f'CLOSED_{reason.upper()}', exit_price=exit_price)
+    database.close_trade(trade['id'], status=f'CLOSED_{reason.upper()}', exit_price=exit_price)
     notifier.send_programmatic_closure_notification(trade['symbol'], trade['side'], reason, exit_price)
 
 def manage_open_positions(ex: ccxt.Exchange):
@@ -120,59 +132,89 @@ def manage_open_positions(ex: ccxt.Exchange):
         df = fetch_ohlcv_df(ex, pos['symbol'], TIMEFRAME)
         if df is None or len(df) < 83: continue
         
-        # --- NOUVELLE LOGIQUE : Clôture sur signal inverse ---
         signal = detect_signal(pos['symbol'], df)
         if signal:
             is_long_position = pos['side'] == 'buy'
             is_short_signal = signal['side'] == 'sell'
             if (is_long_position and is_short_signal) or (not is_long_position and not is_short_signal):
-                close_position_programmatically(ex, pos['id'], "REVERSE_SIGNAL")
-                continue # On passe à la position suivante, celle-ci est en cours de clôture
+                close_position_programmatically(ex, pos, "REVERSE_SIGNAL")
+                continue
 
-        if is_paper_mode: continue # Le reste de la gestion ne s'applique qu'en mode réel
-
+        if is_paper_mode: continue
+        
         last_indicators = _get_indicators(df).iloc[-1]
         is_long = pos['side'] == 'buy'
 
-        # --- Gestion SPLIT ---
         if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
             try:
                 current_price = ex.fetch_ticker(pos['symbol'])['last']
                 management_trigger_price = last_indicators['bb20_mid']
                 if (is_long and current_price >= management_trigger_price) or (not is_long and current_price <= management_trigger_price):
-                    # ... (logique inchangée)
+                    print(f"Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
+                    qty_to_close, remaining_qty = pos['quantity'] / 2, pos['quantity'] / 2
+                    ex.create_market_order(pos['symbol'], 'sell' if is_long else 'buy', qty_to_close)
+                    pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
+                    new_sl_be = pos['entry_price']
+                    params = {'symbol': pos['symbol'], 'stopLossPrice': f"{new_sl_be:.5f}", 'takeProfitPrice': f"{pos['tp_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
+                    notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
             except Exception as e:
-                # ... (logique inchangée)
-
-        # --- Gestion TP Dynamique / Trailing ---
+                print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
+                notifier.tg_send_error(f"Gestion SPLIT {pos['symbol']}", e)
         else:
-            # ... (logique inchangée)
+            new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else \
+                             last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+            if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
+                try:
+                    print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
+                    params = {'symbol': pos['symbol'], 'takeProfitPrice': f"{new_dynamic_tp:.5f}", 'stopLossPrice': f"{pos['sl_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    database.update_trade_tp(pos['id'], new_dynamic_tp)
+                except Exception as e:
+                    print(f"Erreur de mise à jour TP (Dynamique) pour {pos['symbol']}: {e}")
 
-def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
-    """Tente d'exécuter un trade."""
+def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float):
+    """Tente d'exécuter un trade et envoie les notifications appropriées."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
     
-    if len(database.get_open_positions()) >= max_pos: return False, f"Rejeté: Max positions ({max_pos}) atteint."
-    if database.is_position_open(symbol): return False, "Rejeté: Position déjà ouverte (DB)."
-    
-    try:
-        positions = ex.fetch_positions([symbol])
-        if any(p for p in positions if p.get('contracts') and float(p['contracts']) > 0):
-            return False, "Rejeté: Position déjà ouverte (Exchange)."
-    except Exception as e:
-        return False, f"Rejeté: Erreur de vérification de position ({e})."
+    rejection_reason = None
+    if len(database.get_open_positions()) >= max_pos: rejection_reason = f"Rejeté: Max positions ({max_pos}) atteint."
+    elif database.is_position_open(symbol): rejection_reason = "Rejeté: Position déjà ouverte (DB)."
+    else:
+        try:
+            positions = ex.fetch_positions([symbol])
+            if any(p for p in positions if p.get('contracts') and float(p['contracts']) > 0):
+                rejection_reason = "Rejeté: Position déjà ouverte (Exchange)."
+        except Exception as e:
+            rejection_reason = f"Rejeté: Erreur de vérification de position ({e})."
+
+    if rejection_reason:
+        notifier.send_validated_signal_report(symbol, signal, False, rejection_reason, is_control_only=True)
+        return
 
     balance = get_usdt_balance(ex)
-    if balance is None: return False, "Rejeté: Erreur de solde (Clés API?)."
-    if balance <= 10: return False, f"Rejeté: Solde insuffisant ({balance:.2f} USDT)."
+    if balance is None: 
+        notifier.send_validated_signal_report(symbol, signal, False, "Rejeté: Erreur de solde (Clés API?).", is_control_only=True)
+        return
+    if balance <= 10: 
+        reason = f"Rejeté: Solde insuffisant ({balance:.2f} USDT)."
+        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
+        return
     
     quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, signal['sl'])
-    if quantity <= 0: return False, f"Rejeté: Quantité calculée nulle ({quantity})."
-    
+    if quantity <= 0:
+        reason = f"Rejeté: Quantité calculée nulle ({quantity})."
+        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
+        return
+        
     notional_value = quantity * entry_price
-    if notional_value < MIN_NOTIONAL_VALUE: return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis."
-    
+    if notional_value < MIN_NOTIONAL_VALUE:
+        reason = f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < minimum requis ({MIN_NOTIONAL_VALUE} USDT)."
+        notifier.send_validated_signal_report(symbol, signal, False, reason, is_control_only=True)
+        return
+        
     final_entry_price = entry_price
     if not is_paper_mode:
         try:
@@ -184,11 +226,15 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             position = ex.fetch_position(symbol)
             if not position or float(position.get('stopLossPrice', 0)) == 0:
                 ex.create_market_order(symbol, 'sell' if signal['side'] == 'buy' else 'buy', quantity, params={'reduceOnly': True})
-                return False, "ERREUR CRITIQUE: SL non placé. Position clôturée."
+                reason = "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
+                notifier.send_validated_signal_report(symbol, signal, False, reason)
+                return
             final_entry_price = entry_price
         except Exception as e:
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
-            return False, f"Erreur d'exécution: {e}"
+            reason = f"Erreur d'exécution: {e}"
+            notifier.send_validated_signal_report(symbol, signal, False, reason)
+            return
 
     signal['entry'] = final_entry_price
     
@@ -197,7 +243,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     if current_strategy_mode == 'SPLIT' and signal['regime'] == 'Contre-tendance':
         management_strategy = "SPLIT"
         
-    database.create_trade(symbol, signal['side'], signal['regime'], final_entry_price, signal['sl'], signal['tp'], quantity, RISK_PER_TRADE_PERCENT, management_strategy, df.iloc[-1]['atr'], df.iloc[-1]['rsi'])
+    database.create_trade(symbol, signal['side'], signal['regime'], final_entry_price, signal['sl'], signal['tp'], quantity, RISK_PER_TRADE_PERCENT, int(time.time()), signal.get('bb20_mid'), management_strategy, df.iloc[-1]['atr'], df.iloc[-1]['rsi'])
     
     notifier.send_validated_signal_report(symbol, signal, True, "Position ouverte avec succès.")
     
@@ -205,8 +251,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     mode_text = "PAPIER" if is_paper_mode else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message, chat_id=notifier.TG_ALERTS_CHAT_ID or notifier.TG_CHAT_ID)
-    
-    return True, "Position ouverte avec succès."
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
@@ -231,4 +275,4 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     if not trade or trade.get('status') != 'OPEN': return notifier.tg_send(f"Trade #{trade_id} déjà fermé ou invalide.")
     
     exit_price = ex.fetch_ticker(trade['symbol'])['last']
-    close_position_programmatically(ex, trade_id, "MANUAL", exit_price)
+    close_position_programmatically(ex, trade, "MANUAL", exit_price)
