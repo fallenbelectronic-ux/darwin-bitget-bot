@@ -22,8 +22,7 @@ def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[st
         payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
         if reply_markup: payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Erreur d'envoi Telegram: {e}")
+    except Exception as e: print(f"Erreur d'envoi Telegram: {e}")
 
 def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
     """Envoie un rapport de signal validé, avec le statut d'exécution."""
@@ -31,14 +30,13 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
     side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
     status_icon = "✅" if is_taken else "❌"
     status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
-    
     message = (
         f"<b>{status_icon} Signal {side_icon} {side_text} {'Pris' if is_taken else 'Rejeté'}</b>\n\n"
         f" paire: <code>{html.escape(symbol)}</code>\n"
         f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
         f" Entrée: <code>{signal['entry']:.5f}</code>\n"
         f" SL: <code>{signal['sl']:.5f}</code>\n"
-        f" TP: <code>{signal['tp']:.5f}</code>\n"
+        f" TP: <code>{signal['tp']:.5f}</code>\n\n"
         f" RR: <b>x{signal['rr']:.2f}</b>\n\n"
         f"{status_text}"
     )
@@ -115,7 +113,7 @@ def get_trading_mode_keyboard(is_paper: bool) -> Dict:
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
     """Retourne le clavier du menu principal."""
     pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pauser", "callback_data": "pause"}
-    return { "inline_keyboard": [ [pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}], [{"text": "⚙️ Stratégie", "callback_data": "manage_strategy"}, {"text": "📈 Stats", "callback_data": "get_stats"}], [{"text": "⏱️ Signaux Récents (6h)", "callback_data": "get_recent_signals"}]] }
+    return {"inline_keyboard": [ [pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}], [{"text": "⚙️ Stratégie", "callback_data": "manage_strategy"}, {"text": "📈 Stats", "callback_data": "get_stats"}], [{"text": "⏱️ Signaux Récents (6h)", "callback_data": "get_recent_signals"}]] }
 
 def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
     """Envoie une notification de mise à breakeven."""
@@ -138,7 +136,7 @@ def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
     except Exception:
         tg_send(f"⚠️ Erreur de graphique\n{caption}", chat_id=target_chat_id)
 
-def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
+def tg_get_updates(offset: Optional[Dict] = None) -> List[Dict[str, Any]]:
     """Récupère les mises à jour du bot Telegram."""
     params = {"timeout": 1}
     if offset: params["offset"] = offset
