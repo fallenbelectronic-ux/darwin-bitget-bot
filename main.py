@@ -300,8 +300,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                     with _lock:
                         state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
                         _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-                    # Aucune notification ici, tout se passe à la clôture.
-
+            
             print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
         
