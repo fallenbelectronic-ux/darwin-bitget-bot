@@ -176,6 +176,39 @@ def format_open_positions(positions: List[Dict[str, Any]]):
         lines.append(f"<b>{pos.get('id')}. {side_icon} {html.escape(pos.get('symbol', 'N/A'))}</b>\n   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>\n")
     tg_send("\n".join(lines), reply_markup=get_positions_keyboard(positions))
 
+def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
+    """Formate et envoie un rapport complet des positions ouvertes, synchronisé avec l'exchange."""
+    open_exchange_symbols = {p['info']['symbol'] for p in exchange_positions if p.get('contracts') and float(p['contracts']) > 0}
+    open_db_symbols = {p['symbol'].replace('/', '') for p in db_positions}
+    
+    synced_symbols = open_exchange_symbols.intersection(open_db_symbols)
+    ghost_symbols = open_exchange_symbols - open_db_symbols
+    zombie_symbols = open_db_symbols - open_exchange_symbols
+
+    if not open_exchange_symbols and not open_db_symbols:
+        return tg_send("✅ Aucune position ouverte (vérifié sur l'exchange et dans la DB).")
+
+    lines = ["<b>📊 Positions Ouvertes (Synchronisé)</b>\n"]
+    
+    if synced_symbols:
+        lines.append("--- POSITIONS SYNCHRONISÉES ---")
+        synced_db_pos = [p for p in db_positions if p['symbol'].replace('/', '') in synced_symbols]
+        for pos in synced_db_pos:
+            side_icon = "📈" if pos.get('side') == 'buy' else "📉"
+            lines.append(f"<b>{pos.get('id')}. {side_icon} {html.escape(pos.get('symbol', 'N/A'))}</b>")
+    
+    if ghost_symbols:
+        lines.append("\n⚠️ <b>Positions FANTÔMES</b> (sur l'exchange, pas dans la DB):")
+        for symbol in ghost_symbols:
+            lines.append(f"- <code>{symbol}</code>")
+    
+    if zombie_symbols:
+        lines.append("\n🔍 <b>Positions DÉSYNCHRONISÉES</b> (dans la DB, pas sur l'exchange):")
+        for symbol in zombie_symbols:
+            lines.append(f"- <code>{symbol.replace('USDT', '/USDT')}</code>")
+
+    tg_send("\n".join(lines), reply_markup=get_positions_keyboard(db_positions))
+
 def tg_send_error(title: str, error: Any):
     """Envoie un message d'erreur formaté."""
     error_text = str(error)
