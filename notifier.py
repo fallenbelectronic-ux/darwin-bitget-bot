@@ -17,10 +17,12 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
     """Envoie un message texte. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
-    if not TG_TOKEN or not target_chat_id: return
+    if not TG_TOKEN or not target_chat_id:
+        return
     try:
         payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
-        if reply_markup: payload['reply_markup'] = reply_markup
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
@@ -73,6 +75,18 @@ def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
         f" Quantité: <code>{quantity:.4f}</code>\n"
         f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
     )
+
+def send_programmatic_closure_notification(symbol: str, side: str, reason: str, exit_price: float):
+    """Notifie d'une clôture de position due à un signal inverse."""
+    side_icon = "📈" if side == 'buy' else "📉"
+    reason_text = "Signal Inverse Détecté" if reason == "REVERSE_SIGNAL" else reason
+    message = (
+        f"<b>🔐 Clôture de Sécurité {side_icon}</b>\n\n"
+        f" paire: <code>{html.escape(symbol)}</code>\n"
+        f" Raison: <b>{reason_text}</b>\n"
+        f" Prix de sortie: <code>{exit_price:.5f}</code>"
+    )
+    tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
 
 def send_config_message(min_rr: float, risk: float, max_pos: int, leverage: int):
     """Envoie un message affichant la configuration actuelle du bot."""
