@@ -182,7 +182,15 @@ def process_callback_query(callback_query: Dict):
     elif data == 'resume':
         with _lock: _paused = False
         notifier.tg_send("▶️ Reprise du scan.")
-    elif data == 'list_positions': notifier.format_open_positions(database.get_open_positions())
+    elif data == 'list_positions': 
+        ex = create_exchange()
+        try:
+            exchange_positions = ex.fetch_positions()
+            db_positions = database.get_open_positions()
+            notifier.format_synced_open_positions(exchange_positions, db_positions)
+        except Exception as e:
+            notifier.tg_send(f"❌ Erreur de synchro /pos: {e}")
+            notifier.format_open_positions(database.get_open_positions())
     elif data == 'get_recent_signals': notifier.tg_send(get_recent_signals_message(6))
     elif data.startswith('close_trade_'):
         try: trade_id = int(data.split('_')[-1]); trader.close_position_manually(create_exchange(), trade_id)
@@ -223,7 +231,15 @@ def process_message(message: Dict):
         ex = create_exchange(); balance = trader.get_usdt_balance(ex)
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
-    elif command == "/pos": notifier.format_open_positions(database.get_open_positions())
+    elif command == "/pos":
+        ex = create_exchange()
+        try:
+            exchange_positions = ex.fetch_positions()
+            db_positions = database.get_open_positions()
+            notifier.format_synced_open_positions(exchange_positions, db_positions)
+        except Exception as e:
+            notifier.tg_send(f"❌ Erreur de synchro /pos: {e}")
+            notifier.format_open_positions(database.get_open_positions())
     elif command == "/setuniverse":
         if len(parts) < 2: notifier.tg_send("Usage: <code>/setuniverse &lt;nombre&gt;</code>"); return
         try:
@@ -295,16 +311,12 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 if df is None or len(df) < 83: continue
                 
                 signal = detect_signal(symbol, df)
-                if signal:
+                if signal and symbol not in state.pending_signals:
+                    print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
                     with _lock:
-                        # On enregistre tous les signaux pour la commande /recent
-                        if not any(s['signal'] == signal for s in _recent_signals):
-                             _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-                    
-                    if symbol not in state.pending_signals:
-                        print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
                         state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
-
+                        _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+            
             print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
         
@@ -323,6 +335,8 @@ def main():
     if not database.get_setting('UNIVERSE_SIZE'): database.set_setting('UNIVERSE_SIZE', UNIVERSE_SIZE)
     if not database.get_setting('MAX_OPEN_POSITIONS'): database.set_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
     if not database.get_setting('PAPER_TRADING_MODE'): database.set_setting('PAPER_TRADING_MODE', os.getenv("PAPER_TRADING_MODE", "true").lower())
+    
+    sync_positions_on_startup(ex) # Synchronisation au démarrage
     
     notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if database.get_setting('PAPER_TRADING_MODE') == 'true' else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
     universe = build_universe(ex)
