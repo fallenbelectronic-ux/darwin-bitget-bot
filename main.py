@@ -41,7 +41,7 @@ def startup_checks():
     print("Vérification des configurations au démarrage...")
     required = {'BITGET_API_KEY', 'BITGET_API_SECRET'}
     if not os.getenv('BITGET_PASSPHRASSE') and not os.getenv('BITGET_API_PASSWORD'):
-        error_msg = "❌ ERREUR DE DÉMARRage: La variable 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
+        error_msg = "❌ ERREUR DE DÉMARRAGE: La variable 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
         print(error_msg); notifier.tg_send(error_msg); sys.exit(1)
     for key in required:
         if not os.getenv(key):
