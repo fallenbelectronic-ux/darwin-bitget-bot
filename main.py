@@ -16,6 +16,7 @@ import trader
 import notifier
 import utils
 import state
+import analysis
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
