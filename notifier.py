@@ -1,6 +1,11 @@
 # Fichier: notifier.py
-import os, time, html, requests, io
+import os
+import time
+import html
+import requests
+import io
 from typing import List, Dict, Any, Optional
+
 import reporting
 
 # --- PARAMÈTRES TELEGRAM ---
