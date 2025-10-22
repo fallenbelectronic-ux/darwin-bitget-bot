@@ -123,57 +123,6 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
 
     trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
 
-def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    if df is None or len(df) < 83: return None
-    df_with_indicators = trader._get_indicators(df.copy())
-    if df_with_indicators is None: return None
-    
-    last_candle = df_with_indicators.iloc[-1]
-    
-    for i in range(2, 4):
-        contact_candle = df_with_indicators.iloc[-i]
-        signal = None
-        
-        is_uptrend = contact_candle['close'] > contact_candle['bb80_mid']
-        is_downtrend = contact_candle['close'] < contact_candle['bb80_mid']
-
-        # Achat
-        buy_tendance = is_uptrend and contact_candle['low'] <= contact_candle['bb20_lo']
-        buy_ct = (contact_candle['low'] <= contact_candle['bb20_lo'] and contact_candle['low'] <= contact_candle['bb80_lo'])
-        
-        if buy_tendance or buy_ct:
-            if trader.is_valid_reaction_candle(last_candle, 'buy'):
-                reintegration_ok = last_candle['close'] > contact_candle['bb20_lo']
-                if buy_ct: reintegration_ok = reintegration_ok and last_candle['close'] > contact_candle['bb80_lo']
-                if reintegration_ok:
-                    regime = "Tendance" if buy_tendance else "Contre-tendance"
-                    entry = (last_candle['open'] + last_candle['close']) / 2
-                    sl = contact_candle['low'] - (contact_candle['atr'] * 0.25)
-                    tp = last_candle['bb80_up'] if regime == 'Tendance' else last_candle['bb20_up']
-                    rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
-                    if rr >= MIN_RR: signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-
-        # Vente
-        sell_tendance = is_downtrend and contact_candle['high'] >= contact_candle['bb20_up']
-        sell_ct = (contact_candle['high'] >= contact_candle['bb20_up'] and contact_candle['high'] >= contact_candle['bb80_up'])
-
-        if not signal and (sell_tendance or sell_ct):
-            if trader.is_valid_reaction_candle(last_candle, 'sell'):
-                reintegration_ok = last_candle['close'] < contact_candle['bb20_up']
-                if sell_ct: reintegration_ok = reintegration_ok and last_candle['close'] < contact_candle['bb80_up']
-                if reintegration_ok:
-                    regime = "Tendance" if sell_tendance else "Contre-tendance"
-                    entry = (last_candle['open'] + last_candle['close']) / 2
-                    sl = contact_candle['high'] + (contact_candle['atr'] * 0.25)
-                    tp = last_candle['bb80_lo'] if regime == 'Tendance' else last_candle['bb20_lo']
-                    rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
-                    if rr >= MIN_RR: signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-
-        if signal:
-            signal['bb20_mid'] = last_candle['bb20_mid']
-            return signal
-    return None
-
 def process_callback_query(callback_query: Dict):
     global _paused; data = callback_query.get('data', '')
     if data == 'pause':
@@ -310,13 +259,16 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
                 if df is None or len(df) < 83: continue
                 
-                signal = detect_signal(symbol, df)
-                if signal and symbol not in state.pending_signals:
-                    print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
+                signal = trader.detect_signal(symbol, df)
+                if signal:
                     with _lock:
+                        if not any(s['signal'] == signal for s in _recent_signals):
+                             _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+                    
+                    if symbol not in state.pending_signals:
+                        print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
                         state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
-                        _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-            
+
             print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
         
@@ -336,7 +288,7 @@ def main():
     if not database.get_setting('MAX_OPEN_POSITIONS'): database.set_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
     if not database.get_setting('PAPER_TRADING_MODE'): database.set_setting('PAPER_TRADING_MODE', os.getenv("PAPER_TRADING_MODE", "true").lower())
     
-    sync_positions_on_startup(ex) # Synchronisation au démarrage
+    sync_positions_on_startup(ex)
     
     notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if database.get_setting('PAPER_TRADING_MODE') == 'true' else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
     universe = build_universe(ex)
