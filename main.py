@@ -33,7 +33,7 @@ _recent_signals: List[Dict] = []
 _lock = threading.Lock()
 
 # ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
+# DÉFINITION DE TOUTES LES FONCTIONS
 # ==============================================================================
 
 def startup_checks():
@@ -98,10 +98,8 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         if df_with_indicators is None: continue
         
         last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
-        new_tp_price = last_indicators['bb80_up'] if is_long and pending['signal']['regime'] == 'Tendance' else \
-                       last_indicators['bb80_lo'] if not is_long and pending['signal']['regime'] == 'Tendance' else \
-                       last_indicators['bb20_up'] if is_long and pending['signal']['regime'] == 'Contre-tendance' else \
-                       last_indicators['bb20_lo']
+        new_tp_price = last_indicators['bb80_mid'] if pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
         
         new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price) if is_long and (new_entry_price - sl_price) > 0 else \
                  (new_entry_price - new_tp_price) / (sl_price - new_entry_price) if not is_long and (sl_price - new_entry_price) > 0 else 0
@@ -297,12 +295,16 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 if df is None or len(df) < 83: continue
                 
                 signal = detect_signal(symbol, df)
-                if signal and symbol not in state.pending_signals:
-                    print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
+                if signal:
                     with _lock:
+                        # On enregistre tous les signaux pour la commande /recent
+                        if not any(s['signal'] == signal for s in _recent_signals):
+                             _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+                    
+                    if symbol not in state.pending_signals:
+                        print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
                         state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
-                        _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-            
+
             print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
         
