@@ -33,7 +33,7 @@ _recent_signals: List[Dict] = []
 _lock = threading.Lock()
 
 # ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS UTILITAIRES
+# DÉFINITION DE TOUTES LES FONCTIONS
 # ==============================================================================
 
 def startup_checks():
@@ -109,9 +109,9 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
             pending['new_entry_price'] = new_entry_price
             pending['signal']['symbol'] = symbol
             validated_signals.append(pending)
+            notifier.send_confirmed_signal_notification(symbol, pending['signal'])
         else:
             print(f"   -> Signal pour {symbol} invalidé. R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}.")
-            notifier.send_validated_signal_report(symbol, pending['signal'], False, f"Invalidé: R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}")
 
     state.pending_signals.clear()
     if not validated_signals:
@@ -121,9 +121,7 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     symbol = best_signal_data['signal']['symbol']
     print(f"   -> MEILLEUR SIGNAL SÉLECTIONNÉ: {symbol} avec un R/R de {best_signal_data['signal']['rr']:.2f}")
 
-    is_taken, reason = trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
-    if not is_taken:
-        notifier.send_validated_signal_report(symbol, best_signal_data['signal'], is_taken, reason)
+    trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if df is None or len(df) < 83: return None
@@ -298,11 +296,11 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 
                 signal = detect_signal(symbol, df)
                 if signal and symbol not in state.pending_signals:
-                    print(f"✅✅✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
+                    print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
                     with _lock:
                         state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
                         _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
-                    notifier.send_validated_signal_report(symbol, signal, False, "En attente de la clôture horaire.")
+                    # Aucune notification ici, tout se passe à la clôture.
 
             print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
             time.sleep(LOOP_DELAY)
