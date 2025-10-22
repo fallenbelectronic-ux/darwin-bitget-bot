@@ -6,17 +6,16 @@ import ccxt
 import pandas as pd
 import traceback
 import threading
+from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
-from tabulate import tabulate
 
 import database
 import trader
 import notifier
 import utils
 import state
-import analysis
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
@@ -26,15 +25,23 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT PARTAGÉES ET SÉCURISÉES ---
-_last_update_id: Optional[int] = None; _paused = False; _last_daily_report_day, _last_weekly_report_day = -1, -1
-_recent_signals: List[Dict] = []; _lock = threading.Lock()
+_last_update_id: Optional[int] = None
+_paused = False
+_last_daily_report_day = -1
+_last_weekly_report_day = -1
+_recent_signals: List[Dict] = []
+_lock = threading.Lock()
+
+# ==============================================================================
+# DÉFINITION DE TOUTES LES FONCTIONS
+# ==============================================================================
 
 def startup_checks():
     """Vérifie la présence des variables d'environnement critiques au démarrage."""
     print("Vérification des configurations au démarrage...")
     required = {'BITGET_API_KEY', 'BITGET_API_SECRET'}
     if not os.getenv('BITGET_PASSPHRASSE') and not os.getenv('BITGET_API_PASSWORD'):
-        error_msg = "❌ ERREUR DE DÉMARRAGE: La variable 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
+        error_msg = "❌ ERREUR DE DÉMARRage: La variable 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
         print(error_msg); notifier.tg_send(error_msg); sys.exit(1)
     for key in required:
         if not os.getenv(key):
