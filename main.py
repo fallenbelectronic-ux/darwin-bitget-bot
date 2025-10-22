@@ -6,12 +6,16 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 import traceback
 
+# --- Importation des modules locaux du projet ---
 import database
 import trader
 import notifier
 import utils
+import reporting
 
-# --- PARAMÈTRES ---
+# ==============================================================================
+# PARAMÈTRES ET CONFIGURATION
+# ==============================================================================
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
 API_KEY          = os.getenv("BITGET_API_KEY", "")
 API_SECRET       = os.getenv("BITGET_API_SECRET", "")
@@ -24,11 +28,17 @@ TICK_RATIO       = 0.0005
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
 FALLBACK_TESTNET = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 
-# --- VARIABLES GLOBALES ---
+# ==============================================================================
+# VARIABLES GLOBALES D'ÉTAT
+# ==============================================================================
 _last_update_id: Optional[int] = None
 _paused = False
 
-def create_exchange():
+# ==============================================================================
+# FONCTIONS DE BASE DU BOT
+# ==============================================================================
+
+def create_exchange() -> ccxt.Exchange:
     """Initialise et retourne l'objet de l'exchange CCXT."""
     ex = ccxt.bitget({
         "apiKey": API_KEY, "secret": API_SECRET, "password": PASSPHRASSE,
@@ -53,23 +63,32 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
         return FALLBACK_TESTNET
 
 def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
-    """Logique de détection de signal, réécrite pour la clarté et la correction."""
-    if df is None or len(df) < 81: return None
+    """
+    Logique de détection de signal, réécrite pour la clarté, la correction et la fidélité à la stratégie DARWIN.
+    """
+    if df is None or len(df) < 81:
+        return None
     
     last, prev = df.iloc[-1], df.iloc[-2]
     
-    if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']): return None
+    # --- Filtre 1: Réintégration obligatoire ---
+    if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']):
+        return None
     
+    # --- Filtre 2: Zone neutre autour de la MM80 ---
     dead_zone = last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100.0)
-    if abs(last['close'] - last['bb80_mid']) < dead_zone: return None
+    if abs(last['close'] - last['bb80_mid']) < dead_zone:
+        return None
     
     signal = None
     tick = last['close'] * TICK_RATIO
     
+    # --- Logique des Patterns ---
     is_above_mm80 = last['close'] > last['bb80_mid']
     touched_bb20_low = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_up'], "sell")
 
+    # Pattern 1: Tendance (Extrême Correction)
     if is_above_mm80 and touched_bb20_low:
         entry, sl, tp = last['close'], prev['low'] - (2 * tick), last['bb80_up']
         if (entry - sl) > 0 and (tp - entry) / (entry - sl) >= MIN_RR:
@@ -79,10 +98,10 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
         if (sl - entry) > 0 and (entry - tp) / (sl - entry) >= MIN_RR:
             signal = {"side": "sell", "regime": "Tendance", "entry": entry, "sl": sl, "tp": tp, "rr": (entry-tp)/(sl-entry)}
 
+    # Pattern 2: Contre-Tendance (Double Extrême)
     if not signal:
         touched_double_low = prev['low'] <= min(prev['bb20_lo'], prev['bb80_lo'])
         touched_double_high = prev['high'] >= max(prev['bb20_up'], prev['bb80_up'])
-
         if touched_double_low:
             entry, sl, tp = last['close'], prev['low'] - (2 * tick), last['bb20_mid']
             if (entry - sl) > 0 and (tp - entry) / (entry - sl) >= MIN_RR:
@@ -95,12 +114,18 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     if signal:
         signal['bb20_mid'] = last['bb20_mid']
         return signal
+        
     return None
+
+# ==============================================================================
+# GESTION DES INTERACTIONS TELEGRAM
+# ==============================================================================
 
 def process_callback_query(callback_query: Dict):
     """Gère les clics sur les boutons interactifs."""
     global _paused
     data = callback_query.get('data', '')
+    
     if data == 'pause':
         _paused = True; notifier.tg_send("⏸️ Bot mis en pause.")
     elif data == 'resume':
@@ -137,6 +162,10 @@ def poll_telegram_updates():
         elif 'message' in upd:
             process_message(upd['message'])
 
+# ==============================================================================
+# BOUCLE PRINCIPALE
+# ==============================================================================
+
 def main():
     """Fonction principale du bot."""
     ex = create_exchange()
@@ -166,6 +195,7 @@ def main():
                     trader.execute_trade(ex, symbol, signal, df)
             
             time.sleep(LOOP_DELAY)
+
         except KeyboardInterrupt:
             notifier.tg_send("⛔ Arrêt manuel.")
             break
