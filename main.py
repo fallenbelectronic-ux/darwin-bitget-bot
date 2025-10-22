@@ -6,17 +6,16 @@ import ccxt
 import pandas as pd
 import traceback
 import threading
+from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
-from tabulate import tabulate
 
 import database
 import trader
 import notifier
 import utils
 import state
-import analysis
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
