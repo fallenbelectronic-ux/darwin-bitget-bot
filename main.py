@@ -10,6 +10,7 @@ from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
+from tabulate import tabulate
 
 import database
 import trader
@@ -48,29 +49,6 @@ def startup_checks():
             error_msg = f"❌ ERREUR DE DÉMARRAGE: La variable '{key}' est manquante."
             print(error_msg); notifier.tg_send(error_msg); sys.exit(1)
     print("✅ Configurations nécessaires présentes.")
-
-def sync_positions_on_startup(ex: ccxt.Exchange):
-    """Compare les positions de l'exchange avec la DB locale au démarrage."""
-    print("Synchronisation des positions au démarrage...")
-    try:
-        exchange_positions = ex.fetch_positions()
-        open_exchange_symbols = {p['info']['symbol'] for p in exchange_positions if p.get('contracts') and float(p['contracts']) > 0}
-        
-        db_positions = database.get_open_positions()
-        open_db_symbols = {p['symbol'].replace('/', '') for p in db_positions}
-        
-        ghost_symbols = open_exchange_symbols - open_db_symbols
-        
-        if ghost_symbols:
-            message = "⚠️ <b>Positions Fantômes Détectées !</b>\nCes positions sont ouvertes sur l'exchange mais inconnues du bot :\n\n"
-            for symbol in ghost_symbols:
-                message += f"- <code>{symbol}</code>\n"
-            notifier.tg_send(message)
-        
-        print(f"Synchronisation terminée. {len(ghost_symbols)} position(s) fantôme(s) trouvée(s).")
-    except Exception as e:
-        print(f"Erreur durant la synchronisation des positions: {e}")
-        notifier.tg_send_error("Synchronisation Positions", e)
 
 def cleanup_recent_signals(hours: int = 6):
     global _recent_signals
@@ -121,8 +99,10 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         if df_with_indicators is None: continue
         
         last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
-        new_tp_price = last_indicators['bb80_mid'] if pending['signal']['regime'] == 'Tendance' else \
-                       last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+        new_tp_price = last_indicators['bb80_up'] if is_long and pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb80_lo'] if not is_long and pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb20_up'] if is_long and pending['signal']['regime'] == 'Contre-tendance' else \
+                       last_indicators['bb20_lo']
         
         new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price) if is_long and (new_entry_price - sl_price) > 0 else \
                  (new_entry_price - new_tp_price) / (sl_price - new_entry_price) if not is_long and (sl_price - new_entry_price) > 0 else 0
@@ -145,6 +125,57 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     print(f"   -> MEILLEUR SIGNAL SÉLECTIONNÉ: {symbol} avec un R/R de {best_signal_data['signal']['rr']:.2f}")
 
     trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
+
+def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if df is None or len(df) < 83: return None
+    df_with_indicators = trader._get_indicators(df.copy())
+    if df_with_indicators is None: return None
+    
+    last_candle = df_with_indicators.iloc[-1]
+    
+    for i in range(2, 4):
+        contact_candle = df_with_indicators.iloc[-i]
+        signal = None
+        
+        is_uptrend = contact_candle['close'] > contact_candle['bb80_mid']
+        is_downtrend = contact_candle['close'] < contact_candle['bb80_mid']
+
+        # Achat
+        buy_tendance = is_uptrend and contact_candle['low'] <= contact_candle['bb20_lo']
+        buy_ct = (contact_candle['low'] <= contact_candle['bb20_lo'] and contact_candle['low'] <= contact_candle['bb80_lo'])
+        
+        if buy_tendance or buy_ct:
+            if trader.is_valid_reaction_candle(last_candle, 'buy'):
+                reintegration_ok = last_candle['close'] > contact_candle['bb20_lo']
+                if buy_ct: reintegration_ok = reintegration_ok and last_candle['close'] > contact_candle['bb80_lo']
+                if reintegration_ok:
+                    regime = "Tendance" if buy_tendance else "Contre-tendance"
+                    entry = (last_candle['open'] + last_candle['close']) / 2
+                    sl = contact_candle['low'] - (contact_candle['atr'] * 0.25)
+                    tp = last_candle['bb80_up'] if regime == 'Tendance' else last_candle['bb20_up']
+                    rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
+                    if rr >= MIN_RR: signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+
+        # Vente
+        sell_tendance = is_downtrend and contact_candle['high'] >= contact_candle['bb20_up']
+        sell_ct = (contact_candle['high'] >= contact_candle['bb20_up'] and contact_candle['high'] >= contact_candle['bb80_up'])
+
+        if not signal and (sell_tendance or sell_ct):
+            if trader.is_valid_reaction_candle(last_candle, 'sell'):
+                reintegration_ok = last_candle['close'] < contact_candle['bb20_up']
+                if sell_ct: reintegration_ok = reintegration_ok and last_candle['close'] < contact_candle['bb80_up']
+                if reintegration_ok:
+                    regime = "Tendance" if sell_tendance else "Contre-tendance"
+                    entry = (last_candle['open'] + last_candle['close']) / 2
+                    sl = contact_candle['high'] + (contact_candle['atr'] * 0.25)
+                    tp = last_candle['bb80_lo'] if regime == 'Tendance' else last_candle['bb20_lo']
+                    rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
+                    if rr >= MIN_RR: signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+
+        if signal:
+            signal['bb20_mid'] = last_candle['bb20_mid']
+            return signal
+    return None
 
 def process_callback_query(callback_query: Dict):
     global _paused; data = callback_query.get('data', '')
@@ -169,8 +200,8 @@ def process_callback_query(callback_query: Dict):
         except (ValueError, IndexError): notifier.tg_send("Commande de fermeture invalide.")
     elif data == 'get_stats':
         ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
-        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
+        trades = database.get_all_closed_trades()
+        notifier.send_report("📊 Bilan des Performances", trades, balance)
     elif data == 'manage_strategy':
         current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper()); notifier.send_strategy_menu(current_strategy)
     elif data == 'switch_to_NORMAL': database.set_setting('STRATEGY_MODE', 'NORMAL'); notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>."); notifier.send_strategy_menu('NORMAL')
@@ -182,7 +213,11 @@ def process_callback_query(callback_query: Dict):
 def process_message(message: Dict):
     global _paused; text = message.get("text", "").strip().lower(); parts = text.split(); command = parts[0]
     if command == "/start":
-        help_message = ("🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n📈 <b>TRADING</b>\n/signals\n/recent\n/stats\n/pos")
+        help_message = (
+            "🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
+            "⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n"
+            "📈 <b>TRADING & ANALYSE</b>\n/signals\n/recent\n/stats\n/pos\n/history"
+        )
         notifier.tg_send(help_message); notifier.send_main_menu(_paused)
     elif command == "/pause":
         with _lock: _paused = True
@@ -201,8 +236,8 @@ def process_message(message: Dict):
     elif command == "/recent": notifier.tg_send(get_recent_signals_message(6))
     elif command == "/stats":
         ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
-        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+        trades = database.get_all_closed_trades()
+        notifier.send_report("📊 Bilan des Performances (DB)", trades, balance)
     elif command == "/pos":
         ex = create_exchange()
         try:
@@ -212,6 +247,37 @@ def process_message(message: Dict):
         except Exception as e:
             notifier.tg_send(f"❌ Erreur de synchro /pos: {e}")
             notifier.format_open_positions(database.get_open_positions())
+    elif command == "/history":
+        notifier.tg_send("🔍 Recherche de l'historique des trades sur Bitget...")
+        try:
+            ex = create_exchange()
+            since = int((time.time() - 7 * 24 * 60 * 60) * 1000)
+            trades = ex.fetch_my_trades(params={'startTime': since})
+            if not trades:
+                notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
+                return
+            
+            orders = {}
+            for trade in trades:
+                order_id = trade['order']
+                if order_id not in orders: orders[order_id] = {'symbol': trade['symbol'], 'side': trade['side'], 'cost': 0, 'amount': 0, 'pnl': 0, 'timestamp': trade['timestamp']}
+                orders[order_id]['cost'] += trade['cost']
+                orders[order_id]['amount'] += trade['amount']
+                orders[order_id]['pnl'] += float(trade['info'].get('realizedPnl', 0))
+
+            headers = ["Date", "Paire", "Sens", "Taille", "PNL ($)"]
+            table_data = []
+            for order_id, data in sorted(orders.items(), key=lambda item: item[1]['timestamp']):
+                dt_object = datetime.fromtimestamp(data['timestamp'] / 1000)
+                date_str = dt_object.strftime('%d/%m %H:%M')
+                side_icon = "📈" if data['side'] == 'buy' else "📉"
+                pnl_str = f"{data['pnl']:.2f}"
+                table_data.append([date_str, data['symbol'], side_icon, f"{data['cost']:.2f}", pnl_str])
+            
+            table = tabulate(table_data[-15:], headers=headers, tablefmt="simple")
+            notifier.tg_send(f"<b>📈 Historique des Trades (Bitget 7j)</b>\n<pre>{table}</pre>")
+        except Exception as e:
+            notifier.tg_send_error("Historique Bitget", e)
     elif command == "/setuniverse":
         if len(parts) < 2: notifier.tg_send("Usage: <code>/setuniverse &lt;nombre&gt;</code>"); return
         try:
@@ -242,11 +308,11 @@ def check_scheduled_reports():
     now = datetime.now(tz)
     if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
         _last_daily_report_day = now.day; ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 24 * 60 * 60)
+        trades = database.get_all_closed_trades()
         notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
     if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
         _last_weekly_report_day = now.day; ex = create_exchange(); balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
+        trades = database.get_all_closed_trades()
         notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
 
 def telegram_listener_loop():
