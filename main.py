@@ -10,12 +10,14 @@ from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
+from tabulate import tabulate
 
 import database
 import trader
 import notifier
 import utils
 import state
+import analysis
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
@@ -25,16 +27,8 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT PARTAGÉES ET SÉCURISÉES ---
-_last_update_id: Optional[int] = None
-_paused = False
-_last_daily_report_day = -1
-_last_weekly_report_day = -1
-_recent_signals: List[Dict] = []
-_lock = threading.Lock()
-
-# ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS
-# ==============================================================================
+_last_update_id: Optional[int] = None; _paused = False; _last_daily_report_day, _last_weekly_report_day = -1, -1
+_recent_signals: List[Dict] = []; _lock = threading.Lock()
 
 def startup_checks():
     """Vérifie la présence des variables d'environnement critiques au démarrage."""
