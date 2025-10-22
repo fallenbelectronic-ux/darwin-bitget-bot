@@ -43,6 +43,8 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
         f"{status_text}"
     )
     
+    # Si c'est un rejet ('control_only'), on envoie sur le canal principal.
+    # Sinon (succès), on envoie sur le canal d'alertes.
     target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
     tg_send(message, chat_id=target_chat_id)
 
