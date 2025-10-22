@@ -10,7 +10,6 @@ from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
-from tabulate import tabulate
 
 import database
 import trader
@@ -49,6 +48,29 @@ def startup_checks():
             error_msg = f"❌ ERREUR DE DÉMARRAGE: La variable '{key}' est manquante."
             print(error_msg); notifier.tg_send(error_msg); sys.exit(1)
     print("✅ Configurations nécessaires présentes.")
+
+def sync_positions_on_startup(ex: ccxt.Exchange):
+    """Compare les positions de l'exchange avec la DB locale au démarrage."""
+    print("Synchronisation des positions au démarrage...")
+    try:
+        exchange_positions = ex.fetch_positions()
+        open_exchange_symbols = {p['info']['symbol'] for p in exchange_positions if p.get('contracts') and float(p['contracts']) > 0}
+        
+        db_positions = database.get_open_positions()
+        open_db_symbols = {p['symbol'].replace('/', '') for p in db_positions}
+        
+        ghost_symbols = open_exchange_symbols - open_db_symbols
+        
+        if ghost_symbols:
+            message = "⚠️ <b>Positions Fantômes Détectées !</b>\nCes positions sont ouvertes sur l'exchange mais inconnues du bot :\n\n"
+            for symbol in ghost_symbols:
+                message += f"- <code>{symbol}</code>\n"
+            notifier.tg_send(message)
+        
+        print(f"Synchronisation terminée. {len(ghost_symbols)} position(s) fantôme(s) trouvée(s).")
+    except Exception as e:
+        print(f"Erreur durant la synchronisation des positions: {e}")
+        notifier.tg_send_error("Synchronisation Positions", e)
 
 def cleanup_recent_signals(hours: int = 6):
     global _recent_signals
@@ -125,57 +147,6 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     print(f"   -> MEILLEUR SIGNAL SÉLECTIONNÉ: {symbol} avec un R/R de {best_signal_data['signal']['rr']:.2f}")
 
     trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
-
-def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    if df is None or len(df) < 83: return None
-    df_with_indicators = trader._get_indicators(df.copy())
-    if df_with_indicators is None: return None
-    
-    last_candle = df_with_indicators.iloc[-1]
-    
-    for i in range(2, 4):
-        contact_candle = df_with_indicators.iloc[-i]
-        signal = None
-        
-        is_uptrend = contact_candle['close'] > contact_candle['bb80_mid']
-        is_downtrend = contact_candle['close'] < contact_candle['bb80_mid']
-
-        # Achat
-        buy_tendance = is_uptrend and contact_candle['low'] <= contact_candle['bb20_lo']
-        buy_ct = (contact_candle['low'] <= contact_candle['bb20_lo'] and contact_candle['low'] <= contact_candle['bb80_lo'])
-        
-        if buy_tendance or buy_ct:
-            if trader.is_valid_reaction_candle(last_candle, 'buy'):
-                reintegration_ok = last_candle['close'] > contact_candle['bb20_lo']
-                if buy_ct: reintegration_ok = reintegration_ok and last_candle['close'] > contact_candle['bb80_lo']
-                if reintegration_ok:
-                    regime = "Tendance" if buy_tendance else "Contre-tendance"
-                    entry = (last_candle['open'] + last_candle['close']) / 2
-                    sl = contact_candle['low'] - (contact_candle['atr'] * 0.25)
-                    tp = last_candle['bb80_up'] if regime == 'Tendance' else last_candle['bb20_up']
-                    rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
-                    if rr >= MIN_RR: signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-
-        # Vente
-        sell_tendance = is_downtrend and contact_candle['high'] >= contact_candle['bb20_up']
-        sell_ct = (contact_candle['high'] >= contact_candle['bb20_up'] and contact_candle['high'] >= contact_candle['bb80_up'])
-
-        if not signal and (sell_tendance or sell_ct):
-            if trader.is_valid_reaction_candle(last_candle, 'sell'):
-                reintegration_ok = last_candle['close'] < contact_candle['bb20_up']
-                if sell_ct: reintegration_ok = reintegration_ok and last_candle['close'] < contact_candle['bb80_up']
-                if reintegration_ok:
-                    regime = "Tendance" if sell_tendance else "Contre-tendance"
-                    entry = (last_candle['open'] + last_candle['close']) / 2
-                    sl = contact_candle['high'] + (contact_candle['atr'] * 0.25)
-                    tp = last_candle['bb80_lo'] if regime == 'Tendance' else last_candle['bb20_lo']
-                    rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
-                    if rr >= MIN_RR: signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
-
-        if signal:
-            signal['bb20_mid'] = last_candle['bb20_mid']
-            return signal
-    return None
 
 def process_callback_query(callback_query: Dict):
     global _paused; data = callback_query.get('data', '')
