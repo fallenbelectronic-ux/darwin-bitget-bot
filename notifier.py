@@ -17,12 +17,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
     """Envoie un message texte. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
-    if not TG_TOKEN or not target_chat_id:
-        return
+    if not TG_TOKEN or not target_chat_id: return
     try:
         payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
+        if reply_markup: payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
