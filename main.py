@@ -1,11 +1,11 @@
 # Fichier: main.py
 import os
+import sys
 import time
 import ccxt
 import pandas as pd
 import traceback
 import threading
-from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
@@ -20,28 +20,20 @@ import analysis
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
-API_KEY, API_SECRET, PASSPHRASSE = os.getenv("BITGET_API_KEY", ""), os.getenv("BITGET_API_SECRET", ""), os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASE", "")
+API_KEY, API_SECRET, PASSPHRASSE = os.getenv("BITGET_API_KEY", ""), os.getenv("BITGET_API_SECRET", ""), os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
 TIMEFRAME, UNIVERSE_SIZE, MIN_RR = os.getenv("TIMEFRAME", "1h"), int(os.getenv("UNIVERSE_SIZE", "30")), float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY, TIMEZONE, REPORT_HOUR, REPORT_WEEKDAY = int(os.getenv("LOOP_DELAY", "5")), os.getenv("TIMEZONE", "Europe/Lisbon"), int(os.getenv("REPORT_HOUR", "21")), int(os.getenv("REPORT_WEEKDAY", "6"))
 
 # --- VARIABLES D'ÉTAT PARTAGÉES ET SÉCURISÉES ---
-_last_update_id: Optional[int] = None
-_paused = False
-_last_daily_report_day = -1
-_last_weekly_report_day = -1
-_recent_signals: List[Dict] = []
-_lock = threading.Lock()
-
-# ==============================================================================
-# DÉFINITION DE TOUTES LES FONCTIONS
-# ==============================================================================
+_last_update_id: Optional[int] = None; _paused = False; _last_daily_report_day, _last_weekly_report_day = -1, -1
+_recent_signals: List[Dict] = []; _lock = threading.Lock()
 
 def startup_checks():
     """Vérifie la présence des variables d'environnement critiques au démarrage."""
     print("Vérification des configurations au démarrage...")
     required = {'BITGET_API_KEY', 'BITGET_API_SECRET'}
-    if not os.getenv('BITGET_PASSPHRASE') and not os.getenv('BITGET_API_PASSWORD'):
+    if not os.getenv('BITGET_PASSPHRASSE') and not os.getenv('BITGET_API_PASSWORD'):
         error_msg = "❌ ERREUR DE DÉMARRAGE: La variable 'BITGET_PASSPHRASSE' ou 'BITGET_API_PASSWORD' est manquante."
         print(error_msg); notifier.tg_send(error_msg); sys.exit(1)
     for key in required:
@@ -122,7 +114,7 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         if df_with_indicators is None: continue
         
         last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
-        new_tp_price = last_indicators['bb80_mid'] if is_long and pending['signal']['regime'] == 'Tendance' else \
+        new_tp_price = last_indicators['bb80_up'] if is_long and pending['signal']['regime'] == 'Tendance' else \
                        last_indicators['bb80_lo'] if not is_long and pending['signal']['regime'] == 'Tendance' else \
                        last_indicators['bb20_up'] if is_long and pending['signal']['regime'] == 'Contre-tendance' else \
                        last_indicators['bb20_lo']
@@ -185,9 +177,11 @@ def process_callback_query(callback_query: Dict):
 def process_message(message: Dict):
     global _paused; text = message.get("text", "").strip().lower(); parts = text.split(); command = parts[0]
     if command == "/start":
-        help_message = ("🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
+        help_message = (
+            "🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
             "⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n"
-            "📈 <b>TRADING & ANALYSE</b>\n/signals\n/recent\n/stats\n/pos\n/history")
+            "📈 <b>TRADING & ANALYSE</b>\n/signals\n/recent\n/stats\n/pos\n/history"
+        )
         notifier.tg_send(help_message); notifier.send_main_menu(_paused)
     elif command == "/pause":
         with _lock: _paused = True
@@ -217,6 +211,37 @@ def process_message(message: Dict):
         except Exception as e:
             notifier.tg_send(f"❌ Erreur de synchro /pos: {e}")
             notifier.format_open_positions(database.get_open_positions())
+    elif command == "/history":
+        notifier.tg_send("🔍 Recherche de l'historique des trades sur Bitget...")
+        try:
+            ex = create_exchange()
+            since = int((time.time() - 7 * 24 * 60 * 60) * 1000)
+            trades = ex.fetch_my_trades(params={'startTime': since})
+            if not trades:
+                notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
+                return
+            
+            orders = {}
+            for trade in trades:
+                order_id = trade['order']
+                if order_id not in orders: orders[order_id] = {'symbol': trade['symbol'], 'side': trade['side'], 'cost': 0, 'amount': 0, 'pnl': 0, 'timestamp': trade['timestamp']}
+                orders[order_id]['cost'] += trade['cost']
+                orders[order_id]['amount'] += trade['amount']
+                orders[order_id]['pnl'] += float(trade['info'].get('realizedPnl', 0))
+
+            headers = ["Date", "Paire", "Sens", "Taille", "PNL ($)"]
+            table_data = []
+            for order_id, data in sorted(orders.items(), key=lambda item: item[1]['timestamp']):
+                dt_object = datetime.fromtimestamp(data['timestamp'] / 1000)
+                date_str = dt_object.strftime('%d/%m %H:%M')
+                side_icon = "📈" if data['side'] == 'buy' else "📉"
+                pnl_str = f"{data['pnl']:.2f}"
+                table_data.append([date_str, data['symbol'], side_icon, f"{data['cost']:.2f}", pnl_str])
+            
+            table = tabulate(table_data[-15:], headers=headers, tablefmt="simple")
+            notifier.tg_send(f"<b>📈 Historique des Trades (Bitget 7j)</b>\n<pre>{table}</pre>")
+        except Exception as e:
+            notifier.tg_send_error("Historique Bitget", e)
     elif command == "/setuniverse":
         if len(parts) < 2: notifier.tg_send("Usage: <code>/setuniverse &lt;nombre&gt;</code>"); return
         try:
@@ -285,7 +310,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             print(f"4. Début du scan de l'univers ({len(universe)} paires)...")
             for symbol in universe:
                 df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
-                if df is None or len(df) < 81: continue
+                if df is None or len(df) < 83: continue
                 
                 signal = trader.detect_signal(symbol, df)
                 if signal:
@@ -332,3 +357,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
