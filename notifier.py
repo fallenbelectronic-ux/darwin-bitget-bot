@@ -163,7 +163,9 @@ def send_config_message(config: Dict):
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
     stats = reporting.calculate_performance_stats(trades)
     message = reporting.format_report_message(title, stats, balance)
-    tg_send(message)   tg_send("\n".join(lines), reply_markup=get_positions_keyboard(positions))
+    tg_send(message)   tg_send("\n".join(lines)
+    keyboard = get_positions_keyboard(positions)
+    tg_send(message, reply_markup=keyboard)
 
 def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
     """Formate et envoie un rapport complet des positions ouvertes, synchronisé avec l'exchange."""
