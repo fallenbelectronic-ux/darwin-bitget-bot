@@ -49,6 +49,40 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
     # On envoie ce message spécifiquement sur le canal d'alertes
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
 
+
+def send_confirmed_signal_notification(symbol: str, signal: Dict[str, Any]):
+    """Informe Telegram qu'un signal en attente vient d'être confirmé."""
+
+    if not signal:
+        return
+
+    side = signal.get('side', '').lower()
+    side_icon = "📈" if side == 'buy' else "📉"
+    side_text = "LONG" if side == 'buy' else "SHORT"
+
+    entry = signal.get('entry')
+    sl = signal.get('sl')
+    tp = signal.get('tp')
+    rr = signal.get('rr')
+    regime = signal.get('regime', 'Inconnu')
+
+    def fmt_price(value: Optional[float]) -> str:
+        return "N/A" if value is None else f"{value:.5f}"
+
+    message = (
+        f"✅ <b>Signal Confirmé</b> {side_icon} {side_text}\n\n"
+        f"Paire: <code>{html.escape(symbol)}</code>\n"
+        f"Type: <b>{html.escape(regime)}</b>\n\n"
+        f"Entrée: <code>{fmt_price(entry)}</code>\n"
+        f"SL: <code>{fmt_price(sl)}</code>\n"
+        f"TP: <code>{fmt_price(tp)}</code>\n"
+    )
+
+    if rr is not None:
+        message += f"RR Actualisé: <b>x{rr:.2f}</b>"
+
+    tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
+
 def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional[str] = None):
     """Envoie un message avec photo. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
@@ -193,7 +227,21 @@ def tg_send_error(title: str, error: Any):
     error_text = str(error)
     tg_send(f"❌ <b>Erreur: {html.escape(title)}</b>\n<code>{html.escape(error_text)}</code>")
 
-def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-    stats = reporting.get_report_stats(trades)
+def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float], days: Optional[int] = None):
+    filtered_trades = trades
+
+    if days is not None and days > 0:
+        cutoff = time.time() - days * 24 * 60 * 60
+        filtered_trades = []
+        for trade in trades:
+            close_ts = trade.get('close_timestamp') or 0
+            open_ts = trade.get('open_timestamp') or 0
+            trade_ts = close_ts or open_ts
+            if trade_ts >= cutoff:
+                filtered_trades.append(trade)
+
+    stats = reporting.get_report_stats(filtered_trades)
     message = reporting.format_report_message(title, stats, balance)
+    if days is not None and days > 0 and stats.get('total_trades', 0) == 0:
+        message += f"\n\n<i>Aucun trade sur les {days} derniers jours.</i>"
     tg_send(message)
