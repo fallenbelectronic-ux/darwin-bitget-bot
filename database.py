@@ -48,6 +48,7 @@ def create_trade(symbol: str, side: str, regime: str, entry_price: float, sl_pri
     conn.close()
 
 def close_trade(trade_id: int, status: str, exit_price: float):
+    import trader
     """Met à jour un trade comme étant fermé et calcule le PNL."""
     conn = get_db_connection()
     trade = get_trade_by_id(trade_id)
