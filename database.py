@@ -1,6 +1,6 @@
 # Fichier: database.py
 import sqlite3, time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 DB_FILE = 'darwin_bot.db'
 
