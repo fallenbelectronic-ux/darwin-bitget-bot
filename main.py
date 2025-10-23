@@ -128,24 +128,38 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     trader.execute_trade(ex, best['symbol'], best['signal'], best['df'], best['signal']['entry'])
 
 def process_callback_query(callback_query: Dict):
-    """Gère les clics sur les boutons."""
+    """Gère les clics sur les boutons interactifs."""
     global _paused
     data = callback_query.get('data', '')
-    
+
     if data == 'pause':
         with _lock: _paused = True
-        notifier.tg_send("⏸️ Scan mis en pause.")
+        notifier.tg_send("⏸️ Bot mis en pause.")
     elif data == 'resume':
         with _lock: _paused = False
-        notifier.tg_send("▶️ Reprise du scan.")
+        notifier.tg_send("▶️ Bot relancé.")
+    elif data == 'ping':
+        notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
     elif data == 'list_positions':
         notifier.format_open_positions(database.get_open_positions())
-    elif data == 'get_recent_signals':
-        notifier.tg_send(get_recent_signals_message(6))
     elif data == 'get_stats':
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 3600)
-        bal = trader.get_usdt_balance(create_exchange())
-        notifier.send_report("📊 Bilan 7 jours", trades, bal)
+        balance = trader.get_usdt_balance(create_exchange())
+        trades = database.get_closed_trades_since(int(time.time()) - 7*24*3600)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+    elif data == 'menu_config':
+        notifier.send_config_menu()
+    elif data == 'show_config':
+        max_pos = database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+        config = { "RR Min": MIN_RR, "Risque/Trade": f"{trader.RISK_PER_TRADE_PERCENT}%", "Positions Max": max_pos, "Levier": trader.LEVERAGE }
+        notifier.send_config_message(config)
+    elif data == 'menu_signals':
+        notifier.send_signals_menu()
+    elif data == 'signals_1h':
+        notifier.tg_send(get_recent_signals_message(1))
+    elif data == 'signals_6h':
+        notifier.tg_send(get_recent_signals_message(6))
+    elif data == 'main_menu':
+        notifier.send_main_menu(_paused)
     elif data.startswith('close_trade_'):
         try:
             tid = int(data.split('_')[-1])
@@ -161,11 +175,32 @@ def process_callback_query(callback_query: Dict):
         notifier.send_strategy_menu(new_strat)
 
 def process_message(message: Dict):
-    """Gère les commandes textuelles."""
-    text = message.get("text", "").strip().lower().split()
-    cmd = text[0] if text else ""
-    
-    if cmd == "/start": notifier.send_main_menu(_paused)
+    """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
+    global _paused
+    text = message.get("text", "").strip().lower()
+    parts = text.split()
+    command = parts[0] if parts else ""
+
+    if command == "/start":
+        notifier.send_main_menu(_paused)
+    elif command.startswith("/set"):
+        # Garde les commandes /set en textuel car elles prennent un argument
+        if command == "/setuniverse" and len(parts) > 1:
+            try:
+                size = int(parts[1])
+                if size > 0:
+                    database.set_setting('UNIVERSE_SIZE', size)
+                    notifier.tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (appliqué au redémarrage).")
+                else: notifier.tg_send("❌ Le nombre doit être > 0.")
+            except ValueError: notifier.tg_send("❌ Valeur invalide.")
+        elif command == "/setmaxpos" and len(parts) > 1:
+            try:
+                max_p = int(parts[1])
+                if max_p >= 0:
+                    database.set_setting('MAX_OPEN_POSITIONS', max_p)
+                    notifier.tg_send(f"✅ Positions max mises à <b>{max_p}</b>.")
+                else: notifier.tg_send("❌ Le nombre doit être >= 0.")
+            except ValueError: notifier.tg_send("❌ Valeur invalide.")
     elif cmd == "/pos": notifier.format_open_positions(database.get_open_positions())
     elif cmd == "/stats": 
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 3600)
