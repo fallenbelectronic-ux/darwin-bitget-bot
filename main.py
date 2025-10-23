@@ -1,5 +1,5 @@
 # Fichier: main.py
-
+# -*- coding: utf-8 -*-
  import os
  import sys
  import time
@@ -50,7 +50,30 @@ if not hasattr(trader, 'detect_signal'):
  _last_weekly_report_day = -1
  _recent_signals: List[Dict] = []
  _lock = threading.Lock()
- 
+
+def select_and_execute_best_pending_signal(ex: ccxt.Exchange, pending_signals: List[Dict[str, Any]]):
+    """
+    Parmi une liste de signaux potentiels, sélectionne le meilleur (plus haut RR) et l'exécute.
+    """
+    if not pending_signals:
+        print("Aucun signal valide trouvé dans ce cycle de scan.")
+        return
+
+    # Trie les signaux par RR décroissant
+    pending_signals.sort(key=lambda item: item['signal']['rr'], reverse=True)
+    
+    # Le meilleur signal est le premier de la liste
+    best_signal_item = pending_signals[0]
+    symbol = best_signal_item['symbol']
+    signal = best_signal_item['signal']
+    df = best_signal_item['df']
+    
+    # Notifier quel signal a été choisi
+    notifier.send_confirmed_signal_notification(symbol, signal, len(pending_signals))
+    
+    # Exécuter le trade
+    trader.execute_trade(ex, symbol, signal, df)
+
  def startup_checks():
      """Vérifie la présence des variables d'environnement critiques au démarrage."""
      print("Vérification des configurations au démarrage...")
