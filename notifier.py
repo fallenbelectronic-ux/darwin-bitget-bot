@@ -83,6 +83,19 @@ def send_confirmed_signal_notification(symbol: str, signal: Dict[str, Any]):
 
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
 
+def send_confirmed_signal_notification(symbol: str, signal: Dict[str, Any], total_found: int):
+    """
+    Notifie l'utilisateur que le bot a choisi le meilleur signal parmi plusieurs.
+    """
+    message = (
+        f"🎯 **Signal Sélectionné**\n\n"
+        f"Parmi <code>{total_found}</code> opportunités détectées, le signal avec le plus haut RR a été choisi pour exécution :\n\n"
+        f" paire: <b>{_escape(symbol)}</b>\n"
+        f" Côté: <b>{signal['side'].upper()}</b>\n"
+        f" RR: <b>x{signal['rr']:.2f}</b>"
+    )
+    tg_send(message)
+
 def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional[str] = None):
     """Envoie un message avec photo. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
