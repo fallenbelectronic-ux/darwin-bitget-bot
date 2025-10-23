@@ -193,7 +193,7 @@ def tg_send_error(title: str, error: Any):
     error_text = str(error)
     tg_send(f"❌ <b>Erreur: {html.escape(title)}</b>\n<code>{html.escape(error_text)}</code>")
 
-def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-    stats = reporting.get_report_stats(trades)
+def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float], days: int = 7):
+    stats = reporting.get_report_stats(trades, days)
     message = reporting.format_report_message(title, stats, balance)
     tg_send(message)
