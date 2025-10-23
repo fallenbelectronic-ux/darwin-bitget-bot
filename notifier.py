@@ -197,3 +197,37 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
     stats = reporting.get_report_stats(trades)
     message = reporting.format_report_message(title, stats, balance)
     tg_send(message)
+diff --git a/notifier.py b/notifier.py
+index 3b77d06cbe2def0cdf8a8537c385e09b7e6c8e44..5d58284b61799c8128bb9eaef397714818dd59a1 100644
+--- a/notifier.py
++++ b/notifier.py
+@@ -171,29 +171,29 @@ def format_synced_open_positions(exchange_positions: List[Dict], db_positions: L
+     lines = ["<b>📊 Positions Ouvertes (Synchronisé)</b>\n"]
+     
+     if synced_symbols:
+         lines.append("--- POSITIONS SYNCHRONISÉES ---")
+         synced_db_pos = [p for p in db_positions if p['symbol'].replace('/', '') in synced_symbols]
+         for pos in synced_db_pos:
+             side_icon = "📈" if pos.get('side') == 'buy' else "📉"
+             lines.append(f"<b>{pos.get('id')}. {side_icon} {html.escape(pos.get('symbol', 'N/A'))}</b>")
+     
+     if ghost_symbols:
+         lines.append("\n⚠️ <b>Positions FANTÔMES</b> (sur l'exchange, pas dans la DB):")
+         for symbol in ghost_symbols:
+             lines.append(f"- <code>{symbol}</code>")
+     
+     if zombie_symbols:
+         lines.append("\n🔍 <b>Positions DÉSYNCHRONISÉES</b> (dans la DB, pas sur l'exchange):")
+         for symbol in zombie_symbols:
+             lines.append(f"- <code>{symbol.replace('USDT', '/USDT')}</code>")
+ 
+     tg_send("\n".join(lines), reply_markup=get_positions_keyboard(db_positions))
+ 
+ def tg_send_error(title: str, error: Any):
+     error_text = str(error)
+     tg_send(f"❌ <b>Erreur: {html.escape(title)}</b>\n<code>{html.escape(error_text)}</code>")
+ 
++def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float], days: int = 7):
++    stats = reporting.get_report_stats(trades, days)
+     message = reporting.format_report_message(title, stats, balance)
+     tg_send(message)
