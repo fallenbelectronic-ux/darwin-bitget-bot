@@ -6,6 +6,8 @@ import ccxt
 import pandas as pd
 import traceback
 import threading
+import importlib.util
+from pathlib import Path
 from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
@@ -18,6 +20,20 @@ import notifier
 import utils
 import state
 import analysis
+
+# S'assure que le module trader importé expose bien la fonction detect_signal.
+if not hasattr(trader, 'detect_signal'):
+    trader_path = Path(__file__).resolve().parent / 'trader.py'
+    spec = importlib.util.spec_from_file_location('trader', trader_path)
+    if spec and spec.loader:
+        trader_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trader_module)
+        sys.modules['trader'] = trader_module
+        trader = trader_module
+        if hasattr(database, 'trader'):
+            database.trader = trader_module
+    else:
+        raise ImportError("Impossible de charger le module trader attendu depuis trader.py")
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
