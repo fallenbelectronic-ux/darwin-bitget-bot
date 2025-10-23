@@ -101,87 +101,174 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
     try:
         markets = ex.load_markets()
         symbols = [m['symbol'] for m in markets.values() if m.get('swap') and m.get('quote') == 'USDT' and m.get('linear')]
-        if not symbols:
-            print("Aucun symbole trouvé via l'API, utilisation de la liste de secours.")
-            return FALLBACK_TESTNET
-        return symbols[:UNIVERSE_SIZE]
+        return symbols[:size] if symbols else []
     except Exception as e:
-        print(f"Impossible de construire l'univers via l'API. Utilisation de la liste de secours. Erreur: {e}")
-        return FALLBACK_TESTNET
+        print(f"Impossible de construire l'univers via l'API. Erreur: {e}."); return []
 
-def detect_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """
-    Fonction de détection de signal (placeholder).
-    C'est ici que votre logique de trading (croisement de MM, etc.) doit être implémentée.
-    """
-    # Ajout des indicateurs (Bandes de Bollinger)
-    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
-    df['bb20_up'] = bb_20.bollinger_hband()
-    df['bb20_lo'] = bb_20.bollinger_lband()
-    df['bb20_mid'] = bb_20.bollinger_mavg()
+def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
+    if not state.pending_signals: return
+    print(f"  -> NOUVELLE BOUGIE détectée. Analyse de {len(state.pending_signals)} signaux en attente...")
     
-    # NOTE: Ceci est un exemple de logique. Vous devez le remplacer par votre propre stratégie.
-    # Par exemple, si le dernier prix de clôture croise la bande basse :
-    last_close = df['close'].iloc[-1]
-    last_bb_lo = df['bb20_lo'].iloc[-1]
-    
-    if last_close < last_bb_lo:
-        # Signal d'achat (exemple)
-        entry_price = last_close
-        sl_price = entry_price * 0.98  # Stop Loss 2% plus bas
-        tp_price = entry_price * 1.06  # Take Profit 6% plus haut (RR 3:1)
+    validated_signals = []
+    for symbol, pending in list(state.pending_signals.items()):
+        df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
+        if df is None or df.index[-1] <= pending['candle_timestamp']: continue
+
+        new_entry_price = df['open'].iloc[-1]; sl_price = pending['signal']['sl']
+        df_with_indicators = trader._get_indicators(df.copy())
+        if df_with_indicators is None: continue
         
-        return {
-            "side": "buy",
-            "regime": "Contre-tendance",
-            "entry": entry_price,
-            "sl": sl_price,
-            "tp": tp_price,
-            "rr": 3.0,
-            "bb20_mid": df['bb20_mid'].iloc[-1]
-        }
-    return None
+        last_indicators = df_with_indicators.iloc[-1]; is_long = pending['signal']['side'] == 'buy'
+        new_tp_price = last_indicators['bb80_up'] if is_long and pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb80_lo'] if not is_long and pending['signal']['regime'] == 'Tendance' else \
+                       last_indicators['bb20_up'] if is_long and pending['signal']['regime'] == 'Contre-tendance' else \
+                       last_indicators['bb20_lo']
+        
+        new_rr = (new_tp_price - new_entry_price) / (new_entry_price - sl_price) if is_long and (new_entry_price - sl_price) > 0 else \
+                 (new_entry_price - new_tp_price) / (sl_price - new_entry_price) if not is_long and (sl_price - new_entry_price) > 0 else 0
+
+        if new_rr >= MIN_RR:
+            pending['signal']['tp'] = new_tp_price; pending['signal']['rr'] = new_rr
+            pending['new_entry_price'] = new_entry_price
+            pending['signal']['symbol'] = symbol
+            validated_signals.append(pending)
+            notifier.send_confirmed_signal_notification(symbol, pending['signal'])
+        else:
+            print(f"   -> Signal pour {symbol} invalidé. R/R à l'ouverture ({new_rr:.2f}) < {MIN_RR}.")
+
+    state.pending_signals.clear()
+    if not validated_signals:
+        print("   -> Aucun signal n'a passé la re-validation du R/R."); return
+
+    best_signal_data = sorted(validated_signals, key=lambda x: x['signal']['rr'], reverse=True)[0]
+    symbol = best_signal_data['signal']['symbol']
+    print(f"   -> MEILLEUR SIGNAL SÉLECTIONNÉ: {symbol} avec un R/R de {best_signal_data['signal']['rr']:.2f}")
+
+    trader.execute_trade(ex, symbol, best_signal_data['signal'], best_signal_data['df'], best_signal_data['new_entry_price'])
 
 def process_callback_query(callback_query: Dict):
-    global _paused
-    data = callback_query.get('data', '')
-    
+    global _paused; data = callback_query.get('data', '')
     if data == 'pause':
-        _paused = True
-        notifier.tg_send("⏸️ Bot mis en pause.")
+        with _lock: _paused = True
+        notifier.tg_send("⏸️ Scan mis en pause.")
     elif data == 'resume':
-        _paused = False
-        notifier.tg_send("▶️ Bot relancé.")
-    elif data == 'list_positions':
-        positions = database.get_open_positions()
-        notifier.format_open_positions(positions)
-    elif data.startswith('close_trade_'):
+        with _lock: _paused = False
+        notifier.tg_send("▶️ Reprise du scan.")
+    elif data == 'list_positions': 
+        ex = create_exchange()
         try:
-            trade_id = int(data.split('_')[-1])
-            notifier.tg_send(f"Ordre de fermeture pour le trade #{trade_id} en cours...")
-            trader.close_position_manually(create_exchange(), trade_id)
-        except (ValueError, IndexError):
-            notifier.tg_send("Commande de fermeture invalide.")
+            exchange_positions = ex.fetch_positions()
+            db_positions = database.get_open_positions()
+            notifier.format_synced_open_positions(exchange_positions, db_positions)
+        except Exception as e:
+            notifier.tg_send(f"❌ Erreur de synchro /pos: {e}")
+            notifier.format_open_positions(database.get_open_positions())
+    elif data == 'get_recent_signals': notifier.tg_send(get_recent_signals_message(6))
+    elif data.startswith('close_trade_'):
+        try: trade_id = int(data.split('_')[-1]); trader.close_position_manually(create_exchange(), trade_id)
+        except (ValueError, IndexError): notifier.tg_send("Commande de fermeture invalide.")
+    elif data == 'get_stats':
+        ex = create_exchange(); balance = trader.get_usdt_balance(ex)
+        trades = database.get_all_closed_trades()
+        notifier.send_report("📊 Bilan des Performances", trades, balance)
+    elif data == 'manage_strategy':
+        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper()); notifier.send_strategy_menu(current_strategy)
+    elif data == 'switch_to_NORMAL': database.set_setting('STRATEGY_MODE', 'NORMAL'); notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>."); notifier.send_strategy_menu('NORMAL')
+    elif data == 'switch_to_SPLIT': database.set_setting('STRATEGY_MODE', 'SPLIT'); notifier.tg_send("✅ Stratégie changée en <b>SPLIT</b>."); notifier.send_strategy_menu('SPLIT')
+    elif data == 'switch_to_REAL': database.set_setting('PAPER_TRADING_MODE', 'false'); notifier.tg_send("🚨 <b>ATTENTION:</b> Bot en mode <b>RÉEL</b>."); notifier.send_mode_message(BITGET_TESTNET, False)
+    elif data == 'switch_to_PAPER': database.set_setting('PAPER_TRADING_MODE', 'true'); notifier.tg_send("✅ Bot en mode <b>PAPIER</b>."); notifier.send_mode_message(BITGET_TESTNET, True)
+    elif data == 'back_to_main': notifier.send_main_menu(_paused)
 
 def process_message(message: Dict):
-    """Gère les commandes textuelles de l'utilisateur."""
-    text = message.get("text", "").strip().lower()
-    if text.startswith("/start"):
-        notifier.send_main_menu(_paused)
-    elif text.startswith("/pos"):
-        positions = database.get_open_positions()
-        notifier.format_open_positions(positions)
+    global _paused; text = message.get("text", "").strip().lower(); parts = text.split(); command = parts[0]
+    if command == "/start":
+        help_message = (
+            "🤖 <b>PANNEAU DE CONTRÔLE</b>\n\n🚦 <b>GESTION</b>\n/start\n/pause\n/resume\n/ping\n\n"
+            "⚙️ <b>CONFIG</b>\n/config\n/mode\n/strategy\n/setuniverse <code>&lt;n&gt;</code>\n/setmaxpos <code>&lt;n&gt;</code>\n\n"
+            "📈 <b>TRADING & ANALYSE</b>\n/signals\n/recent\n/stats\n/pos\n/history"
+        )
+        notifier.tg_send(help_message); notifier.send_main_menu(_paused)
+    elif command == "/pause":
+        with _lock: _paused = True
+        notifier.tg_send("⏸️ Scan mis en pause.")
+    elif command == "/resume":
+        with _lock: _paused = False
+        notifier.tg_send("▶️ Reprise du scan.")
+    elif command == "/ping": notifier.tg_send("🛰️ Pong ! Le bot est en ligne.")
+    elif command == "/config":
+        current_max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)); notifier.send_config_message(min_rr=MIN_RR, risk=trader.RISK_PER_TRADE_PERCENT, max_pos=current_max_pos, leverage=trader.LEVERAGE)
+    elif command == "/mode":
+        current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'; notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
+    elif command == "/strategy":
+        current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper()); notifier.send_strategy_menu(current_strategy)
+    elif command == "/signals": notifier.tg_send(get_recent_signals_message(1))
+    elif command == "/recent": notifier.tg_send(get_recent_signals_message(6))
+    elif command == "/stats":
+        ex = create_exchange(); balance = trader.get_usdt_balance(ex)
+        trades = database.get_all_closed_trades()
+        notifier.send_report("📊 Bilan des Performances (DB)", trades, balance)
+    elif command == "/pos":
+        ex = create_exchange()
+        try:
+            exchange_positions = ex.fetch_positions()
+            db_positions = database.get_open_positions()
+            notifier.format_synced_open_positions(exchange_positions, db_positions)
+        except Exception as e:
+            notifier.tg_send(f"❌ Erreur de synchro /pos: {e}")
+            notifier.format_open_positions(database.get_open_positions())
+    elif command == "/history":
+        notifier.tg_send("🔍 Recherche de l'historique des trades sur Bitget...")
+        try:
+            ex = create_exchange()
+            since = int((time.time() - 7 * 24 * 60 * 60) * 1000)
+            trades = ex.fetch_my_trades(params={'startTime': since})
+            if not trades:
+                notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
+                return
+            
+            orders = {}
+            for trade in trades:
+                order_id = trade['order']
+                if order_id not in orders: orders[order_id] = {'symbol': trade['symbol'], 'side': trade['side'], 'cost': 0, 'amount': 0, 'pnl': 0, 'timestamp': trade['timestamp']}
+                orders[order_id]['cost'] += trade['cost']
+                orders[order_id]['amount'] += trade['amount']
+                orders[order_id]['pnl'] += float(trade['info'].get('realizedPnl', 0))
+
+            headers = ["Date", "Paire", "Sens", "Taille", "PNL ($)"]
+            table_data = []
+            for order_id, data in sorted(orders.items(), key=lambda item: item[1]['timestamp']):
+                dt_object = datetime.fromtimestamp(data['timestamp'] / 1000)
+                date_str = dt_object.strftime('%d/%m %H:%M')
+                side_icon = "📈" if data['side'] == 'buy' else "📉"
+                pnl_str = f"{data['pnl']:.2f}"
+                table_data.append([date_str, data['symbol'], side_icon, f"{data['cost']:.2f}", pnl_str])
+            
+            table = tabulate(table_data[-15:], headers=headers, tablefmt="simple")
+            notifier.tg_send(f"<b>📈 Historique des Trades (Bitget 7j)</b>\n<pre>{table}</pre>")
+        except Exception as e:
+            notifier.tg_send_error("Historique Bitget", e)
+    elif command == "/setuniverse":
+        if len(parts) < 2: notifier.tg_send("Usage: <code>/setuniverse &lt;nombre&gt;</code>"); return
+        try:
+            new_size = int(parts[1])
+            if new_size > 0: database.set_setting('UNIVERSE_SIZE', new_size); notifier.tg_send(f"✅ Taille du scan mise à jour à <b>{new_size}</b> paires.\n<i>(Sera appliqué au prochain redémarrage)</i>")
+            else: notifier.tg_send("❌ Le nombre doit être > 0.")
+        except ValueError: notifier.tg_send("❌ Valeur invalide.")
+    elif command == "/setmaxpos":
+        if len(parts) < 2: notifier.tg_send("Usage: <code>/setmaxpos &lt;nombre&gt;</code>"); return
+        try:
+            new_max = int(parts[1])
+            if new_max >= 0: database.set_setting('MAX_OPEN_POSITIONS', new_max); notifier.tg_send(f"✅ Nombre max de positions mis à jour à <b>{new_max}</b>.")
+            else: notifier.tg_send("❌ Le nombre doit être >= 0.")
+        except ValueError: notifier.tg_send("❌ Valeur invalide.")
 
 def poll_telegram_updates():
-    """Récupère et distribue les mises à jour de Telegram."""
     global _last_update_id
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
     for upd in updates:
         _last_update_id = upd.get("update_id", _last_update_id)
-        if 'callback_query' in upd:
-            process_callback_query(upd['callback_query'])
-        elif 'message' in upd:
-            process_message(upd['message'])
+        if 'callback_query' in upd: process_callback_query(upd['callback_query'])
+        elif 'message' in upd: process_message(upd['message'])
 
 def check_scheduled_reports():
     global _last_daily_report_day, _last_weekly_report_day
@@ -205,8 +292,7 @@ def telegram_listener_loop():
             poll_telegram_updates()
             time.sleep(1)
         except Exception as e:
-            print(f"Erreur dans le thread Telegram: {e}")
-            time.sleep(5)
+            print(f"Erreur dans le thread Telegram: {e}"); time.sleep(5)
 
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     """Boucle principale dédiée au trading."""
@@ -276,6 +362,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-Use Arrow Up and Arrow Down to select a turn, Enter to jump to it, and Escape to return to the chat.
-Start typing a prompt
-
