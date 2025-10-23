@@ -146,17 +146,21 @@ def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
         tg_send(f"⚠️ Erreur de graphique\n{caption}", chat_id=target_chat_id)
 
 def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Récupère les mises à jour du bot Telegram."""
     """Récupère les mises à jour de Telegram."""
     params = {"timeout": 1}
-    if offset: params["offset"] = offset
     if offset:
         params["offset"] = offset
     try:
         r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
-        data = r.json()
-        return data.get("result", []) if data.get("ok") else []
-    except Exception: return []
+        # CORRECTION : L'indentation de ce bloc a été validée.
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("ok"):
+                return data.get("result", [])
+    except Exception:
+        # Ignore les erreurs de réseau, le bot réessaiera au prochain cycle.
+        pass
+    return []```
 
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
