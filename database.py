@@ -8,16 +8,6 @@ import trader # Import nécessaire pour utiliser trader.LEVERAGE dans close_trad
 DB_FILE = 'darwin_bot.db'
 
 def get_db_connection():
-    """Crée et retourne une connexion à la base de données."""# Fichier: database.py
-import sqlite3
-import time
-from typing import List, Dict, Any, Optional
-
-import trader
-
-DB_FILE = 'darwin_bot.db'
-
-def get_db_connection():
     """Crée et retourne une connexion à la base de données."""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -295,3 +285,5 @@ def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
