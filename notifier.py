@@ -130,17 +130,19 @@ def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty:
 def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional[str] = None):
     """Envoie un message avec photo. Peut cibler un chat_id spécifique."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
-    """Envoie une photo avec une légende."""
-    target_chat_id = chat_id or TG_CHAT_ID
-    if not target_chat_id: return
-    if not photo_buffer: return tg_send(caption, chat_id=target_chat_id)
+    if not target_chat_id:
+        return
+        
     if not photo_buffer:
         return tg_send(caption, chat_id=target_chat_id)
+        
     try:
         files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
         payload = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
-
-def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
+        requests.post(f"{TELEGRAM_API}/sendPhoto", data=payload, files=files, timeout=20)
+    except Exception as e:
+        # CORRECTION : Un bloc 'except' doit contenir du code.
+        print(f"Erreur d'envoi de photo Telegram: {e}")
         tg_send(f"⚠️ Erreur de graphique\n{caption}", chat_id=target_chat_id)
 
 def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
