@@ -1,113 +1,193 @@
-# Fichier: database.py
-import sqlite3
+# Fichier: trader.py
+import os
 import time
-from typing import List, Dict, Any, Optional
+import ccxt
+import pandas as pd
+from ta.volatility import BollingerBands, AverageTrueRange
+from typing import Dict, Any, Optional, Tuple
 
-import trader
+import database
+import notifier
+import charting
+from utils import fetch_ohlcv_df
 
-DB_FILE = 'darwin_bot.db'
+# --- PARAMÈTRES ---
+RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
+LEVERAGE = int(os.getenv("LEVERAGE", "2"))
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+TP_UPDATE_THRESHOLD_PERCENT = 0.05
+MIN_NOTIONAL_VALUE = 5.0
+MIN_RR = float(os.getenv("MIN_RR", "3.0"))
+ATR_TRAILING_MULTIPLIER = 2.0
 
-def get_db_connection():
-    """Crée et retourne une connexion à la base de données."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def setup_database():
-    """Initialise la DB et crée les tables si elles n'existent pas."""
-    print("Initialisation de la base de données SQLite...")
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL, regime TEXT, status TEXT NOT NULL,
-            entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL,
-            quantity REAL NOT NULL, risk_percent REAL,
-            management_strategy TEXT DEFAULT 'NORMAL', breakeven_status TEXT DEFAULT 'PENDING',
-            pnl REAL DEFAULT 0.0, pnl_percent REAL DEFAULT 0.0,
-            open_timestamp INTEGER NOT NULL, close_timestamp INTEGER,
-            duration_minutes INTEGER, max_drawdown REAL,
-            entry_atr REAL, entry_rsi REAL
-        );
-    ''')
-    cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);')
-    conn.commit()
-    conn.close()
-    print("Base de données prête.")
-
-def create_trade(symbol: str, side: str, regime: str, entry_price: float, sl_price: float, tp_price: float, quantity: float, risk_percent: float, management_strategy: str, entry_atr: float, entry_rsi: float):
-    """Enregistre un nouveau trade dans la DB."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    sql = """
-        INSERT INTO trades (symbol, side, regime, status, entry_price, sl_price, tp_price, quantity, risk_percent, open_timestamp, management_strategy, entry_atr, entry_rsi)
-        VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    cursor.execute(sql, (symbol, side, regime, entry_price, sl_price, tp_price, quantity, risk_percent, int(time.time()), management_strategy, entry_atr, entry_rsi))
-    conn.commit()
-    conn.close()
-
-def close_trade(trade_id: int, status: str, exit_price: float):
-    """Met à jour un trade comme étant fermé et calcule le PNL."""
-    conn = get_db_connection()
-    trade = get_trade_by_id(trade_id)
-    if not trade: return
-
-    pnl = (exit_price - trade['entry_price']) * trade['quantity'] if trade['side'] == 'buy' else (trade['entry_price'] - exit_price) * trade['quantity']
-    pnl_percent = (pnl / (trade['entry_price'] * trade['quantity'])) * 100 * trader.LEVERAGE
-    close_ts = int(time.time())
-    duration = (close_ts - trade['open_timestamp']) // 60
+def _get_indicators(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Calcule et ajoute tous les indicateurs techniques nécessaires."""
+    if df is None or len(df) < 81:
+        return None
     
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET status = ?, pnl = ?, pnl_percent = ?, close_timestamp = ?, duration_minutes = ? WHERE id = ?", (status, pnl, pnl_percent, close_ts, duration, trade_id))
-    conn.commit()
-    conn.close()
+    bb_20 = BollingerBands(close=df['close'], window=20, window_dev=2)
+    df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb_20.bollinger_hband(), bb_20.bollinger_mavg(), bb_20.bollinger_lband()
+    
+    bb_80 = BollingerBands(close=df['close'], window=80, window_dev=2)
+    df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb_80.bollinger_hband(), bb_80.bollinger_mavg(), bb_80.bollinger_lband()
+    
+    df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
+    return df
 
-def get_last_closed_trade() -> Optional[Dict[str, Any]]:
-    """Récupère le dernier trade clôturé de la base de données."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM trades WHERE status != 'OPEN' ORDER BY close_timestamp DESC LIMIT 1")
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row) if row else None
+def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
+    """Vérifie si la bougie de réaction est une bougie de décision valide."""
+    body = abs(candle['close'] - candle['open'])
+    if body == 0: return False
+    
+    wick_high = candle['high'] - max(candle['open'], candle['close'])
+    wick_low = min(candle['open'], candle['close']) - candle['low']
+    total_size = candle['high'] - candle['low']
 
-def get_all_closed_trades() -> List[Dict[str, Any]]:
-    """Récupère tous les trades clôturés, triés par date."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM trades WHERE status != 'OPEN' ORDER BY close_timestamp ASC")
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    if body < total_size * 0.15:
+        return False
 
-def update_trade_sl(trade_id: int, new_sl_price: float):
-    """Met à jour uniquement le prix du Stop Loss pour un trade donné."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET sl_price = ? WHERE id = ?", (new_sl_price, trade_id))
-    conn.commit()
-    conn.close()
+    if side == 'buy':
+        if candle['close'] <= candle['open']: return False
+        if wick_high > body * 2.0: return False
+            
+    if side == 'sell':
+        if candle['close'] >= candle['open']: return False
+        if wick_low > body * 2.0: return False
+            
+    return True
 
-def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
-    """Met à jour un trade après sa mise à breakeven."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET breakeven_status = 'ACTIVATED', quantity = ?, sl_price = ? WHERE id = ?", (remaining_quantity, new_sl, trade_id))
-    conn.commit()
-    conn.close()
+def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
+    """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
+    is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+    max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
+    
+    if len(database.get_open_positions()) >= max_pos: return False, f"Rejeté: Max positions ({max_pos}) atteint."
+    if database.is_position_open(symbol): return False, "Rejeté: Position déjà ouverte (DB)."
+    try:
+        positions = ex.fetch_positions([symbol])
+        if any(p for p in positions if p.get('contracts') and float(p['contracts']) > 0):
+            return False, "Rejeté: Position déjà ouverte (vérifié sur l'exchange)."
+    except Exception as e:
+        return False, f"Rejeté: Erreur de vérification de position ({e})."
 
-def get_setting(key: str, default: Any = None) -> Any:
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("SELECT value FROM settings WHERE key = ?", (key,)); row = cursor.fetchone(); conn.close(); return row['value'] if row else default
-def set_setting(key: str, value: Any):
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value))); conn.commit(); conn.close()
-def is_position_open(symbol: str) -> bool:
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("SELECT 1 FROM trades WHERE symbol = ? AND status = 'OPEN' LIMIT 1", (symbol,)); result = cursor.fetchone(); conn.close(); return result is not None
-def get_open_positions() -> List[Dict[str, Any]]:
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("SELECT * FROM trades WHERE status = 'OPEN'"); rows = cursor.fetchall(); conn.close(); return [dict(row) for row in rows]
-def get_trade_by_id(trade_id: int) -> Optional[Dict[str, Any]]:
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)); row = cursor.fetchone(); conn.close(); return dict(row) if row else None
-def update_trade_tp(trade_id: int, new_tp_price: float):
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("UPDATE trades SET tp_price = ? WHERE id = ?", (new_tp_price, trade_id)); conn.commit(); conn.close()
-def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
-    conn = get_db_connection(); cursor = conn.cursor(); cursor.execute("SELECT * FROM trades WHERE status != 'OPEN' AND close_timestamp >= ?", (timestamp,)); rows = cursor.fetchall(); conn.close(); return [dict(row) for row in rows]
+    balance = get_usdt_balance(ex)
+    if balance is None: return False, "Rejeté: Erreur de solde (Clés API?)."
+    if balance <= 10: return False, f"Rejeté: Solde insuffisant ({balance:.2f} USDT)."
+    
+    quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, signal['sl'])
+    if quantity <= 0: return False, f"Rejeté: Quantité calculée nulle ({quantity})."
+    
+    notional_value = quantity * entry_price
+    if notional_value < MIN_NOTIONAL_VALUE: return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < minimum requis ({MIN_NOTIONAL_VALUE} USDT)."
+    
+    final_entry_price = entry_price
+    if not is_paper_mode:
+        try:
+            ex.set_leverage(LEVERAGE, symbol)
+            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}, 'tradeSide': 'open'}
+            order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
+            
+            time.sleep(3)
+            position = ex.fetch_position(symbol)
+            if not position or float(position.get('stopLossPrice', 0)) == 0:
+                print("🚨 ALERTE SÉCURITÉ : SL non détecté ! Clôture d'urgence.")
+                ex.create_market_order(symbol, 'sell' if signal['side'] == 'buy' else 'buy', quantity, params={'reduceOnly': True})
+                return False, "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
+            
+            if order and 'price' in order and order['price']:
+                final_entry_price = float(order['price'])
+        except Exception as e:
+            notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
+            return False, f"Erreur d'exécution: {e}"
+
+    signal['entry'] = final_entry_price
+    
+    current_strategy_mode = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+    management_strategy = "NORMAL"
+    if current_strategy_mode == 'SPLIT' and signal['regime'] == 'Contre-tendance':
+        management_strategy = "SPLIT"
+        
+    database.create_trade(symbol, signal['side'], signal['regime'], final_entry_price, signal['sl'], signal['tp'], quantity, RISK_PER_TRADE_PERCENT, int(time.time()), signal.get('bb20_mid'), management_strategy)
+    
+    chart_image = charting.generate_trade_chart(symbol, df, signal)
+    mode_text = "PAPIER" if is_paper_mode else "RÉEL"
+    trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
+    notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message, chat_id=notifier.TG_ALERTS_CHAT_ID or notifier.TG_CHAT_ID)
+    
+    return True, "Position ouverte avec succès."
+
+def manage_open_positions(ex: ccxt.Exchange):
+    """Gère les positions ouvertes selon leur stratégie."""
+    is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+    if is_paper_mode: return
+
+    for pos in database.get_open_positions():
+        df = _get_indicators(fetch_ohlcv_df(ex, pos['symbol'], TIMEFRAME))
+        if df is None: continue
+        
+        last_indicators = df.iloc[-1]; is_long = pos['side'] == 'buy'
+
+        if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
+            try:
+                current_price = ex.fetch_ticker(pos['symbol'])['last']
+                management_trigger_price = last_indicators['bb20_mid']
+                if (is_long and current_price >= management_trigger_price) or (not is_long and current_price <= management_trigger_price):
+                    
+                    print(f"Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
+                    qty_to_close, remaining_qty = pos['quantity'] / 2, pos['quantity'] / 2
+                    ex.create_market_order(pos['symbol'], 'sell' if is_long else 'buy', qty_to_close)
+                    
+                    pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
+                    new_sl_be = pos['entry_price']
+                    
+                    params = {'symbol': pos['symbol'], 'stopLossPrice': f"{new_sl_be:.5f}", 'takeProfitPrice': f"{pos['tp_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    
+                    database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
+                    notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
+            except Exception as e:
+                print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
+                notifier.tg_send_error(f"Gestion SPLIT {pos['symbol']}", e)
+        else:
+            new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else \
+                             last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+            if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
+                try:
+                    print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
+                    params = {'symbol': pos['symbol'], 'takeProfitPrice': f"{new_dynamic_tp:.5f}", 'stopLossPrice': f"{pos['sl_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    database.update_trade_tp(pos['id'], new_dynamic_tp)
+                except Exception as e:
+                    print(f"Erreur de mise à jour TP (Dynamique) pour {pos['symbol']}: {e}")
+
+def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
+    """Récupère le solde USDT. Retourne None en cas d'erreur."""
+    try:
+        ex.options['recvWindow'] = 10000
+        balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
+        return float(balance['total'].get('USDT', 0.0))
+    except Exception as e:
+        notifier.tg_send_error("Récupération du solde", e)
+        return None
+
+def calculate_position_size(balance: float, risk_percent: float, entry_price: float, sl_price: float) -> float:
+    """Calcule la quantité d'actifs à trader."""
+    if balance <= 0 or entry_price == sl_price: return 0.0
+    risk_amount_usdt = balance * (risk_percent / 100.0)
+    price_diff_per_unit = abs(entry_price - sl_price)
+    return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
+
+def close_position_manually(ex: ccxt.Exchange, trade_id: int):
+    """Clôture manuellement une position."""
+    is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+    trade = database.get_trade_by_id(trade_id)
+    if not trade or trade.get('status') != 'OPEN':
+        return notifier.tg_send(f"Trade #{trade_id} déjà fermé ou invalide.")
+    try:
+        if not is_paper_mode:
+            ex.create_market_order(trade['symbol'], 'sell' if trade['side'] == 'buy' else 'buy', trade['quantity'], params={'reduceOnly': True})
+        
+        database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
+        notifier.tg_send(f"✅ Position sur {trade['symbol']} (Trade #{trade_id}) fermée manuellement.")
+    except Exception as e:
+        notifier.tg_send_error(f"Fermeture manuelle de {trade['symbol']}", e)
