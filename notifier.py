@@ -5,7 +5,6 @@ import html
 import requests
 import io
 from typing import List, Dict, Any, Optional
-
 import reporting
 
 # --- PARAMÈTRES TELEGRAM ---
