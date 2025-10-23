@@ -124,7 +124,8 @@ def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty:
                f"🛡️ <b>Trade sécurisé à Breakeven.</b>\n"
                f"   - Quantité restante: <code>{remaining_qty:.4f}</code>" )
         tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
-    except Exception as e: print(f"Erreur d'envoi Telegram: {e}")
+ except Exception as e:
+    print(f"Erreur d'envoi Telegram: {e}")
 
 def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional[str] = None):
     """Envoie un message avec photo. Peut cibler un chat_id spécifique."""
