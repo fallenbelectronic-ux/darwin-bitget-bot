@@ -118,8 +118,18 @@ def manage_open_positions(ex: ccxt.Exchange):
                      # ... (Logique de fermeture partielle ici) ...
                      pass
 
-            # Mise à jour dynamique du TP (optionnelle)
-            # ...
+            # Mise à jour dynamique du TP
+              else:
+            new_dynamic_tp = last_indicators['bb80_mid'] if pos['regime'] == 'Tendance' else \
+                             last_indicators['bb20_up'] if is_long else last_indicators['bb20_lo']
+            if new_dynamic_tp and (abs(new_dynamic_tp - pos['tp_price']) / pos['tp_price']) * 100 >= TP_UPDATE_THRESHOLD_PERCENT:
+                try:
+                    print(f"Gestion Dynamique: Mise à jour du TP pour {pos['symbol']} -> {new_dynamic_tp:.5f}")
+                    params = {'symbol': pos['symbol'], 'takeProfitPrice': f"{new_dynamic_tp:.5f}", 'stopLossPrice': f"{pos['sl_price']:.5f}"}
+                    ex.private_post_mix_position_modify_position(params)
+                    database.update_trade_tp(pos['id'], new_dynamic_tp)
+                except Exception as e:
+                    print(f"Erreur de mise à jour TP (Dynamique) pour {pos['symbol']}: {e}")
             
         except Exception as e:
              print(f"Erreur gestion {pos['symbol']}: {e}")
