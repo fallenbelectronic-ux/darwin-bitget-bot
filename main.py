@@ -6,6 +6,8 @@ import ccxt
 import pandas as pd
 import traceback
 import threading
+import importlib.util
+from pathlib import Path
 from ta.volatility import BollingerBands
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
@@ -18,6 +20,20 @@ import notifier
 import utils
 import state
 import analysis
+
+# S'assure que le module trader importé expose bien la fonction detect_signal.
+if not hasattr(trader, 'detect_signal'):
+    trader_path = Path(__file__).resolve().parent / 'trader.py'
+    spec = importlib.util.spec_from_file_location('trader', trader_path)
+    if spec and spec.loader:
+        trader_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trader_module)
+        sys.modules['trader'] = trader_module
+        trader = trader_module
+        if hasattr(database, 'trader'):
+            database.trader = trader_module
+    else:
+        raise ImportError("Impossible de charger le module trader attendu depuis trader.py")
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
@@ -170,7 +186,7 @@ def process_callback_query(callback_query: Dict):
     elif data == 'get_stats':
         ex = create_exchange(); balance = trader.get_usdt_balance(ex)
         trades = database.get_all_closed_trades()
-        notifier.send_report("📊 Bilan des Performances", trades, balance)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
     elif data == 'manage_strategy':
         current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper()); notifier.send_strategy_menu(current_strategy)
     elif data == 'switch_to_NORMAL': database.set_setting('STRATEGY_MODE', 'NORMAL'); notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>."); notifier.send_strategy_menu('NORMAL')
@@ -206,7 +222,7 @@ def process_message(message: Dict):
     elif command == "/stats":
         ex = create_exchange(); balance = trader.get_usdt_balance(ex)
         trades = database.get_all_closed_trades()
-        notifier.send_report("📊 Bilan des Performances (DB)", trades, balance)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
     elif command == "/pos":
         ex = create_exchange()
         try:
