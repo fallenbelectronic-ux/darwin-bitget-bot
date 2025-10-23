@@ -6,8 +6,8 @@
  import pandas as pd
  import traceback
  import threading
-+import importlib.util
-+from pathlib import Path
+ import importlib.util
+ from pathlib import Path
  from ta.volatility import BollingerBands
  from typing import List, Dict, Any, Optional
  from datetime import datetime, timezone
@@ -21,20 +21,20 @@
  import state
  import analysis
  
-+# S'assure que le module trader importé expose bien la fonction detect_signal.
-+if not hasattr(trader, 'detect_signal'):
-+    trader_path = Path(__file__).resolve().parent / 'trader.py'
-+    spec = importlib.util.spec_from_file_location('trader', trader_path)
-+    if spec and spec.loader:
-+        trader_module = importlib.util.module_from_spec(spec)
-+        spec.loader.exec_module(trader_module)
-+        sys.modules['trader'] = trader_module
-+        trader = trader_module
-+        if hasattr(database, 'trader'):
-+            database.trader = trader_module
-+    else:
-+        raise ImportError("Impossible de charger le module trader attendu depuis trader.py")
-+
+# S'assure que le module trader importé expose bien la fonction detect_signal.
+if not hasattr(trader, 'detect_signal'):
+    trader_path = Path(__file__).resolve().parent / 'trader.py'
+    spec = importlib.util.spec_from_file_location('trader', trader_path)
+    if spec and spec.loader:
+        trader_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(trader_module)
+        sys.modules['trader'] = trader_module
+       trader = trader_module
+        if hasattr(database, 'trader'):
+            database.trader = trader_module
+    else:
+        raise ImportError("Impossible de charger le module trader attendu depuis trader.py")
+
  # --- PARAMÈTRES GLOBAUX ---
  BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
  API_KEY, API_SECRET, PASSPHRASSE = os.getenv("BITGET_API_KEY", ""), os.getenv("BITGET_API_SECRET", ""), os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
@@ -86,8 +86,7 @@
      elif data == 'get_stats':
          ex = create_exchange(); balance = trader.get_usdt_balance(ex)
          trades = database.get_all_closed_trades()
--        notifier.send_report("📊 Bilan des Performances", trades, balance)
-+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
      elif data == 'manage_strategy':
          current_strategy = database.get_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper()); notifier.send_strategy_menu(current_strategy)
      elif data == 'switch_to_NORMAL': database.set_setting('STRATEGY_MODE', 'NORMAL'); notifier.tg_send("✅ Stratégie changée en <b>NORMAL</b>."); notifier.send_strategy_menu('NORMAL')
@@ -123,8 +122,7 @@
      elif command == "/stats":
          ex = create_exchange(); balance = trader.get_usdt_balance(ex)
          trades = database.get_all_closed_trades()
--        notifier.send_report("📊 Bilan des Performances (DB)", trades, balance)
-+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
      elif command == "/pos":
          ex = create_exchange()
          try:
@@ -139,109 +137,96 @@
          try:
              ex = create_exchange()
              since = int((time.time() - 7 * 24 * 60 * 60) * 1000)
--            trades = ex.fetch_my_trades(params={'startTime': since})
--            if not trades:
--                notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
-+            ex.load_markets()
-+            available_symbols = set(ex.symbols)
-+
-+            candidate_symbols = []
-+            for source in (database.get_all_closed_trades(), database.get_open_positions()):
-+                for trade in source:
-+                    raw_symbol = trade.get('symbol') if isinstance(trade, dict) else None
-+                    if not raw_symbol:
-+                        continue
-+                    normalized_symbol = raw_symbol
-+                    if normalized_symbol not in available_symbols:
-+                        if ':' not in normalized_symbol and '/' in normalized_symbol:
-+                            alt_symbol = f"{normalized_symbol}:USDT"
-+                            if alt_symbol in available_symbols:
-+                                normalized_symbol = alt_symbol
-+                        elif '/' not in normalized_symbol and normalized_symbol.endswith('USDT'):
-+                            base = normalized_symbol[:-4]
-+                            for candidate in (f"{base}/USDT:USDT", f"{base}/USDT"):
-+                                if candidate in available_symbols:
-+                                    normalized_symbol = candidate
-+                                    break
-+                    if normalized_symbol in available_symbols:
-+                        candidate_symbols.append(normalized_symbol)
-+
-+            if not candidate_symbols:
-+                candidate_symbols = [s for s in available_symbols if s.endswith(':USDT')][:10]
-+
-+            fetched_trades = []
-+            symbol_errors = []
-+            for symbol in sorted(set(candidate_symbols)):
-+                try:
-+                    symbol_trades = ex.fetch_my_trades(symbol, since=since, limit=100)
-+                    fetched_trades.extend(symbol_trades)
-+                except Exception as symbol_error:
-+                    symbol_errors.append(f"{symbol}: {symbol_error}")
-+
-+            if not fetched_trades:
-+                if symbol_errors:
-+                    notifier.tg_send_error("Historique Bitget", "; ".join(symbol_errors))
-+                else:
-+                    notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
-                 return
--            
-+
+            ex.load_markets()
+            available_symbols = set(ex.symbols)
+
+            candidate_symbols = []
+            for source in (database.get_all_closed_trades(), database.get_open_positions()):
+                for trade in source:
+                    raw_symbol = trade.get('symbol') if isinstance(trade, dict) else None
+                    if not raw_symbol:
+                        continue
+                    normalized_symbol = raw_symbol
+                    if normalized_symbol not in available_symbols:
+                        if ':' not in normalized_symbol and '/' in normalized_symbol:
+                            alt_symbol = f"{normalized_symbol}:USDT"
+                            if alt_symbol in available_symbols:
+                                normalized_symbol = alt_symbol
+                        elif '/' not in normalized_symbol and normalized_symbol.endswith('USDT'):
+                            base = normalized_symbol[:-4]
+                            for candidate in (f"{base}/USDT:USDT", f"{base}/USDT"):
+                                if candidate in available_symbols:
+                                    normalized_symbol = candidate
+                                    break
+                    if normalized_symbol in available_symbols:
+                        candidate_symbols.append(normalized_symbol)
+
+            if not candidate_symbols:
+                candidate_symbols = [s for s in available_symbols if s.endswith(':USDT')][:10]
+
+            fetched_trades = []
+            symbol_errors = []
+            for symbol in sorted(set(candidate_symbols)):
+                try:
+                    symbol_trades = ex.fetch_my_trades(symbol, since=since, limit=100)
+                    fetched_trades.extend(symbol_trades)
+                except Exception as symbol_error:
+                    symbol_errors.append(f"{symbol}: {symbol_error}")
+
+            if not fetched_trades:
+                if symbol_errors:
+                    notifier.tg_send_error("Historique Bitget", "; ".join(symbol_errors))
+                else:
+                    notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
+                 return           
+
              orders = {}
--            for trade in trades:
--                order_id = trade['order']
--                if order_id not in orders: orders[order_id] = {'symbol': trade['symbol'], 'side': trade['side'], 'cost': 0, 'amount': 0, 'pnl': 0, 'timestamp': trade['timestamp']}
--                orders[order_id]['cost'] += trade['cost']
--                orders[order_id]['amount'] += trade['amount']
--                orders[order_id]['pnl'] += float(trade['info'].get('realizedPnl', 0))
-+            for trade in fetched_trades:
-+                order_id = trade.get('order') or trade.get('id')
-+                if not order_id:
-+                    continue
-+                if order_id not in orders:
-+                    orders[order_id] = {
-+                        'symbol': trade.get('symbol', 'N/A'),
-+                        'side': trade.get('side', ''),
-+                        'cost': 0.0,
-+                        'amount': 0.0,
-+                        'pnl': 0.0,
-+                        'timestamp': trade.get('timestamp', 0)
-+                    }
-+                orders[order_id]['cost'] += float(trade.get('cost') or 0.0)
-+                orders[order_id]['amount'] += float(trade.get('amount') or 0.0)
-+                info = trade.get('info') or {}
-+                pnl_value = info.get('realizedPnl')
-+                if pnl_value is None:
-+                    pnl_value = info.get('profit')
-+                try:
-+                    orders[order_id]['pnl'] += float(pnl_value or 0.0)
-+                except (TypeError, ValueError):
-+                    orders[order_id]['pnl'] += 0.0
+
+            for trade in fetched_trades:
+                order_id = trade.get('order') or trade.get('id')
+                if not order_id:
+                    continue
+                if order_id not in orders:
+                    orders[order_id] = {
+                        'symbol': trade.get('symbol', 'N/A'),
+                        'side': trade.get('side', ''),
+                        'cost': 0.0,
+                        'amount': 0.0,
+                        'pnl': 0.0,
+                        'timestamp': trade.get('timestamp', 0)
+                    }
+                orders[order_id]['cost'] += float(trade.get('cost') or 0.0)
+                orders[order_id]['amount'] += float(trade.get('amount') or 0.0)
+                info = trade.get('info') or {}
+                pnl_value = info.get('realizedPnl')
+                if pnl_value is None:
+                    pnl_value = info.get('profit')
+                try:
+                    orders[order_id]['pnl'] += float(pnl_value or 0.0)
+                except (TypeError, ValueError):
+                    orders[order_id]['pnl'] += 0.0
  
              headers = ["Date", "Paire", "Sens", "Taille", "PNL ($)"]
--            table_data = []
--            for order_id, data in sorted(orders.items(), key=lambda item: item[1]['timestamp']):
--                dt_object = datetime.fromtimestamp(data['timestamp'] / 1000)
-+            table_rows = []
-+            for _, data in sorted(orders.items(), key=lambda item: item[1]['timestamp']):
-+                timestamp = data['timestamp'] or 0
-+                dt_object = datetime.fromtimestamp(timestamp / 1000) if timestamp else datetime.now()
+
+            table_rows = []
+            for _, data in sorted(orders.items(), key=lambda item: item[1]['timestamp']):
+                timestamp = data['timestamp'] or 0
+                dt_object = datetime.fromtimestamp(timestamp / 1000) if timestamp else datetime.now()
                  date_str = dt_object.strftime('%d/%m %H:%M')
                  side_icon = "📈" if data['side'] == 'buy' else "📉"
                  pnl_str = f"{data['pnl']:.2f}"
--                table_data.append([date_str, data['symbol'], side_icon, f"{data['cost']:.2f}", pnl_str])
--            
--            table = tabulate(table_data[-15:], headers=headers, tablefmt="simple")
-+                table_rows.append([date_str, data['symbol'], side_icon, f"{data['cost']:.2f}", pnl_str])
-+
-+            if not table_rows:
-+                notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
-+                return
-+
-+            table = tabulate(table_rows[-15:], headers=headers, tablefmt="simple")
+
+                table_rows.append([date_str, data['symbol'], side_icon, f"{data['cost']:.2f}", pnl_str])
+
+            if not table_rows:
+                notifier.tg_send("Aucun trade exécuté sur Bitget dans les 7 derniers jours.")
+                return
+
+            table = tabulate(table_rows[-15:], headers=headers, tablefmt="simple")
              notifier.tg_send(f"<b>📈 Historique des Trades (Bitget 7j)</b>\n<pre>{table}</pre>")
-+
-+            if symbol_errors:
-+                notifier.tg_send(f"⚠️ Symboles ignorés: {'; '.join(symbol_errors)}")
+
+            if symbol_errors:
+                notifier.tg_send(f"⚠️ Symboles ignorés: {'; '.join(symbol_errors)}")
          except Exception as e:
              notifier.tg_send_error("Historique Bitget", e)
      elif command == "/setuniverse":
@@ -275,13 +260,11 @@
      if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
          _last_daily_report_day = now.day; ex = create_exchange(); balance = trader.get_usdt_balance(ex)
          trades = database.get_all_closed_trades()
--        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
-+        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance, days=1)
+        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance, days=1)
      if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
          _last_weekly_report_day = now.day; ex = create_exchange(); balance = trader.get_usdt_balance(ex)
          trades = database.get_all_closed_trades()
--        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
-+        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance, days=7)
+        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance, days=7)
  
  def telegram_listener_loop():
      """Boucle dédiée à l'écoute des commandes Telegram."""
