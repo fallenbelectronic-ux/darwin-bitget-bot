@@ -1,8 +1,3 @@
-diff --git a/main.py b/main.py
-index 410e7d6d3995485223fead9912519267e0c1c1dc..a290462695deb1b9fc8cd0c417c8d83691978011 100644
---- a/main.py
-+++ b/main.py
-@@ -1,46 +1,62 @@
  # Fichier: main.py
  import os
  import sys
