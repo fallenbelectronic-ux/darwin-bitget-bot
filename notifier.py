@@ -121,7 +121,7 @@ def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
         f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
         f" Entrée: <code>{signal['entry']:.5f}</code>\n"
         f" SL: <code>{signal['sl']:.5f}</code>\n"
-@@ -171,29 +205,43 @@ def format_synced_open_positions(exchange_positions: List[Dict], db_positions: L
+def format_synced_open_positions(exchange_positions: List[Dict], db_positions: L
     lines = ["<b>📊 Positions Ouvertes (Synchronisé)</b>\n"]
     
     if synced_symbols:
