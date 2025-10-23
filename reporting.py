@@ -69,6 +69,5 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: float) -> 
         ["Ratio de Sharpe (approx.)", f"{stats['sharpe_ratio']:.2f}"],
         ["Drawdown Max", f"{stats['max_drawdown_percent']:.2f}%"]
     ]
-      table = tabulate(table_data, headers=headers, tablefmt="simple")
 
     return f"{header}\n<pre>{table}</pre>"
