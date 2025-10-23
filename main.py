@@ -1,25 +1,25 @@
 # Fichier: main.py
- import os
- import sys
- import time
- import ccxt
- import pandas as pd
- import traceback
- import threading
- import importlib.util
- from pathlib import Path
- from ta.volatility import BollingerBands
- from typing import List, Dict, Any, Optional
- from datetime import datetime, timezone
- import pytz
- from tabulate import tabulate
+import os
+import sys
+import time
+import ccxt
+import pandas as pd
+import traceback
+import threading
+import importlib.util
+from pathlib import Path
+from ta.volatility import BollingerBands
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+import pytz
+from tabulate import tabulate
  
- import database
- import trader
- import notifier
- import utils
- import state
- import analysis
+import database
+import trader
+import notifier
+import utils
+import state
+import analysis
  
 # S'assure que le module trader importé expose bien la fonction detect_signal.
 if not hasattr(trader, 'detect_signal'):
