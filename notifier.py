@@ -139,7 +139,8 @@ def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
     try:
         files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
         payload = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
-@@ -114,99 +52,114 @@ def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
+
+def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional
         tg_send(f"⚠️ Erreur de graphique\n{caption}", chat_id=target_chat_id)
 
 def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
