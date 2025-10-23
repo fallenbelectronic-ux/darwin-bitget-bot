@@ -56,6 +56,65 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
             
     return True
 
+def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Analyse les dernières bougies pour détecter un signal de trading valide."""
+    if df is None or len(df) < 83:
+        return None
+
+    df_with_indicators = _get_indicators(df.copy())
+    if df_with_indicators is None:
+        return None
+
+    last_candle = df_with_indicators.iloc[-1]
+
+    for i in range(2, 4):
+        contact_candle = df_with_indicators.iloc[-i]
+        signal: Optional[Dict[str, Any]] = None
+
+        is_uptrend = contact_candle['close'] > contact_candle['bb80_mid']
+        is_downtrend = contact_candle['close'] < contact_candle['bb80_mid']
+
+        buy_tendance = is_uptrend and contact_candle['low'] <= contact_candle['bb20_lo']
+        buy_ct = contact_candle['low'] <= contact_candle['bb20_lo'] and contact_candle['low'] <= contact_candle['bb80_lo']
+
+        if buy_tendance or buy_ct:
+            if is_valid_reaction_candle(last_candle, 'buy'):
+                reintegration_ok = last_candle['close'] > contact_candle['bb20_lo']
+                if buy_ct:
+                    reintegration_ok = reintegration_ok and last_candle['close'] > contact_candle['bb80_lo']
+                if reintegration_ok:
+                    regime = "Tendance" if buy_tendance else "Contre-tendance"
+                    entry = (last_candle['open'] + last_candle['close']) / 2
+                    sl = contact_candle['low'] - (contact_candle['atr'] * 0.25)
+                    tp = last_candle['bb80_up'] if regime == 'Tendance' else last_candle['bb20_up']
+                    rr = (tp - entry) / (entry - sl) if (entry - sl) > 0 else 0
+                    if rr >= MIN_RR:
+                        signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+
+        sell_tendance = is_downtrend and contact_candle['high'] >= contact_candle['bb20_up']
+        sell_ct = contact_candle['high'] >= contact_candle['bb20_up'] and contact_candle['high'] >= contact_candle['bb80_up']
+
+        if signal is None and (sell_tendance or sell_ct):
+            if is_valid_reaction_candle(last_candle, 'sell'):
+                reintegration_ok = last_candle['close'] < contact_candle['bb20_up']
+                if sell_ct:
+                    reintegration_ok = reintegration_ok and last_candle['close'] < contact_candle['bb80_up']
+                if reintegration_ok:
+                    regime = "Tendance" if sell_tendance else "Contre-tendance"
+                    entry = (last_candle['open'] + last_candle['close']) / 2
+                    sl = contact_candle['high'] + (contact_candle['atr'] * 0.25)
+                    tp = last_candle['bb80_lo'] if regime == 'Tendance' else last_candle['bb20_lo']
+                    rr = (entry - tp) / (sl - entry) if (sl - entry) > 0 else 0
+                    if rr >= MIN_RR:
+                        signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+
+        if signal:
+            signal['bb20_mid'] = last_candle['bb20_mid']
+            return signal
+
+    return None
+
+
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
