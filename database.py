@@ -13,7 +13,7 @@ def get_db_connection():
 def setup_database():
     """Initialise la DB et crée les tables si elles n'existent pas."""
     print("Initialisation de la base de données SQLite...")
-    conn = get_conn()
+    conn = get_db_connection()
     conn.cursor().executescript('''
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY, symbol TEXT, side TEXT, regime TEXT, status TEXT,
