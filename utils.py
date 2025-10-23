@@ -1,7 +1,8 @@
 # Fichier: utils.py
 import ccxt
 import pandas as pd
-from ta.volatility import BollingerBands, AverageTrueRange
+from typing import Optional
+from ta.volatility import BollingerBands
 
 def fetch_and_prepare_df(ex, symbol, timeframe, limit=100):
     try:
