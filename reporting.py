@@ -1,6 +1,5 @@
 # Fichier: reporting.py
 from typing import List, Dict, Any, Optional
-from typing import List, Dict, Any
 from tabulate import tabulate
 import numpy as np
 from scipy import stats as st
