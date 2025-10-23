@@ -4,12 +4,15 @@ from typing import List, Dict, Any, Optional
 
 DB_FILE = 'darwin_bot.db'
 
-def get_conn():
+def get_db_connection():
+    """Crée et retourne une connexion à la base de données. C'est la fonction standard."""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
 def setup_database():
+    """Initialise la DB et crée les tables si elles n'existent pas."""
+    print("Initialisation de la base de données SQLite...")
     conn = get_conn()
     conn.cursor().executescript('''
         CREATE TABLE IF NOT EXISTS trades (
