@@ -1,6 +1,5 @@
-# python -m compileall main.py
-Compiling 'main.py'...
 # Fichier: main.py
+
  import os
  import sys
  import time
