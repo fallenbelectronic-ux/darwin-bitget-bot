@@ -1,7 +1,6 @@
 # Fichier: notifier.py
 import os, time, html, requests, io
 from typing import List, Dict, Any, Optional
-
 import reporting
 
 # --- PARAMÈTRES TELEGRAM ---
@@ -10,16 +9,15 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TG_ALERTS_CHAT_ID = os.getenv("TELEGRAM_ALERTS_CHAT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
-    """Envoie un message texte. Peut cibler un chat_id spécifique."""
-    target_chat_id = chat_id if chat_id else TG_CHAT_ID
-    if not TG_TOKEN or not target_chat_id: return
+def _escape(text: str) -> str: return html.escape(str(text))
+
+def tg_send(text: str, reply_markup: Optional[Dict] = None):
+    if not TG_TOKEN or not TG_CHAT_ID: return
     try:
-        payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
         if reply_markup: payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Erreur d'envoi Telegram: {e}")
+    except Exception as e: print(f"Erreur d'envoi Telegram: {e}")
 
 def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
     """Envoie un rapport de signal validé, avec le statut d'exécution."""
@@ -86,21 +84,14 @@ def send_mode_message(is_testnet: bool, is_paper: bool):
                f"<b>Trading :</b> {trading_mode}\n<i>(Changez ci-dessous)</i>" )
     tg_send(message, reply_markup=get_trading_mode_keyboard(is_paper))
 
-def get_trading_mode_keyboard(is_paper: bool) -> Dict:
-    """Crée le clavier pour changer de mode de trading."""
-    buttons = []
-    if is_paper:
-        buttons.append([{"text": "✅ PAPIER (Actuel)", "callback_data": "no_change"}, {"text": "➡️ Passer en RÉEL", "callback_data": "switch_to_REAL"}])
-    else:
-        buttons.append([{"text": "➡️ Passer en PAPIER", "callback_data": "switch_to_PAPER"}, {"text": "✅ RÉEL (Actuel)", "callback_data": "no_change"}])
-    buttons.append([{"text": "⬅️ Retour", "callback_data": "back_to_main"}])
-    return {"inline_keyboard": buttons}
-
-def get_main_menu_keyboard(is_paused: bool) -> Dict:
-    """Retourne le clavier du menu principal."""
-    pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pauser", "callback_data": "pause"}
-    return { "inline_keyboard": [ [pause_resume_btn, {"text": "📊 Positions", "callback_data": "list_positions"}], [{"text": "⚙️ Stratégie", "callback_data": "manage_strategy"}, {"text": "📈 Stats", "callback_data": "get_stats"}], [{"text": "⏱️ Signaux Récents (6h)", "callback_data": "get_recent_signals"}]] }
-
+def tg_send(text: str, reply_markup: Optional[Dict] = None):
+    if not TG_TOKEN or not TG_CHAT_ID: return
+    try:
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        if reply_markup: payload['reply_markup'] = reply_markup
+        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+    except Exception as e: print(f"Erreur d'envoi Telegram: {e}")
+        
 def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
     """Envoie une notification de mise à breakeven."""
     message = ( f"<b>⚙️ Gestion de Trade sur {html.escape(symbol)}</b>\n\n"
@@ -155,22 +146,24 @@ def send_start_banner(platform: str, trading: str, risk: float):
     tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n plateforme: <code>{html.escape(platform)}</code>\n Mode: <b>{html.escape(trading)}</b>\n Risque: <code>{risk}%</code>")
 
 def send_main_menu(is_paused: bool):
-    """Envoie le menu principal."""
-    tg_send("🤖 <b>Panneau de Contrôle</b>\nUtilisez les boutons ou /start.", reply_markup=get_main_menu_keyboard(is_paused))
+    tg_send("🤖 **Panneau de Contrôle**", reply_markup=get_main_menu_keyboard(is_paused))
 
-def send_strategy_menu(current_strategy: str):
-    """Envoie le menu de sélection de stratégie."""
-    message = (f"<b>⚙️ Gestion de la Stratégie</b>\n\nDéfinit comment les trades de <b>contre-tendance</b> sont gérés.\n\nStratégie Actuelle: <b><code>{current_strategy}</code></b>")
-    tg_send(message, reply_markup=get_strategy_menu_keyboard(current_strategy))
-
-def format_open_positions(positions: List[Dict[str, Any]]):
-    """Formate et envoie la liste des positions ouvertes."""
-    if not positions: return tg_send("📊 Aucune position n'est actuellement ouverte.")
-    lines = ["<b>📊 Positions Ouvertes</b>\n"]
-    for pos in positions:
-        side_icon = "📈" if pos.get('side') == 'buy' else "📉"
-        lines.append(f"<b>{pos.get('id')}. {side_icon} {html.escape(pos.get('symbol', 'N/A'))}</b>\n   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>\n")
-    tg_send("\n".join(lines), reply_markup=get_positions_keyboard(positions))
+def send_config_menu():
+    tg_send("⚙️ **Menu Configuration**", reply_markup=get_config_menu_keyboard())
+    
+def send_signals_menu():
+    tg_send("🚀 **Menu Signaux**", reply_markup=get_signals_menu_keyboard())
+    
+def send_config_message(config: Dict):
+    lines = ["<b>🔩 Configuration Actuelle</b>\n"]
+    for key, value in config.items():
+        lines.append(f"- {_escape(key)}: <code>{_escape(value)}</code>")
+    tg_send("\n".join(lines))
+    
+def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
+    stats = reporting.calculate_performance_stats(trades)
+    message = reporting.format_report_message(title, stats, balance)
+    tg_send(message)   tg_send("\n".join(lines), reply_markup=get_positions_keyboard(positions))
 
 def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
     """Formate et envoie un rapport complet des positions ouvertes, synchronisé avec l'exchange."""
