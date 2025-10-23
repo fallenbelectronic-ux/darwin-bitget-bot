@@ -1,5 +1,4 @@
 # Fichier: main.py
-# -*- coding: utf-8 -*-
  import os
  import sys
  import time
