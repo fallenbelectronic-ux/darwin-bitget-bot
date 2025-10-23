@@ -1,8 +1,4 @@
-diff --git a/trader.py b/trader.py
-index 0ab79b55f279be9f640343fefcb02402e7a2e3fb..9c8330219a5d98252375efe43f19a03fca9bf7c6 100644
---- a/trader.py
-+++ b/trader.py
-@@ -8,76 +8,134 @@ from typing import Dict, Any, Optional, Tuple
+ from typing import Dict, Any, Optional, Tuple
  
  import database
  import notifier
