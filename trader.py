@@ -3,10 +3,7 @@ import os, time, ccxt
 import pandas as pd
 from typing import Dict, Any, Optional, Tuple
 
-import database
-import notifier
-import charting
-import utils
+import database, notifier, charting, utils
 
 # --- PARAMÈTRES ---
 RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
