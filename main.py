@@ -184,32 +184,18 @@ def poll_telegram_updates():
             process_message(upd['message'])
 
 def check_scheduled_reports():
-    """Vérifie s'il est temps d'envoyer un rapport quotidien ou hebdomadaire."""
     global _last_daily_report_day, _last_weekly_report_day
-    
-    try:
-        tz = pytz.timezone(TIMEZONE)
-        now = datetime.now(tz)
-    except pytz.UnknownTimeZoneError:
-        print(f"Fuseau horaire '{TIMEZONE}' invalide. Utilisation de l'UTC.")
-        tz = pytz.timezone("UTC")
-        now = datetime.now(tz)
-
-    # Rapport Quotidien
+    try: tz = pytz.timezone(TIMEZONE)
+    except pytz.UnknownTimeZoneError: tz = pytz.timezone("UTC")
+    now = datetime.now(tz)
     if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
-        print("Heure du rapport quotidien atteinte. Génération du bilan...")
-        _last_daily_report_day = now.day
-        one_day_ago = int(time.time()) - 24 * 60 * 60
-        trades = database.get_closed_trades_since(one_day_ago)
-        notifier.send_report("📊 Bilan Quotidien (24h)", trades)
-
-    # Rapport Hebdomadaire
+        _last_daily_report_day = now.day; ex = create_exchange(); balance = trader.get_usdt_balance(ex)
+        trades = database.get_all_closed_trades()
+        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
     if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
-        print("Jour et heure du rapport hebdomadaire atteints. Génération du bilan...")
-        _last_weekly_report_day = now.day
-        seven_days_ago = int(time.time()) - 7 * 24 * 60 * 60
-        trades = database.get_closed_trades_since(seven_days_ago)
-        notifier.send_report("🗓️ Bilan Hebdomadaire", trades)
+        _last_weekly_report_day = now.day; ex = create_exchange(); balance = trader.get_usdt_balance(ex)
+        trades = database.get_all_closed_trades()
+        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
 
 def telegram_listener_loop():
     """Boucle dédiée à l'écoute des commandes Telegram."""
@@ -225,30 +211,71 @@ def telegram_listener_loop():
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     """Boucle principale dédiée au trading."""
     print("📈 Thread de trading démarré.")
-    last_ts_seen = {}
-    state = {}
+    last_processed_hour = -1
 
     while True:
         try:
-            poll_telegram_updates()
-            
-            if _paused:
-                time.sleep(LOOP_DELAY)
-                continue
-            
-            trader.manage_open_positions(ex)
-            
-            # ... (la boucle de scan reste ici)
-            
-            time.sleep(LOOP_DELAY)
+            with _lock: is_paused = _paused
+            if is_paused:
+                print("   -> (Moteur de Trading en pause)"); time.sleep(LOOP_DELAY); continue
 
-        except KeyboardInterrupt:
-            notifier.tg_send("⛔ Arrêt manuel.")
-            break
-        except Exception as e:
-            notifier.tg_send_error("Erreur critique (boucle)", e)
-            print(f"Erreur critique: {e}")
+            current_hour = datetime.now(pytz.timezone(TIMEZONE)).hour
+            if current_hour != last_processed_hour:
+                select_and_execute_best_pending_signal(ex)
+                last_processed_hour = current_hour
+
+            cleanup_recent_signals(); check_scheduled_reports(); trader.manage_open_positions(ex)
+            
+            print(f"4. Début du scan de l'univers ({len(universe)} paires)...")
+            for symbol in universe:
+                df = utils.fetch_ohlcv_df(ex, symbol, TIMEFRAME)
+                if df is None or len(df) < 83: continue
+                
+                signal = trader.detect_signal(symbol, df)
+                if signal:
+                    with _lock:
+                        if not any(s['signal'] == signal for s in _recent_signals):
+                             _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+                    
+                    if symbol not in state.pending_signals:
+                        print(f"✅ Signal '{signal['regime']}' DÉTECTÉ pour {symbol}. MISE EN ATTENTE...")
+                        state.pending_signals[symbol] = {'signal': signal, 'df': df.copy(), 'candle_timestamp': df.index[-1]}
+
+            print(f"--- Fin du cycle de scan. Attente de {LOOP_DELAY} secondes. ---")
+            time.sleep(LOOP_DELAY)
+        
+        except KeyboardInterrupt: notifier.tg_send("⛔ Arrêt manuel du thread de trading."); break
+        except Exception:
+            print("\n--- ERREUR CRITIQUE DANS LE THREAD DE TRADING ---"); error_details = traceback.format_exc()
+            print(error_details); notifier.tg_send_error("Erreur critique (Moteur de Trading)", error_details)
+            print("--------------------------------------------------")
             time.sleep(15)
+
+def main():
+    """Point d'entrée principal du bot."""
+    startup_checks()
+    ex = create_exchange(); database.setup_database()
+    if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', os.getenv('STRATEGY_MODE', 'NORMAL').upper())
+    if not database.get_setting('UNIVERSE_SIZE'): database.set_setting('UNIVERSE_SIZE', UNIVERSE_SIZE)
+    if not database.get_setting('MAX_OPEN_POSITIONS'): database.set_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+    if not database.get_setting('PAPER_TRADING_MODE'): database.set_setting('PAPER_TRADING_MODE', os.getenv("PAPER_TRADING_MODE", "true").lower())
+    
+    sync_positions_on_startup(ex)
+    
+    notifier.send_start_banner("TESTNET" if BITGET_TESTNET else "LIVE", "PAPIER" if database.get_setting('PAPER_TRADING_MODE') == 'true' else "RÉEL", trader.RISK_PER_TRADE_PERCENT)
+    universe = build_universe(ex)
+    if not universe: notifier.tg_send("❌ Impossible de construire l'univers de trading."); return
+    print(f"Univers de trading chargé avec {len(universe)} paires.")
+
+    telegram_thread = threading.Thread(target=telegram_listener_loop, daemon=True)
+    trading_thread = threading.Thread(target=trading_engine_loop, args=(ex, universe))
+
+    telegram_thread.start()
+    trading_thread.start()
+    trading_thread.join()
 
 if __name__ == "__main__":
     main()
+Use Arrow Up and Arrow Down to select a turn, Enter to jump to it, and Escape to return to the chat.
+Start typing a prompt
+
