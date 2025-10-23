@@ -29,7 +29,6 @@ if not hasattr(trader, 'detect_signal'):
         trader_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(trader_module)
         sys.modules['trader'] = trader_module
-       trader = trader_module
         if hasattr(database, 'trader'):
             database.trader = trader_module
     else:
