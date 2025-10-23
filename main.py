@@ -1,4 +1,4 @@
- root@63a79cb92230:/workspace/darwin-bitget-bot# python -m compileall main.py
+# python -m compileall main.py
 Compiling 'main.py'...
 # Fichier: main.py
  import os
