@@ -48,6 +48,11 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "max_drawdown_percent": max_drawdown_percent
     }
 
+def get_report_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compatibilité avec l'ancien nom de fonction utilisé par notifier."""
+    return calculate_performance_stats(trades)
+
+
 def format_report_message(title: str, stats: Dict[str, Any], balance: float) -> str:
     """Met en forme le message de rapport pour Telegram, en incluant le solde."""
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
@@ -69,5 +74,6 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: float) -> 
         ["Ratio de Sharpe (approx.)", f"{stats['sharpe_ratio']:.2f}"],
         ["Drawdown Max", f"{stats['max_drawdown_percent']:.2f}%"]
     ]
+    table = tabulate(table_data, headers=headers, tablefmt="simple")
 
     return f"{header}\n<pre>{table}</pre>"
