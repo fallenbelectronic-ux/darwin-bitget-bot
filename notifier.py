@@ -146,10 +146,14 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
         params["offset"] = offset
     try:
         r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
-
         if r.status_code == 200:
             data = r.json()
-            if data.get("ok")
+            if data.get("ok"):
+                return data.get("result", [])
+    except Exception as e:
+        print(f"Erreur lors de la récupération des updates Telegram: {e}")
+        
+    return []
 
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
