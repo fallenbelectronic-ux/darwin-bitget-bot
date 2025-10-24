@@ -319,24 +319,25 @@ def main():
     ex = create_exchange()
     database.setup_database()
     
-    if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', 'NORMAL')
+    if not database.get_setting('STRATEGY_MODE'):
+        database.set_setting('STRATEGY_MODE', 'NORMAL')
     
+    current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
     notifier.send_start_banner(
         "TESTNET" if BITGET_TESTNET else "LIVE",
-        "PAPIER" if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true' else "RÉEL",
+        "PAPIER" if current_paper_mode else "RÉEL",
         trader.RISK_PER_TRADE_PERCENT
     )
 
     notifier.send_main_menu(_paused)
     
-       universe = build_universe(ex)
+    universe = build_universe(ex)
     if not universe:
-        notifier.tg_send("❌ **ERREUR CRITIQUE:** Impossible de construire l'univers de trading. Le bot va s'arrêter.")
-        return # Arrêt propre du programme
+        notifier.tg_send("❌ **ERREUR CRITIQUE:** Impossible de construire l'univers de trading.")
+        return
 
     print(f"Univers de trading chargé avec {len(universe)} paires.")
 
-    # Démarrage des deux threads principaux
     telegram_thread = threading.Thread(target=telegram_listener_loop, daemon=True)
     trading_thread = threading.Thread(target=trading_engine_loop, args=(ex, universe), daemon=True)
 
@@ -344,13 +345,10 @@ def main():
     trading_thread.start()
     
     try:
-        # Garde le programme principal en vie et attend un arrêt (Ctrl+C)
-        # en surveillant le thread de trading. Si ce dernier crashe, le programme s'arrêtera.
         trading_thread.join()
-        
     except KeyboardInterrupt:
-        print("Arrêt manuel du bot demandé.")
-        notifier.tg_send("⛔ Arrêt manuel du bot.")
+        print("Arrêt demandé.")
+        notifier.tg_send("⛔ Arrêt manuel.")
 
 if __name__ == "__main__":
     main()
