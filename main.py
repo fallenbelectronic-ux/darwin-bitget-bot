@@ -208,7 +208,7 @@ def process_callback_query(callback_query: Dict):
             database.set_setting('PAPER_TRADING_MODE', 'true')
             notifier.tg_send("✅ Le bot est repassé en mode <b>PAPIER</b> (simulation).")
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
-                
+    
     except Exception as e:
         # Bloc de sécurité générique pour attraper toute erreur inattendue
         # pendant le traitement d'une commande et éviter que le thread ne crashe.
