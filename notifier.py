@@ -196,17 +196,17 @@ def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     buttons = []
     if current_strategy == 'NORMAL':
         buttons.append([
-            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"},
+            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"}, 
             {"text": "➡️ Passer en SPLIT", "callback_data": "switch_to_SPLIT"}
         ])
     else: # Si c'est SPLIT
         buttons.append([
-            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"},
+            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"}, 
             {"text": "✅ SPLIT (Actuel)", "callback_data": "no_change"}
         ])
-    buttons.append([{"text": "↩️ Retour", "callback_data": "back_to_main"}])
+    buttons.append([{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}])
     return {"inline_keyboard": buttons}
-
+    
 # ==============================================================================
 # MESSAGES FORMATÉS
 # ==============================================================================
@@ -223,7 +223,16 @@ def send_config_menu():
     
 def send_signals_menu():
     tg_send("🚀 **Menu Signaux**", reply_markup=get_signals_menu_keyboard())
-    
+
+def send_strategy_menu(current_strategy: str):
+    """Envoie le menu de sélection de stratégie."""
+    message = (
+        f"<b>⚙️ Gestion de la Stratégie</b>\n\n"
+        f"Définit comment les trades de <b>contre-tendance</b> sont gérés.\n\n"
+        f"Stratégie Actuelle: <b><code>{current_strategy}</code></b>"
+    )
+    tg_send(message, reply_markup=get_strategy_menu_keyboard(current_strategy))
+
 def send_config_message(config: Dict):
     lines = ["<b>🔩 Configuration Actuelle</b>\n"]
     for key, value in config.items():
