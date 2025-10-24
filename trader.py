@@ -124,9 +124,75 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
-def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict, df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
-    # (Votre logique de sécurité execute_trade reste ici, elle est déjà très bonne)
-    pass
+def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
+    """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
+    is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+    max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
+
+    if len(database.get_open_positions()) >= max_pos:
+        return False, f"Rejeté: Max positions ({max_pos}) atteint."
+    if database.is_position_open(symbol):
+        return False, "Rejeté: Position déjà ouverte (DB)."
+    
+    balance = get_usdt_balance(ex)
+    if balance is None or balance <= 10:
+        return False, f"Rejeté: Solde insuffisant ({balance or 0:.2f} USDT) ou erreur API."
+    
+    quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, signal['sl'])
+    if quantity <= 0:
+        return False, f"Rejeté: Quantité calculée nulle ({quantity})."
+        
+    notional_value = quantity * entry_price
+    if notional_value < MIN_NOTIONAL_VALUE:
+        return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
+    
+    final_entry_price = entry_price
+    if not is_paper_mode:
+        try:
+            ex.set_leverage(LEVERAGE, symbol)
+            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}
+            order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
+            
+            time.sleep(3)
+            position = ex.fetch_position(symbol)
+            if not position or float(position.get('stopLossPrice', 0)) == 0:
+                print("🚨 ALERTE SÉCURITÉ : SL non détecté ! Clôture d'urgence.")
+                ex.create_market_order(symbol, 'sell' if signal['side'] == 'buy' else 'buy', quantity, params={'reduceOnly': True})
+                return False, "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
+            
+            if order and order.get('price'):
+                final_entry_price = float(order['price'])
+
+        except Exception as e:
+            notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
+            return False, f"Erreur d'exécution: {e}"
+
+    signal['entry'] = final_entry_price
+    
+    management_strategy = "NORMAL"
+    if database.get_setting('STRATEGY_MODE', 'NORMAL').upper() == 'SPLIT' and signal['regime'] == 'Contre-tendance':
+        management_strategy = "SPLIT"
+        
+    database.create_trade(
+        symbol=symbol,
+        side=signal['side'],
+        regime=signal['regime'],
+        entry_price=final_entry_price,
+        sl_price=signal['sl'],
+        tp_price=signal['tp'],
+        quantity=quantity,
+        risk_percent=RISK_PER_TRADE_PERCENT,
+        management_strategy=management_strategy,
+        entry_atr=signal.get('entry_atr', 0.0) or 0.0,
+        entry_rsi=signal.get('entry_rsi', 0.0) or 0.0,
+    )
+    
+    chart_image = charting.generate_trade_chart(symbol, df, signal)
+    mode_text = "PAPIER" if is_paper_mode else "RÉEL"
+    trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
+    notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
+    
+    return True, "Position ouverte avec succès."```
 
 def manage_open_positions(ex: ccxt.Exchange):
     # (Votre logique avancée de gestion SPLIT et TP Dynamique sera implémentée ici)
