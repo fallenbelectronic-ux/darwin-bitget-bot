@@ -149,7 +149,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 
         if r.status_code == 200:
             data = r.json()
-            if data.get("ok"):
+            if data.get("ok")
 
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
