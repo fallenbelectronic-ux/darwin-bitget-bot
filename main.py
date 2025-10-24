@@ -224,6 +224,13 @@ def process_message(message: Dict):
 
     if command == "/start":
         notifier.send_main_menu(_paused)
+
+    elif command == "/mode":
+        # --- LOGIQUE POUR LA COMMANDE /mode ---
+        current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
+        # Assurez-vous que cette fonction existe bien dans votre notifier.py
+        notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
+        
     elif command.startswith("/set"):
         # Garde les commandes /set en textuel car elles prennent un argument
         if command == "/setuniverse" and len(parts) > 1:
@@ -234,6 +241,7 @@ def process_message(message: Dict):
                     notifier.tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (appliqué au redémarrage).")
                 else: notifier.tg_send("❌ Le nombre doit être > 0.")
             except ValueError: notifier.tg_send("❌ Valeur invalide.")
+                
         elif command == "/setmaxpos" and len(parts) > 1:
             try:
                 max_p = int(parts[1])
@@ -356,7 +364,7 @@ def main():
         database.set_setting('PAPER_TRADING_MODE', 'true')
         paper_mode_setting = 'true'
         
-    current_paper_mode = paper_mode_setting.lower() == 'true'
+    current_paper_mode = paper_mode_setting.lower() == 'false'
     
     # Envoi de la bannière de démarrage
     notifier.send_start_banner(
