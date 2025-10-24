@@ -160,7 +160,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
     except Exception:
         # Ignore les erreurs de réseau, le bot réessaiera au prochain cycle.
         pass
-    return []```
+    return []
 
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
