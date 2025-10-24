@@ -10,18 +10,22 @@ import reporting
 # --- PARAMÈTRES TELEGRAM ---
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TG_ALERTS_CHAT_ID = os.getenv("TELEGRAM_ALERTS_CHAT_ID", TG_CHAT_ID)
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 def _escape(text: str) -> str: return html.escape(str(text))
 
-def tg_send(text: str, reply_markup: Optional[Dict] = None):
-    if not TG_TOKEN or not TG_CHAT_ID: return
+def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
+    """Fonction principale d'envoi de message texte."""
+    target_chat_id = chat_id or TG_CHAT_ID
+    if not TG_TOKEN or not target_chat_id:
+        return
     try:
-        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        if reply_markup: payload['reply_markup'] = reply_markup
+        payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e: print(f"Erreur d'envoi Telegram: {e}")
+    except Exception as e:
+        print(f"Erreur d'envoi Telegram: {e}")
 
 def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
     """Envoie un rapport de signal validé, avec le statut d'exécution."""
@@ -155,25 +159,6 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
         
     return []
 
-def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
-    """Retourne le clavier du menu de stratégie."""
-    buttons = []
-
-    if current_strategy == 'NORMAL':
-        buttons.append([
-            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"},
-            {"text": "➡️ Passer en SPLIT", "callback_data": "switch_to_SPLIT"}
-        ])
-    else: # Si c'est SPLIT
-        buttons.append([
-            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"},
-            {"text": "✅ SPLIT (Actuel)", "callback_data": "no_change"}
-        ])
-    
-    buttons.append([{"text": "↩️ Retour", "callback_data": "back_to_main"}])
-    return {"inline_keyboard": buttons}
-
-
 # ==============================================================================
 # GESTION DES CLAVIERS INTERACTIFS
 # ==============================================================================
@@ -193,6 +178,21 @@ def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     for pos in positions:
         keyboard.append([{"text": f"❌ Clôturer Trade #{pos.get('id', 0)}", "callback_data": f"close_trade_{pos.get('id', 0)}"}])
     return {"inline_keyboard": keyboard}
+def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
+    """Retourne le clavier du menu de stratégie."""
+    buttons = []
+    if current_strategy == 'NORMAL':
+        buttons.append([
+            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"},
+            {"text": "➡️ Passer en SPLIT", "callback_data": "switch_to_SPLIT"}
+        ])
+    else: # Si c'est SPLIT
+        buttons.append([
+            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"},
+            {"text": "✅ SPLIT (Actuel)", "callback_data": "no_change"}
+        ])
+    buttons.append([{"text": "↩️ Retour", "callback_data": "back_to_main"}])
+    return {"inline_keyboard": buttons}
 
 # ==============================================================================
 # MESSAGES FORMATÉS
@@ -201,7 +201,7 @@ def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
 def send_start_banner(platform: str, trading: str, risk: float):
     """Envoie la bannière de démarrage."""
     tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n- Plateforme: <code>{_escape(platform)}</code>\n- Mode: <b>{_escape(trading)}</b>\n- Risque: <code>{risk}%</code>")
-
+    
 def send_main_menu(is_paused: bool):
     tg_send("🤖 **Panneau de Contrôle**", reply_markup=get_main_menu_keyboard(is_paused))
 
