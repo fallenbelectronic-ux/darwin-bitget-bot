@@ -157,12 +157,12 @@ def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
 
     if current_strategy == 'NORMAL':
         buttons.append([
-            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"}, 
+            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"},
             {"text": "➡️ Passer en SPLIT", "callback_data": "switch_to_SPLIT"}
         ])
     else: # Si c'est SPLIT
         buttons.append([
-            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"}, 
+            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"},
             {"text": "✅ SPLIT (Actuel)", "callback_data": "no_change"}
         ])
     
