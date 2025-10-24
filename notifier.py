@@ -154,7 +154,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
     buttons = []
-    # Logique pour créer le bouton NORMAL ou SPLIT
+
     if current_strategy == 'NORMAL':
         buttons.append([
             {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"}, 
@@ -166,10 +166,9 @@ def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
             {"text": "✅ SPLIT (Actuel)", "callback_data": "no_change"}
         ])
     
-    # Bouton de retour
-    buttons.append([{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}])
-    
+    buttons.append([{"text": "↩️ Retour", "callback_data": "back_to_main"}])
     return {"inline_keyboard": buttons}
+
 
 # ==============================================================================
 # GESTION DES CLAVIERS INTERACTIFS
