@@ -1,22 +1,16 @@
 # Fichier: notifier.py
-import os, time, html, requests, io
-# Version finale, fusionnée et corrigée, incluant toutes les fonctionnalités avancées.
-
 import os
 import time
 import html
 import requests
 import io
 from typing import List, Dict, Any, Optional
-
-# Assurez-vous que votre projet contient un fichier reporting.py fonctionnel
 import reporting
 
 # --- PARAMÈTRES TELEGRAM ---
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TG_ALERTS_CHAT_ID = os.getenv("TELEGRAM_ALERTS_CHAT_ID", "")
-TG_ALERTS_CHAT_ID = os.getenv("TELEGRAM_ALERTS_CHAT_ID", TG_CHAT_ID) # Fallback sur le chat ID principal
+TG_ALERTS_CHAT_ID = os.getenv("TELEGRAM_ALERTS_CHAT_ID", TG_CHAT_ID)
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 def _escape(text: str) -> str: return html.escape(str(text))
@@ -152,31 +146,30 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
         params["offset"] = offset
     try:
         r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
-        # CORRECTION : L'indentation de ce bloc a été validée.
+
         if r.status_code == 200:
             data = r.json()
             if data.get("ok"):
-                return data.get("result", [])
-    except Exception:
-        # Ignore les erreurs de réseau, le bot réessaiera au prochain cycle.
-        pass
-    return []
 
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
     buttons = []
+    # Logique pour créer le bouton NORMAL ou SPLIT
     if current_strategy == 'NORMAL':
-        buttons.append([{"text": "✅ NORMAL", "callback_data": "no_change"}, {"text": "Activer: SPLIT", "callback_data": "switch_to_SPLIT"}])
-    else:
-        buttons.append([{"text": "Activer: NORMAL", "callback_data": "switch_to_NORMAL"}, {"text": "✅ SPLIT", "callback_data": "no_change"}])
-    buttons.append([{"text": "⬅️ Retour", "callback_data": "back_to_main"}])
+        buttons.append([
+            {"text": "✅ NORMAL (Actuel)", "callback_data": "no_change"}, 
+            {"text": "➡️ Passer en SPLIT", "callback_data": "switch_to_SPLIT"}
+        ])
+    else: # Si c'est SPLIT
+        buttons.append([
+            {"text": "➡️ Passer en NORMAL", "callback_data": "switch_to_NORMAL"}, 
+            {"text": "✅ SPLIT (Actuel)", "callback_data": "no_change"}
+        ])
+    
+    # Bouton de retour
+    buttons.append([{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}])
+    
     return {"inline_keyboard": buttons}
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("result", []) if data.get("ok") else []
-    except Exception:
-        pass
-    return []
 
 # ==============================================================================
 # GESTION DES CLAVIERS INTERACTIFS
@@ -204,7 +197,6 @@ def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
 
 def send_start_banner(platform: str, trading: str, risk: float):
     """Envoie la bannière de démarrage."""
-    tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n plateforme: <code>{html.escape(platform)}</code>\n Mode: <b>{html.escape(trading)}</b>\n Risque: <code>{risk}%</code>")
     tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n- Plateforme: <code>{_escape(platform)}</code>\n- Mode: <b>{_escape(trading)}</b>\n- Risque: <code>{risk}%</code>")
 
 def send_main_menu(is_paused: bool):
@@ -284,8 +276,6 @@ def tg_send_error(title: str, error: Any):
 
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
     """Calcule les stats et envoie un rapport."""
-    stats = reporting.get_report_stats(trades)
-    """Calcule et envoie un rapport de performance."""
     stats = reporting.calculate_performance_stats(trades)
     message = reporting.format_report_message(title, stats, balance)
     tg_send(message)
