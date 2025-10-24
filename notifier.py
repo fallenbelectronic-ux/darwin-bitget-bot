@@ -85,6 +85,7 @@ def send_config_message(min_rr: float, risk: float, max_pos: int, leverage: int)
                f" - RR Min: <code>{min_rr}</code>\n - Risque: <code>{risk}%</code>\n"
                f" - Positions Max: <code>{max_pos}</code>\n - Levier: <code>x{leverage}</code>" )
     tg_send(message)
+    
 def _escape(text: str) -> str:
     """Échappe les caractères HTML."""
     return html.escape(str(text))
@@ -100,19 +101,19 @@ def send_mode_message(is_testnet: bool, is_paper: bool):
 
 def tg_send(text: str, reply_markup: Optional[Dict] = None):
     if not TG_TOKEN or not TG_CHAT_ID: return
+        
 def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
     """Fonction principale d'envoi de message texte."""
     target_chat_id = chat_id or TG_CHAT_ID
     if not TG_TOKEN or not target_chat_id:
         return
     try:
-        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        if reply_markup: payload['reply_markup'] = reply_markup
         payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
         if reply_markup:
             payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e: print(f"Erreur d'envoi Telegram: {e}")
+    except Exception as e:
+        print(f"Erreur d'envoi Telegram: {e}")
         
 def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
     """Envoie une notification de mise à breakeven."""
@@ -163,6 +164,17 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 # GESTION DES CLAVIERS INTERACTIFS
 # ==============================================================================
 
+def get_config_menu_keyboard() -> Dict:
+    """Crée le clavier pour le menu de configuration."""
+    return {
+        "inline_keyboard": [
+            [{"text": "🔩 Afficher Config Actuelle", "callback_data": "show_config"}],
+            [{"text": "🖥️ Changer Mode (Papier/Réel)", "callback_data": "show_mode"}],
+            [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
+            [{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]
+        ]
+    }
+
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
     pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pauser", "callback_data": "pause"}
     return {"inline_keyboard": [
@@ -178,6 +190,7 @@ def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     for pos in positions:
         keyboard.append([{"text": f"❌ Clôturer Trade #{pos.get('id', 0)}", "callback_data": f"close_trade_{pos.get('id', 0)}"}])
     return {"inline_keyboard": keyboard}
+    
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
     buttons = []
@@ -218,7 +231,7 @@ def send_config_message(config: Dict):
     tg_send("\n".join(lines))
     
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-    """Calcule les statistiques via le module reporting et envoie le rapport."""
+    """Calcule les statistiques et envoie un rapport."""
     stats = reporting.calculate_performance_stats(trades)
     message = reporting.format_report_message(title, stats, balance)
     tg_send(message)
