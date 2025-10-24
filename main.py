@@ -270,7 +270,7 @@ def telegram_listener_loop():
             poll_telegram_updates()
             time.sleep(0.5)
         except Exception as e:
-            print(f"Erreur Telegram: {e}"); time.sleep(5) # Augmentation du sleep en cas d'erreur
+            print(f"Erreur Telegram: {e}"); time.sleep(10) # Augmentation du sleep en cas d'erreur
 
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
