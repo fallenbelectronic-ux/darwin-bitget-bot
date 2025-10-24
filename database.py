@@ -120,3 +120,15 @@ def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
+    """Met à jour un trade après sa mise à breakeven."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE trades SET breakeven_status = 'ACTIVATED', quantity = ?, sl_price = ? WHERE id = ?",
+        (remaining_quantity, new_sl, trade_id)
+    )
+    conn.commit()
+    conn.close()
+    print(f"DB: Trade #{trade_id} mis à breakeven.")
