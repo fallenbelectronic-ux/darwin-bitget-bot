@@ -2,22 +2,26 @@
 import ccxt
 import pandas as pd
 from typing import Optional
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 
-def fetch_and_prepare_df(ex, symbol, timeframe, limit=100):
+def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 120) -> Optional[pd.DataFrame]:
+    """Récupère les données OHLCV et y ajoute tous les indicateurs nécessaires."""
     try:
+        if not ex.markets: ex.load_markets()
         ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-        if not ohlcv: return None
-        df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','vol'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        df.set_index('ts', inplace=True)
+        if not ohlcv or len(ohlcv) < 81: return None
         
-        bb20 = BollingerBands(df['close'], window=20, window_dev=2)
-        df['bb20_up'], df['bb20_mid'], df['bb20_lo'] = bb20.bollinger_hband(), bb20.bollinger_mavg(), bb20.bollinger_lband()
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
         
-        bb80 = BollingerBands(df['close'], window=80, window_dev=2)
-        df['bb80_up'], df['bb80_mid'], df['bb80_lo'] = bb80.bollinger_hband(), bb80.bollinger_mavg(), bb80.bollinger_lband()
+        bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
+        df["bb20_up"], df["bb20_mid"], df["bb20_lo"] = bb20.bollinger_hband(), bb20.bollinger_mavg(), bb20.bollinger_lband()
         
-        df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
-        return df
-    except: return None
+        bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
+        df["bb80_up"], df["bb80_mid"], df["bb80_lo"] = bb80.bollinger_hband(), bb80.bollinger_mavg(), bb80.bollinger_lband()
+        
+        df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
+        
+        return df.dropna()
+    except Exception:
+        return None
