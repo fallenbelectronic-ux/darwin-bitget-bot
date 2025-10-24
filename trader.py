@@ -197,7 +197,53 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
 def manage_open_positions(ex: ccxt.Exchange):
     # (Votre logique avancée de gestion SPLIT et TP Dynamique sera implémentée ici)
-    # Pour l'instant, on se concentre sur la qualité de l'entrée.
+def manage_open_positions(ex: ccxt.Exchange):
+    """Gère les positions ouvertes, notamment la stratégie SPLIT."""
+    if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
+        return
+
+    open_positions = database.get_open_positions()
+    if not open_positions:
+        return
+
+    for pos in open_positions:
+        # Applique la stratégie SPLIT uniquement aux trades concernés et non encore gérés
+        if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
+            try:
+                current_price = ex.fetch_ticker(pos['symbol'])['last']
+                df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+                if df is None:
+                    continue
+                
+                management_trigger_price = df.iloc[-1]['bb20_mid']
+                is_long = pos['side'] == 'buy'
+
+                # Vérifie si la cible est atteinte
+                if (is_long and current_price >= management_trigger_price) or \
+                   (not is_long and current_price <= management_trigger_price):
+                    
+                    print(f"✅ Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
+                    qty_to_close = pos['quantity'] / 2
+                    remaining_qty = pos['quantity'] - qty_to_close
+                    close_side = 'sell' if is_long else 'buy'
+                    
+                    # 1. Clôturer 50% de la position
+                    ex.create_market_order(pos['symbol'], close_side, qty_to_close, params={'reduceOnly': True})
+                    
+                    # 2. Mettre à Breakeven le reste (approche robuste)
+                    ex.cancel_all_orders(pos['symbol']) # Annuler les anciens SL/TP
+                    new_sl_be = pos['entry_price']
+                    # Créer un nouvel ordre OCO (One-Cancels-the-Other) pour SL et TP
+                    params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price']}
+                    ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None, params=params)
+
+                    # 3. Mettre à jour la base de données et notifier
+                    pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
+                    database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
+                    notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
+                    
+            except Exception as e:
+                print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
     pass
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
