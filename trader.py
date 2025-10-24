@@ -196,8 +196,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     return True,"Position ouverte avec succès."
 
 def manage_open_positions(ex: ccxt.Exchange):
-    # (Votre logique avancée de gestion SPLIT et TP Dynamique sera implémentée ici)
-def manage_open_positions(ex: ccxt.Exchange):
     """Gère les positions ouvertes, notamment la stratégie SPLIT."""
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
         return
