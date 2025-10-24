@@ -319,7 +319,6 @@ def main():
     ex = create_exchange()
     database.setup_database()
     
-    # Initialisation des paramètres par défaut si nécessaire
     if not database.get_setting('STRATEGY_MODE'): database.set_setting('STRATEGY_MODE', 'NORMAL')
     
     notifier.send_start_banner(
@@ -328,6 +327,8 @@ def main():
         trader.RISK_PER_TRADE_PERCENT
     )
 
+    notifier.send_main_menu(_paused)
+    
     universe = build_universe(ex)
     if not universe: return
 
