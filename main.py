@@ -349,7 +349,7 @@ def main():
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', 'NORMAL')
     
-    current_paper_mode = database.get_setting('PAPER_TRADING_MODE').lower() == 'true'
+    current_paper_mode = database.set_setting('PAPER_TRADING_MODE', 'false').lower() == 'true'
     notifier.send_start_banner(
         "TESTNET" if BITGET_TESTNET else "LIVE",
         "PAPIER" if current_paper_mode else "RÉEL",
