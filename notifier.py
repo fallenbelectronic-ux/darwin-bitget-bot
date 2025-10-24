@@ -180,7 +180,7 @@ def get_main_menu_keyboard(is_paused: bool) -> Dict:
     return {"inline_keyboard": [
         [pause_resume_btn, {"text": "🛰️ Ping", "callback_data": "ping"}],
         [{"text": "📊 Positions", "callback_data": "list_positions"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
-        [{"text": "⚙️ Configuration", "callback_data": "menu_config"}]
+        [{"text": "⚙️ Configuration", "callback_data": "menu_config"}, {"text": "🚀 Signaux", "callback_data": "menu_signals"}]
     ]}
 
 def get_signals_menu_keyboard() -> Dict:
