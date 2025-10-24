@@ -183,6 +183,16 @@ def get_main_menu_keyboard(is_paused: bool) -> Dict:
         [{"text": "⚙️ Configuration", "callback_data": "menu_config"}]
     ]}
 
+def get_signals_menu_keyboard() -> Dict:
+    """Crée le clavier pour le menu des signaux."""
+    return {
+        "inline_keyboard": [
+            [{"text": "🚀 Signaux (Dernière Heure)", "callback_data": "signals_1h"}],
+            [{"text": "⏱️ Signaux (6 Dernières Heures)", "callback_data": "signals_6h"}],
+            [{"text": "↩️ Retour", "callback_data": "main_menu"}]
+        ]
+    }
+
 def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     """Retourne le clavier pour la gestion des positions ouvertes."""
     if not positions: return None
