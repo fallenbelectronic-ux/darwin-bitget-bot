@@ -68,4 +68,4 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
     ]
     
     table = tabulate(table_data, headers=headers, tablefmt="simple")
-    return f"{header}\n<pre>{table}</pre>"```
+    return f"{header}\n<pre>{table}</pre>"
