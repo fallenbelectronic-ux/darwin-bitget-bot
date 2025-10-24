@@ -325,8 +325,8 @@ def send_pending_signal_notification(symbol: str, signal: Dict):
 def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
     """Envoie une notification de mise à breakeven."""
     message = (
-        f"🛡️ <b>Trade Sécurisé sur {_escape(symbol)} !</b>\n\n"
+        f"🛡️ **Trade Sécurisé sur {_escape(symbol)} !**\n\n"
         f"Prise de profit partielle à la MM20 avec un gain de <code>{pnl_realised:.2f} USDT</code>.\n"
-        f"Le Stop Loss a été remonté au point d'entrée pour le reste de la position (<code>{remaining_qty:.4f}</code>)."
+        f"Le reste de la position est maintenant à breakeven (risque zéro)."
     )
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID)
