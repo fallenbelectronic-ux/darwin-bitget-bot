@@ -267,9 +267,10 @@ def telegram_listener_loop():
     print("🤖 Thread Telegram démarré.")
     while True:
         try:
+            poll_telegram_updates()
             time.sleep(0.5)
         except Exception as e:
-            print(f"Erreur Telegram: {e}"); time.sleep(0.5)
+            print(f"Erreur Telegram: {e}"); time.sleep(5) # Augmentation du sleep en cas d'erreur
 
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
@@ -328,18 +329,28 @@ def main():
 
     notifier.send_main_menu(_paused)
     
-    universe = build_universe(ex)
-    if not universe: return
+       universe = build_universe(ex)
+    if not universe:
+        notifier.tg_send("❌ **ERREUR CRITIQUE:** Impossible de construire l'univers de trading. Le bot va s'arrêter.")
+        return # Arrêt propre du programme
+
+    print(f"Univers de trading chargé avec {len(universe)} paires.")
 
     # Démarrage des deux threads principaux
-    t_tg = threading.Thread(target=telegram_listener_loop, daemon=True)
-    t_tr = threading.Thread(target=trading_engine_loop, args=(ex, universe), daemon=True)
-    t_tg.start(); t_tr.start()
+    telegram_thread = threading.Thread(target=telegram_listener_loop, daemon=True)
+    trading_thread = threading.Thread(target=trading_engine_loop, args=(ex, universe), daemon=True)
+
+    telegram_thread.start()
+    trading_thread.start()
     
     try:
-        while True: time.sleep(1)
+        # Garde le programme principal en vie et attend un arrêt (Ctrl+C)
+        # en surveillant le thread de trading. Si ce dernier crashe, le programme s'arrêtera.
+        trading_thread.join()
+        
     except KeyboardInterrupt:
-        print("Arrêt demandé."); notifier.tg_send("⛔ Arrêt manuel.")
+        print("Arrêt manuel du bot demandé.")
+        notifier.tg_send("⛔ Arrêt manuel du bot.")
 
 if __name__ == "__main__":
     main()
