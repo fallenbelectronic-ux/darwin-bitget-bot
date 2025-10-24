@@ -218,10 +218,10 @@ def send_config_message(config: Dict):
     tg_send("\n".join(lines))
     
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
+    """Calcule les statistiques via le module reporting et envoie le rapport."""
     stats = reporting.calculate_performance_stats(trades)
     message = reporting.format_report_message(title, stats, balance)
-    tg_send(message)   tg_send("\n".join(lines))
-    tg_send("🤖 <b>Panneau de Contrôle</b>", reply_markup=get_main_menu_keyboard(is_paused))
+    tg_send(message)
 
 def format_open_positions(positions: List[Dict[str, Any]]):
     """Formate et envoie la liste des positions ouvertes depuis la DB."""
