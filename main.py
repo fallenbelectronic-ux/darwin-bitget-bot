@@ -194,6 +194,20 @@ def process_callback_query(callback_query: Dict):
                 notifier.tg_send(f"✅ Stratégie mise à jour en <b>{new_strategy}</b>.")
                 # Réaffiche le menu pour montrer le nouvel état
                 notifier.send_strategy_menu(new_strategy)
+
+        elif data == 'show_mode':
+            current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
+            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
+        
+        elif data == 'switch_to_REAL':
+            database.set_setting('PAPER_TRADING_MODE', 'false')
+            notifier.tg_send("🚨 <b>ATTENTION:</b> Le bot est maintenant en mode de trading <b>RÉEL</b>.")
+            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=False)
+            
+        elif data == 'switch_to_PAPER':
+            database.set_setting('PAPER_TRADING_MODE', 'true')
+            notifier.tg_send("✅ Le bot est repassé en mode <b>PAPIER</b> (simulation).")
+            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
                 
     except Exception as e:
         # Bloc de sécurité générique pour attraper toute erreur inattendue
