@@ -261,7 +261,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
                 if df is None: continue
                 
-                signal = trader.detect_signal(df)
+                signal = trader.detect_signal(symbol, df)
                 if signal:
                     with _lock:
                         # Si c'est un nouveau signal, on le met en attente
