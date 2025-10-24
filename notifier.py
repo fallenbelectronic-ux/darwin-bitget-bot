@@ -250,6 +250,21 @@ def send_strategy_menu(current_strategy: str):
     )
     tg_send(message, reply_markup=get_strategy_menu_keyboard(current_strategy))
 
+def send_mode_message(is_testnet: bool, is_paper: bool):
+    """Envoie un message affichant les modes de fonctionnement avec des boutons."""
+    platform_mode = "TESTNET" if is_testnet else "LIVE"
+    trading_mode = "PAPIER" if is_paper else "RÉEL"
+    
+    message = (
+        f"<b>🖥️ Modes de Fonctionnement</b>\n\n"
+        f"<b>Plateforme :</b> {platform_mode}\n"
+        f"<i>(Défini au démarrage du bot)</i>\n\n"
+        f"<b>Trading :</b> {trading_mode}\n"
+        f"<i>(Vous pouvez changer le mode de trading ci-dessous)</i>"
+    )
+    
+    tg_send(message, reply_markup=get_trading_mode_keyboard(is_paper))
+
 def send_config_message(config: Dict):
     lines = ["<b>🔩 Configuration Actuelle</b>\n"]
     for key, value in config.items():
