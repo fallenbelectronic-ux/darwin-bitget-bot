@@ -9,14 +9,10 @@ import threading
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import pytz
-
-# Importation des modules locaux nettoyés
 import database
 import trader
 import notifier
 import utils
-# Note: 'state' a été retiré car il peut être géré avec des variables globales simples pour l'instant.
-# 'analysis' a été renommé 'reporting' pour la cohérence.
 import reporting
 
 # --- PARAMÈTRES GLOBAUX ---
@@ -143,9 +139,10 @@ def process_callback_query(callback_query: Dict):
     elif data == 'list_positions':
         notifier.format_open_positions(database.get_open_positions())
     elif data == 'get_stats':
-        balance = trader.get_usdt_balance(create_exchange())
-        trades = database.get_closed_trades_since(int(time.time()) - 7*24*3600)
-        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+        ex = create_exchange()
+        balance = trader.get_usdt_balance(ex)
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
+        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
     elif data == 'menu_config':
         notifier.send_config_menu()
     elif data == 'show_config':
@@ -202,10 +199,11 @@ def process_message(message: Dict):
                 else: notifier.tg_send("❌ Le nombre doit être >= 0.")
             except ValueError: notifier.tg_send("❌ Valeur invalide.")
     elif cmd == "/pos": notifier.format_open_positions(database.get_open_positions())
-    elif cmd == "/stats": 
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 3600)
-        bal = trader.get_usdt_balance(create_exchange())
-        notifier.send_report("📊 Bilan 7 jours", trades, bal)
+    elif command == "/stats":
+        ex = create_exchange()
+        balance = trader.get_usdt_balance(ex)
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
+        notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
 
 def poll_telegram_updates():
     """Boucle de polling Telegram."""
