@@ -40,9 +40,6 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
         
     return False
 
-# ==============================================================================
-# LOGIQUE DE DÉTECTION (Fortement Améliorée)
-# ==============================================================================
 def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     """Logique de détection complète avec les règles avancées."""
     if df is None or len(df) < 81: return None
@@ -54,11 +51,12 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     if not is_valid_reaction_candle(last, side_guess):
         return None
 
-    # --- Filtre 1: Réintégration BB20 (inchangé) ---
+    # --- Filtre 1: Réintégration BB20 ---
+    # Note: Vous devez avoir une fonction close_inside_bb20 dans utils.py
     if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']):
         return None
     
-    # --- Filtre 2: Zone neutre MM80 (inchangé) ---
+    # --- Filtre 2: Zone neutre MM80 ---
     dead_zone = last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100.0)
     if abs(last['close'] - last['bb80_mid']) < dead_zone:
         return None
@@ -67,6 +65,7 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     
     # --- Détection des Patterns ---
     is_above_mm80 = last['close'] > last['bb80_mid']
+    # Note: Vous devez avoir une fonction touched_or_crossed dans utils.py
     touched_bb20_low = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_up'], "sell")
 
@@ -74,7 +73,7 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     if is_above_mm80 and touched_bb20_low:
         regime = "Tendance"
         entry = last['close']
-        sl = prev['low'] - (prev['atr'] * 0.25)  # SL avec coussin ATR
+        sl = prev['low'] - (prev['atr'] * 0.25)
         tp = last['bb80_up']
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
@@ -84,7 +83,7 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
     elif not is_above_mm80 and touched_bb20_high:
         regime = "Tendance"
         entry = last['close']
-        sl = prev['high'] + (prev['atr'] * 0.25) # SL avec coussin ATR
+        sl = prev['high'] + (prev['atr'] * 0.25)
         tp = last['bb80_lo']
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
@@ -100,7 +99,7 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
             regime = "Contre-tendance"
             entry = last['close']
             sl = prev['low'] - (prev['atr'] * 0.25)
-            tp = last['bb20_mid'] # Objectif prudent : la MM20
+            tp = last['bb20_mid']
             if (entry - sl) > 0:
                 rr = (tp - entry) / (entry - sl)
                 if rr >= MIN_RR:
@@ -116,7 +115,9 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
                     signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
     
     if signal:
-        signal['bb20_mid'] = last['bb20_mid'] # Pour la gestion future du BE
+        signal['bb20_mid'] = last['bb20_mid']
+        signal['entry_atr'] = prev.get('atr', 0.0) # Utiliser .get pour plus de sécurité
+        signal['entry_rsi'] = 0.0 # Placeholder
         return signal
         
     return None
@@ -192,7 +193,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
     
-    return True, "Position ouverte avec succès."```
+    return True,"Position ouverte avec succès."
 
 def manage_open_positions(ex: ccxt.Exchange):
     # (Votre logique avancée de gestion SPLIT et TP Dynamique sera implémentée ici)
