@@ -206,6 +206,23 @@ def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
         ])
     buttons.append([{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}])
     return {"inline_keyboard": buttons}
+
+def get_trading_mode_keyboard(is_paper: bool) -> Dict:
+    """Crée le clavier pour changer de mode de trading."""
+    buttons = []
+    if is_paper:
+        buttons.append([
+            {"text": "✅ PAPIER (Actuel)", "callback_data": "no_change"},
+            {"text": "➡️ Passer en RÉEL", "callback_data": "switch_to_REAL"}
+        ])
+    else: # Si c'est RÉEL
+        buttons.append([
+            {"text": "➡️ Passer en PAPIER", "callback_data": "switch_to_PAPER"},
+            {"text": "✅ RÉEL (Actuel)", "callback_data": "no_change"}
+        ])
+    
+    buttons.append([{"text": "↩️ Retour", "callback_data": "main_menu"}])
+    return {"inline_keyboard": buttons}
     
 # ==============================================================================
 # MESSAGES FORMATÉS
