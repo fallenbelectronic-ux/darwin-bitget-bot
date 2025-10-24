@@ -242,7 +242,6 @@ def process_message(message: Dict):
                     notifier.tg_send(f"✅ Positions max mises à <b>{max_p}</b>.")
                 else: notifier.tg_send("❌ Le nombre doit être >= 0.")
             except ValueError: notifier.tg_send("❌ Valeur invalide.")
-    elif command == "/pos": notifier.format_open_positions(database.get_open_positions())
     elif command == "/stats":
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
