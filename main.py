@@ -199,9 +199,7 @@ def process_callback_query(callback_query: Dict):
         # Bloc de sécurité générique pour attraper toute erreur inattendue
         # pendant le traitement d'une commande et éviter que le thread ne crashe.
         print(f"Erreur lors du traitement du callback '{data}': {e}")
-        notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
-        
-    pass     
+        notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")       
 
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
@@ -236,8 +234,6 @@ def process_message(message: Dict):
         balance = trader.get_usdt_balance(ex)
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
-        
-    pass 
     
 def check_scheduled_reports():
     """Gère les rapports automatiques."""
@@ -347,7 +343,6 @@ def main():
         trader.RISK_PER_TRADE_PERCENT
     )
 
-    notifier.send_start_banner(...)
     notifier.send_main_menu(_paused)
     
     universe = build_universe(ex)
