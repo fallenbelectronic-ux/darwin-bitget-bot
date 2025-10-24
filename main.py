@@ -124,52 +124,82 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     trader.execute_trade(ex, best['symbol'], best['signal'], best['df'], best['signal']['entry'])
 
 def process_callback_query(callback_query: Dict):
-    """Gère les clics sur les boutons interactifs."""
+    """Gère les clics sur les boutons interactifs de manière robuste et lisible."""
     global _paused
     data = callback_query.get('data', '')
 
-    if data == 'pause':
-        with _lock: _paused = True
-        notifier.tg_send("⏸️ Bot mis en pause.")
-    elif data == 'resume':
-        with _lock: _paused = False
-        notifier.tg_send("▶️ Bot relancé.")
-    elif data == 'ping':
-        notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
-    elif data == 'list_positions':
-        notifier.format_open_positions(database.get_open_positions())
-    elif data == 'get_stats':
-        ex = create_exchange()
-        balance = trader.get_usdt_balance(ex)
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
-        notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
-    elif data == 'menu_config':
-        notifier.send_config_menu()
-    elif data == 'show_config':
-        max_pos = database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
-        config = { "RR Min": MIN_RR, "Risque/Trade": f"{trader.RISK_PER_TRADE_PERCENT}%", "Positions Max": max_pos, "Levier": trader.LEVERAGE }
-        notifier.send_config_message(config)
-    elif data == 'menu_signals':
-        notifier.send_signals_menu()
-    elif data == 'signals_1h':
-        notifier.tg_send(get_recent_signals_message(1))
-    elif data == 'signals_6h':
-        notifier.tg_send(get_recent_signals_message(6))
-    elif data == 'main_menu':
-        notifier.send_main_menu(_paused)
-    elif data.startswith('close_trade_'):
-        try:
-            tid = int(data.split('_')[-1])
-            trader.close_position_manually(create_exchange(), tid)
-        except: notifier.tg_send("ID invalide.")
-    elif data == 'manage_strategy':
-        strat = database.get_setting('STRATEGY_MODE', 'NORMAL')
-        notifier.send_strategy_menu(strat)
-    elif data in ['switch_to_NORMAL', 'switch_to_SPLIT']:
-        new_strat = data.split('_')[-1]
-        database.set_setting('STRATEGY_MODE', new_strat)
-        notifier.tg_send(f"✅ Stratégie: <b>{new_strat}</b>")
-        notifier.send_strategy_menu(new_strat)
+    try:
+        if data == 'pause':
+            with _lock: _paused = True
+            notifier.tg_send("⏸️ Bot mis en pause.")
+        
+        elif data == 'resume':
+            with _lock: _paused = False
+            notifier.tg_send("▶️ Bot relancé.")
+            
+        elif data == 'ping':
+            notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
+            
+        elif data == 'list_positions':
+            notifier.format_open_positions(database.get_open_positions())
+            
+        elif data == 'get_stats':
+            ex = create_exchange()
+            balance = trader.get_usdt_balance(ex)
+            # Calcul sur les 7 derniers jours (en secondes)
+            trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)
+            notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
+            
+        elif data == 'menu_config':
+            notifier.send_config_menu()
+            
+        elif data == 'show_config':
+            max_pos = database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+            config = {
+                "RR Min": MIN_RR,
+                "Risque/Trade": f"{trader.RISK_PER_TRADE_PERCENT}%",
+                "Positions Max": max_pos,
+                "Levier": trader.LEVERAGE
+            }
+            notifier.send_config_message(config)
+            
+        elif data == 'menu_signals':
+            notifier.send_signals_menu()
+            
+        elif data == 'signals_1h':
+            notifier.tg_send(get_recent_signals_message(1))
+            
+        elif data == 'signals_6h':
+            notifier.tg_send(get_recent_signals_message(6))
+            
+        elif data == 'main_menu':
+            notifier.send_main_menu(_paused)
+            
+        elif data.startswith('close_trade_'):
+            try:
+                trade_id_str = data.replace('close_trade_', '')
+                trade_id = int(trade_id_str)
+                trader.close_position_manually(create_exchange(), trade_id)
+            except (ValueError, IndexError):
+                notifier.tg_send("❌ Erreur : ID de trade invalide.")
+                
+        elif data == 'manage_strategy':
+            current_strategy = database.get_setting('STRATEGY_MODE', 'NORMAL')
+            notifier.send_strategy_menu(current_strategy)
+            
+        elif data.startswith('switch_to_'):
+            new_strategy = data.replace('switch_to_', '')
+            if new_strategy in ['NORMAL', 'SPLIT']:
+                database.set_setting('STRATEGY_MODE', new_strategy)
+                notifier.tg_send(f"✅ Stratégie mise à jour en <b>{new_strategy}</b>.")
+                # Réaffiche le menu pour montrer le nouvel état
+                notifier.send_strategy_menu(new_strategy)
+                
+    except Exception as e:
+        # Bloc de sécurité générique pour attraper toute erreur inattendue
+        # pendant le traitement d'une commande et éviter que le thread ne crashe.
+        print(f"Erreur lors du traitement du callback '{data}': {e}")
+        notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
 
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
