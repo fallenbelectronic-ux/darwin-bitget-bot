@@ -120,7 +120,7 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     best = sorted(validated, key=lambda x: x['signal']['rr'], reverse=True)[0]
     print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f})")
     
-    notifier.send_confirmed_signal_notification(best['symbol'], best['signal'])
+    notifier.send_confirmed_signal_notification(best['symbol'], best['signal'], len(validated))
     trader.execute_trade(ex, best['symbol'], best['signal'], best['df'], best['signal']['entry'])
 
 def process_callback_query(callback_query: Dict):
@@ -198,33 +198,37 @@ def process_message(message: Dict):
                     notifier.tg_send(f"✅ Positions max mises à <b>{max_p}</b>.")
                 else: notifier.tg_send("❌ Le nombre doit être >= 0.")
             except ValueError: notifier.tg_send("❌ Valeur invalide.")
-    elif cmd == "/pos": notifier.format_open_positions(database.get_open_positions())
+    elif command == "/pos": notifier.format_open_positions(database.get_open_positions())
     elif command == "/stats":
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
 
-def poll_telegram_updates():
-    """Boucle de polling Telegram."""
-    global _last_update_id
-    for upd in notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None):
-        _last_update_id = upd.get("update_id", _last_update_id)
-        if 'callback_query' in upd: process_callback_query(upd['callback_query'])
-        elif 'message' in upd: process_message(upd['message'])
-
 def check_scheduled_reports():
     """Gère les rapports automatiques."""
     global _last_daily_report_day, _last_weekly_report_day
-    try: tz = pytz.timezone(TIMEZONE)
-    except: tz = pytz.timezone("UTC")
+    try:
+        tz = pytz.timezone(TIMEZONE)
+    except:
+        tz = pytz.timezone("UTC")
     now = datetime.now(tz)
 
+    # Rapport quotidien
     if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
         _last_daily_report_day = now.day
-        trades = database.get_closed_trades_since(int(time.time()) - 86400)
-        notifier.send_report("📊 Bilan Quotidien", trades, trader.get_usdt_balance(create_exchange()))
+        trades = database.get_closed_trades_since(int(time.time()) - 86400) # 24 heures en secondes
+        balance = trader.get_usdt_balance(create_exchange())
+        # CORRECTION: L'argument "days" est retiré
+        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
 
+    # Rapport hebdomadaire
+    if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
+        _last_weekly_report_day = now.day
+        trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400) # 7 jours en secondes
+        balance = trader.get_usdt_balance(create_exchange())
+        # CORRECTION: L'argument "days" est retiré
+        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
 # ==============================================================================
 # BOUCLES ET MAIN
 # ==============================================================================
