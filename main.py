@@ -349,7 +349,16 @@ def main():
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', 'NORMAL')
     
-    current_paper_mode = database.get_setting('PAPER_TRADING_MODE').lower() == 'true'
+    # Initialisation du mode de trading (PAPIER/RÉEL)
+    paper_mode_setting = database.get_setting('PAPER_TRADING_MODE')
+    if paper_mode_setting is None:
+        # Valeur par défaut de sécurité : PAPIER ('true')
+        database.set_setting('PAPER_TRADING_MODE', 'true')
+        paper_mode_setting = 'true'
+        
+    current_paper_mode = paper_mode_setting.lower() == 'true'
+    
+    # Envoi de la bannière de démarrage
     notifier.send_start_banner(
         "TESTNET" if BITGET_TESTNET else "LIVE",
         "PAPIER" if current_paper_mode else "RÉEL",
