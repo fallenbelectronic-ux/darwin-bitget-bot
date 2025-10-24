@@ -267,7 +267,6 @@ def telegram_listener_loop():
     print("🤖 Thread Telegram démarré.")
     while True:
         try:
-            poll_telegram_updates()
             time.sleep(0.5)
         except Exception as e:
             print(f"Erreur Telegram: {e}"); time.sleep(0.5)
