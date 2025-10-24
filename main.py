@@ -200,6 +200,8 @@ def process_callback_query(callback_query: Dict):
         # pendant le traitement d'une commande et éviter que le thread ne crashe.
         print(f"Erreur lors du traitement du callback '{data}': {e}")
         notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
+        
+    pass     
 
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
@@ -234,7 +236,9 @@ def process_message(message: Dict):
         balance = trader.get_usdt_balance(ex)
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
-
+        
+    pass 
+    
 def check_scheduled_reports():
     """Gère les rapports automatiques."""
     global _last_daily_report_day, _last_weekly_report_day
@@ -259,18 +263,32 @@ def check_scheduled_reports():
         balance = trader.get_usdt_balance(create_exchange())
         # CORRECTION: L'argument "days" est retiré
         notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
+        
 # ==============================================================================
 # BOUCLES ET MAIN
 # ==============================================================================
 
+def poll_telegram_updates():
+    """Récupère et distribue les mises à jour de Telegram. C'est le cœur de la réactivité."""
+    global _last_update_id
+    updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
+    for upd in updates:
+        _last_update_id = upd.get("update_id", _last_update_id)
+        if 'callback_query' in upd:
+            process_callback_query(upd['callback_query'])
+        elif 'message' in upd:
+            process_message(upd['message'])
+            
 def telegram_listener_loop():
+    """Thread dédié qui exécute la boucle de polling Telegram."""
     print("🤖 Thread Telegram démarré.")
     while True:
         try:
             poll_telegram_updates()
             time.sleep(0.5)
         except Exception as e:
-            print(f"Erreur Telegram: {e}"); time.sleep(10) # Augmentation du sleep en cas d'erreur
+            print(f"Erreur dans le thread Telegram: {e}")
+            time.sleep(5)
 
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
@@ -329,6 +347,7 @@ def main():
         trader.RISK_PER_TRADE_PERCENT
     )
 
+    notifier.send_start_banner(...)
     notifier.send_main_menu(_paused)
     
     universe = build_universe(ex)
