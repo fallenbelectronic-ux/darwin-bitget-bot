@@ -200,6 +200,7 @@ def process_callback_query(callback_query: Dict):
                 # Réaffiche le menu pour montrer le nouvel état
                 notifier.send_strategy_menu(new_strategy)
 
+       
         elif data == 'show_mode':
             current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
@@ -215,11 +216,9 @@ def process_callback_query(callback_query: Dict):
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
     
     except Exception as e:
-        # Bloc de sécurité générique pour attraper toute erreur inattendue
-        # pendant le traitement d'une commande et éviter que le thread ne crashe.
         print(f"Erreur lors du traitement du callback '{data}': {e}")
-        notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")       
-
+        notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
+        
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
     global _paused
