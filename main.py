@@ -29,7 +29,6 @@ LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
 TIMEZONE         = os.getenv("TIMEZONE", "Europe/Lisbon")
 REPORT_HOUR      = int(os.getenv("REPORT_HOUR", "21"))
 REPORT_WEEKDAY   = int(os.getenv("REPORT_WEEKDAY", "6"))
-PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE","")
 
 # --- VARIABLES D'ÉTAT ---
 _last_update_id: Optional[int] = None
@@ -358,14 +357,13 @@ def main():
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', 'NORMAL')
     
-    # Initialisation du mode de trading (PAPIER/RÉEL)
-    paper_mode_setting = PAPER_TRADING_MODE
-    if paper_mode_setting is None:
-        # Valeur par défaut de sécurité : PAPIER ('true')
-        database.set_setting('PAPER_TRADING_MODE', 'true')
-        paper_mode_setting = 'true'
-        
-    current_paper_mode = paper_mode_setting.lower() == 'false'
+    # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
+    mode_raw = database.get_setting('PAPER_TRADING_MODE', None)
+    if not mode_raw:
+        database.set_setting('PAPER_TRADING_MODE', 'true')  # défaut = PAPIER
+        mode_raw = 'true'
+
+        current_paper_mode = str(mode_raw).lower() == 'true'
     
     # Envoi de la bannière de démarrage
     notifier.send_start_banner(
