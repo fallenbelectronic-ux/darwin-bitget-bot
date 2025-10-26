@@ -44,6 +44,7 @@ def startup_checks():
     print("Vérification des configurations au démarrage...")
     required = [API_KEY, API_SECRET, PASSPHRASSE]
     is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
+    
     if not all(required) and not is_paper_mode:
         error_msg = "❌ ERREUR DE DÉMARRAGE: Clés API manquantes."
         print(error_msg); sys.exit(1)
@@ -355,9 +356,9 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
              print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
 
 def main():
+    database.setup_database()
     startup_checks()
     ex = create_exchange()
-    database.setup_database()
     
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', 'NORMAL')
