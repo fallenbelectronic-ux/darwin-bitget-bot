@@ -139,13 +139,15 @@ def process_callback_query(callback_query: Dict):
         if data == 'pause':
             with _lock: _paused = True
             notifier.tg_send("⏸️ Bot mis en pause.")
+            database.set_setting('PAUSED', 'true')
             notifier.send_main_menu(_paused)
 
         elif data == 'resume':
             with _lock: _paused = False
             notifier.tg_send("▶️ Bot relancé.")
+            database.set_setting('PAUSED', 'false')
             notifier.send_main_menu(_paused)
-            
+
         elif data == 'ping':
             notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
             
@@ -370,6 +372,12 @@ def main():
     
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', 'NORMAL')
+        
+    # Restaure l'état Pause/Reprise depuis la DB
+    global _paused
+    paused_raw = database.get_setting('PAUSED', 'false')
+    _paused = str(paused_raw).lower() == 'true'
+
     
     # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
     paper_mode_setting = database.get_setting('PAPER_TRADING_MODE', None)
