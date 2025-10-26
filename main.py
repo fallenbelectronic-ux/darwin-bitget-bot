@@ -129,6 +129,11 @@ def process_callback_query(callback_query: Dict):
     data = callback_query.get('data', '')
 
     try:
+    notifier.tg_answer_callback_query(callback_query.get('id'), "")
+    except Exception as _:
+    pass
+    
+    try:
         if data == 'pause':
             with _lock: _paused = True
             notifier.tg_send("⏸️ Bot mis en pause.")
@@ -358,12 +363,12 @@ def main():
         database.set_setting('STRATEGY_MODE', 'NORMAL')
     
     # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
-    mode_raw = database.get_setting('PAPER_TRADING_MODE', None)
-    if not mode_raw:
-        database.set_setting('PAPER_TRADING_MODE', 'true')  # défaut = PAPIER
-        mode_raw = 'true'
+    paper_mode_setting = database.get_setting('PAPER_TRADING_MODE', None)
+    if not paper_mode_setting:
+    database.set_setting('PAPER_TRADING_MODE', 'true')  # défaut = PAPIER
+    paper_mode_setting = 'true'
 
-        current_paper_mode = str(mode_raw).lower() == 'true'
+    current_paper_mode = str(paper_mode_setting).lower() == 'true'
     
     # Envoi de la bannière de démarrage
     notifier.send_start_banner(
