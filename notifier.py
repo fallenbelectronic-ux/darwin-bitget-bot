@@ -11,6 +11,7 @@ import reporting
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+TG_ALERTS_CHAT_ID = os.getenv("TELEGRAM_ALERTS_CHAT_ID", "")
 
 def _escape(text: str) -> str: return html.escape(str(text))
 
@@ -26,6 +27,18 @@ def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[st
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
+        
+def tg_answer_callback_query(callback_query_id: str, text: str = ""):
+    """Accuse réception d'un clic sur un bouton inline Telegram (évite l'impression que rien ne se passe)."""
+    if not TG_TOKEN or not callback_query_id:
+        return
+    try:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erreur answerCallbackQuery: {e}")
 
 def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
     """Envoie un rapport de signal validé, avec le statut d'exécution."""
