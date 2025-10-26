@@ -129,9 +129,9 @@ def process_callback_query(callback_query: Dict):
     data = callback_query.get('data', '')
 
     try:
-    notifier.tg_answer_callback_query(callback_query.get('id'), "")
+        notifier.tg_answer_callback_query(callback_query.get('id'), "")
     except Exception as _:
-    pass
+        pass
     
     try:
         if data == 'pause':
@@ -365,8 +365,8 @@ def main():
     # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
     paper_mode_setting = database.get_setting('PAPER_TRADING_MODE', None)
     if not paper_mode_setting:
-    database.set_setting('PAPER_TRADING_MODE', 'true')  # défaut = PAPIER
-    paper_mode_setting = 'true'
+        database.set_setting('PAPER_TRADING_MODE', 'true')  # défaut = PAPIER
+        paper_mode_setting = 'true'
 
     current_paper_mode = str(paper_mode_setting).lower() == 'true'
     
