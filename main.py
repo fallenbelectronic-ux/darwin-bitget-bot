@@ -139,10 +139,12 @@ def process_callback_query(callback_query: Dict):
         if data == 'pause':
             with _lock: _paused = True
             notifier.tg_send("⏸️ Bot mis en pause.")
-        
+            notifier.send_main_menu(_paused)
+
         elif data == 'resume':
             with _lock: _paused = False
             notifier.tg_send("▶️ Bot relancé.")
+            notifier.send_main_menu(_paused)
             
         elif data == 'ping':
             notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
