@@ -245,8 +245,11 @@ def process_message(message: Dict):
                 if size > 0:
                     database.set_setting('UNIVERSE_SIZE', size)
                     notifier.tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (appliqué au redémarrage).")
-                else: notifier.tg_send("❌ Le nombre doit être > 0.")
-            except ValueError: notifier.tg_send("❌ Valeur invalide.")
+                else:
+                    notifier.tg_send("❌ Le nombre doit être > 0.")
+            except ValueError:
+                notifier.tg_send("❌ Valeur invalide. Utilisez: /setuniverse 30")
+
                 
         elif command == "/setmaxpos" and len(parts) > 1:
             try:
@@ -254,8 +257,11 @@ def process_message(message: Dict):
                 if max_p >= 0:
                     database.set_setting('MAX_OPEN_POSITIONS', max_p)
                     notifier.tg_send(f"✅ Positions max mises à <b>{max_p}</b>.")
-                else: notifier.tg_send("❌ Le nombre doit être >= 0.")
-            except ValueError: notifier.tg_send("❌ Valeur invalide.")
+                else:
+                    notifier.tg_send("❌ Le nombre doit être >= 0.")
+            except ValueError:
+                notifier.tg_send("❌ Valeur invalide. Utilisez: /setmaxpos 3")
+   
     elif command == "/stats":
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
