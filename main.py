@@ -43,7 +43,8 @@ def startup_checks():
     """Vérifie la présence des variables d'environnement critiques."""
     print("Vérification des configurations au démarrage...")
     required = [API_KEY, API_SECRET, PASSPHRASSE]
-    if not all(required):
+    is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
+    if not all(required) and not is_paper_mode:
         error_msg = "❌ ERREUR DE DÉMARRAGE: Clés API manquantes."
         print(error_msg); sys.exit(1)
     print("✅ Configurations nécessaires présentes.")
@@ -340,7 +341,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                         # Si c'est un nouveau signal, on le met en attente
                         if symbol not in _pending_signals:
                              print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
-                             _pending_signals[symbol] = {'signal': signal, 'symbol': symbol, 'candle_timestamp': df.index[-1]}
+                             _pending_signals[symbol] = {'signal': signal, 'symbol': symbol, 'candle_timestamp': df.index[-1], 'df': df}
                              notifier.send_pending_signal_notification(symbol, signal)
                         
                         # On l'ajoute toujours à l'historique récent
