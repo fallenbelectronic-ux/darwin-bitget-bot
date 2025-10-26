@@ -169,7 +169,7 @@ def process_callback_query(callback_query: Dict):
                 "Levier": trader.LEVERAGE
             }
             notifier.send_config_message(config)
-            
+
         elif data == 'menu_signals':
             notifier.send_signals_menu()
             
@@ -181,7 +181,34 @@ def process_callback_query(callback_query: Dict):
             
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
-            
+
+        elif data == 'manage_strategy':
+            current_strategy = database.get_setting('STRATEGY_MODE', 'NORMAL')
+            notifier.send_strategy_menu(current_strategy)
+
+        elif data == 'show_mode':
+            current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
+            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
+
+        # --- SWITCH MODE (placé avant le bloc startswith('switch_to_')) ---
+        elif data == 'switch_to_REAL':
+            database.set_setting('PAPER_TRADING_MODE', 'false')
+            notifier.tg_send("🚨 <b>ATTENTION:</b> Le bot est maintenant en mode de trading <b>RÉEL</b>.")
+            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=False)
+
+        elif data == 'switch_to_PAPER':
+            database.set_setting('PAPER_TRADING_MODE', 'true')
+            notifier.tg_send("✅ Le bot est repassé en mode <b>PAPIER</b> (simulation).")
+            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
+
+        # --- STRATÉGIE (laisse tel quel) ---
+        elif data.startswith('switch_to_'):
+            new_strategy = data.replace('switch_to_', '')
+            if new_strategy in ['NORMAL', 'SPLIT']:
+                database.set_setting('STRATEGY_MODE', new_strategy)
+                notifier.tg_send(f"✅ Stratégie mise à jour en <b>{new_strategy}</b>.")
+                notifier.send_strategy_menu(new_strategy)
+
         elif data.startswith('close_trade_'):
             try:
                 trade_id_str = data.replace('close_trade_', '')
@@ -189,33 +216,6 @@ def process_callback_query(callback_query: Dict):
                 trader.close_position_manually(create_exchange(), trade_id)
             except (ValueError, IndexError):
                 notifier.tg_send("❌ Erreur : ID de trade invalide.")
-                
-        elif data == 'manage_strategy':
-            current_strategy = database.get_setting('STRATEGY_MODE', 'NORMAL')
-            notifier.send_strategy_menu(current_strategy)
-            
-        elif data.startswith('switch_to_'):
-            new_strategy = data.replace('switch_to_', '')
-            if new_strategy in ['NORMAL', 'SPLIT']:
-                database.set_setting('STRATEGY_MODE', new_strategy)
-                notifier.tg_send(f"✅ Stratégie mise à jour en <b>{new_strategy}</b>.")
-                # Réaffiche le menu pour montrer le nouvel état
-                notifier.send_strategy_menu(new_strategy)
-
-       
-        elif data == 'show_mode':
-            current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
-            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
-        
-        elif data == 'switch_to_REAL':
-            database.set_setting('PAPER_TRADING_MODE', 'false')
-            notifier.tg_send("🚨 <b>ATTENTION:</b> Le bot est maintenant en mode de trading <b>RÉEL</b>.")
-            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=False)
-            
-        elif data == 'switch_to_PAPER':
-            database.set_setting('PAPER_TRADING_MODE', 'true')
-            notifier.tg_send("✅ Le bot est repassé en mode <b>PAPIER</b> (simulation).")
-            notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
     
     except Exception as e:
         print(f"Erreur lors du traitement du callback '{data}': {e}")
