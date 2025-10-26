@@ -189,7 +189,7 @@ def get_config_menu_keyboard() -> Dict:
     }
 
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
-    pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pauser", "callback_data": "pause"}
+    pause_resume_btn = {"text": "▶️ Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pause", "callback_data": "pause"}
     return {"inline_keyboard": [
         [pause_resume_btn, {"text": "🛰️ Ping", "callback_data": "ping"}],
         [{"text": "🚀 Signaux", "callback_data": "menu_signals"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
