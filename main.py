@@ -159,7 +159,12 @@ def process_callback_query(callback_query: Dict):
             # Calcul sur les 7 derniers jours (en secondes)
             trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)
             notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
-            
+
+        elif data == 'toggle_cutwick':
+            new_val = database.toggle_setting_bool('CUT_WICK_FOR_RR', default_true=False)
+            notifier.tg_answer_callback_query(callback_query.get('id'), f"Cut-wick: {'ON' if new_val else 'OFF'}")
+            notifier.send_config_menu()
+        
         elif data == 'menu_config':
             notifier.send_config_menu()
             
