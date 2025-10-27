@@ -380,7 +380,6 @@ def main():
     global _paused
     paused_raw = database.get_setting('PAUSED', 'false')
     _paused = str(paused_raw).lower() == 'true'
-
     
     # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
     paper_mode_setting = database.get_setting('PAPER_TRADING_MODE', None)
@@ -390,13 +389,6 @@ def main():
 
     current_paper_mode = str(paper_mode_setting).lower() == 'true'
     
-    # Envoi de la bannière de démarrage
-    notifier.send_start_banner(
-        "TESTNET" if BITGET_TESTNET else "LIVE",
-        "PAPIER" if current_paper_mode else "RÉEL",
-        trader.RISK_PER_TRADE_PERCENT
-    )
-
     notifier.send_main_menu(_paused)
     
     universe = build_universe(ex)
