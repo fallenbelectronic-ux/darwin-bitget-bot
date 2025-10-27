@@ -7,6 +7,8 @@ import io
 from typing import List, Dict, Any, Optional
 import reporting
 import database
+import trader
+
 
 # --- PARAMÈTRES TELEGRAM ---
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -288,9 +290,26 @@ def send_main_menu(is_paused: bool):
     mode_text = "PAPIER" if is_paper else "RÉEL"
     etat_text = "PAUSE" if is_paused else "ACTIF"
 
+    # --- Config actuelle (DB ou valeurs par défaut/env) ---
+    try:
+        min_rr = float(database.get_setting('MIN_RR', os.getenv("MIN_RR", "3.0")))
+    except Exception:
+        min_rr = 3.0
+    try:
+        max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv("MAX_OPEN_POSITIONS", "3")))
+    except Exception:
+        max_pos = 3
+    risk = getattr(trader, "RISK_PER_TRADE_PERCENT", 1.0)
+    leverage = getattr(trader, "LEVERAGE", 1)
+
     text = (
         f"🤖 <b>Panneau de Contrôle</b>\n\n"
-        f"Mode: <b>{mode_text}</b> • État: <b>{etat_text}</b>"
+        f"Mode: <b>{mode_text}</b> • État: <b>{etat_text}</b>\n\n"
+        f"<b>🔧 Configuration</b>\n"
+        f"- RR Min: <code>{min_rr:.1f}</code>\n"
+        f"- Risque/Trade: <code>{risk:.1f}%</code>\n"
+        f"- Positions Max: <code>{max_pos}</code>\n"
+        f"- Levier: <code>{leverage}</code>"
     )
 
     keyboard = get_main_menu_keyboard(is_paused)
@@ -326,7 +345,6 @@ def send_main_menu(is_paused: bool):
         if data.get("ok"):
             new_id = str(data["result"]["message_id"])
             database.set_setting('MAIN_MENU_MESSAGE_ID', new_id)
-            # Pin (ignoré si le bot n'a pas les droits)
             try:
                 pin_payload = {"chat_id": TG_CHAT_ID, "message_id": int(new_id), "disable_notification": True}
                 requests.post(f"{TELEGRAM_API}/pinChatMessage", json=pin_payload, timeout=10)
