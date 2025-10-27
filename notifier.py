@@ -257,7 +257,8 @@ def send_main_menu(is_paused: bool):
 
         # Stratégie actuelle
     current_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
-
+    cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    cw_chip = f"✂️ Couper mèches      : <code>{'ON' if cw else 'OFF'}</code>\n"
 
     text = (
         f"<b>💹🤖 Darwin Bot</b>\n"
@@ -270,6 +271,7 @@ def send_main_menu(is_paused: bool):
         f"🎯 RR Minimum   : <code>{min_rr:.1f}</code>\n"
         f"📊 Positions Max: <code>{max_pos}</code>\n"
         f"🧭 Stratégie    : <code>{_escape(current_strategy)}</code>\n"
+        f"{cw_chip}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🛠️ Commandes</b>\n"
         f"🌐 <code>/setuniverse &lt;nombre&gt;</code> — Taille du scan\n"
