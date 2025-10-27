@@ -23,15 +23,32 @@ def setup_database():
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
     ''')
+    # Migrations idempotentes simples
+    try:
+        conn.cursor().execute("ALTER TABLE trades ADD COLUMN pnl_percent REAL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.cursor().execute("ALTER TABLE trades ADD COLUMN entry_atr REAL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.cursor().execute("ALTER TABLE trades ADD COLUMN entry_rsi REAL DEFAULT 0")
+    except Exception:
+        pass
+    
     conn.commit(); conn.close()
 
-def create_trade(symbol, side, regime, entry, sl, tp, qty, risk, strat):
-    conn = get_conn()
-    conn.cursor().execute(
-        "INSERT INTO trades (symbol, side, regime, status, entry_price, sl_price, tp_price, quantity, risk_percent, management_strategy, open_timestamp) VALUES (?,?,?, 'OPEN',?,?,?,?,?,?,?)",
-        (symbol, side, regime, entry, sl, tp, qty, risk, strat, int(time.time()))
+def create_trade(symbol, side, regime, entry_price, sl_price, tp_price, quantity, risk_percent, management_strategy, entry_atr=0.0, entry_rsi=0.0):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO trades (symbol, side, regime, status, entry_price, sl_price, tp_price, quantity, risk_percent, management_strategy, breakeven_status, open_timestamp, pnl, close_timestamp) "
+        "VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, 'PENDING', ?, 0, NULL)",
+        (symbol, side, regime, entry_price, sl_price, tp_price, quantity, risk_percent, management_strategy, int(time.time()))
     )
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
     """Met à jour un trade après sa mise à breakeven."""
@@ -62,6 +79,14 @@ def set_setting(key: str, value: Any):
     conn.commit()
     conn.close()
     print(f"DB: Paramètre '{key}' mis à jour.")
+
+def toggle_setting_bool(key: str, default_true: bool = False) -> bool:
+    """Bascule un booléen en base et retourne la nouvelle valeur."""
+    cur = str(get_setting(key, 'true' if default_true else 'false')).lower() == 'true'
+    new_val = 'false' if cur else 'true'
+    set_setting(key, new_val)
+    return new_val == 'true'
+
 
 def is_position_open(symbol: str) -> bool:
     """Vérifie si une position est déjà ouverte pour un symbole."""
@@ -120,15 +145,3 @@ def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
-def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
-    """Met à jour un trade après sa mise à breakeven."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE trades SET breakeven_status = 'ACTIVATED', quantity = ?, sl_price = ? WHERE id = ?",
-        (remaining_quantity, new_sl, trade_id)
-    )
-    conn.commit()
-    conn.close()
-    print(f"DB: Trade #{trade_id} mis à breakeven.")
