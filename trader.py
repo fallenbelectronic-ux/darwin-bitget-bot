@@ -184,7 +184,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if len(df) >= lookback:
         recent = df.iloc[-lookback:]
 
-        # Streak haussier (clôtures >= bb80_up consécutives en partant de la plus récente)
         streak_up = 0
         for i in range(len(recent)):
             row = recent.iloc[-1 - i]
@@ -195,7 +194,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             else:
                 break
 
-        # Streak baissier (clôtures <= bb80_lo consécutives)
         streak_down = 0
         for i in range(len(recent)):
             row = recent.iloc[-1 - i]
@@ -261,7 +259,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    # Garde-fou : si excès prolongé, on saute la contre-tendance (on conserve un éventuel signal de tendance)
     if not allow_countertrend:
         if signal:
             signal['bb20_mid'] = last['bb20_mid']
@@ -326,7 +323,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return signal
 
     return None
-
 
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
@@ -396,25 +392,33 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             if notional_value < MIN_NOTIONAL_VALUE:
                 return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
 
-            # Utiliser ces valeurs corrigées dans params (convention Bitget)
-            params = {
-                'stopLossPrice': sl,
-                'takeProfitPrice': tp
-            }
+            # 1) Entrée au marché (AUCUN stopLossPrice / takeProfitPrice ici)
+            order = ex.create_market_order(symbol, signal['side'], quantity)
 
-            order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
-            
-            time.sleep(3)
-            position = ex.fetch_position(symbol)
-            if not position or float(position.get('stopLossPrice', 0)) == 0:
-                print("🚨 ALERTE SÉCURITÉ : SL non détecté ! Clôture d'urgence.")
-                ex.create_market_order(symbol, 'sell' if signal['side'] == 'buy' else 'buy', quantity, params={'reduceOnly': True})
-                return False, "ERREUR CRITIQUE: Stop Loss non placé. Position clôturée."
-            
+            # 2) Créer les 2 ordres reduceOnly SÉPARÉS (Bitget n'accepte qu'UNE clé par appel)
+            close_side = 'sell' if signal['side'] == 'buy' else 'buy'
+
+            # SL
+            ex.create_order(
+                symbol, 'limit', close_side, quantity, price=None,
+                params={'stopLossPrice': sl, 'reduceOnly': True}
+            )
+            # TP
+            ex.create_order(
+                symbol, 'limit', close_side, quantity, price=None,
+                params={'takeProfitPrice': tp, 'reduceOnly': True}
+            )
+
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
         except Exception as e:
+            # Tentative de clôture d'urgence si l'un des ordres a échoué
+            try:
+                close_side = 'sell' if signal['side'] == 'buy' else 'buy'
+                ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True})
+            except Exception:
+                pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
             return False, f"Erreur d'exécution: {e}"
 
@@ -444,6 +448,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
     
     return True,"Position ouverte avec succès."
+
 
 def manage_open_positions(ex: ccxt.Exchange):
     """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/Contre-tendance, puis trailing après BE."""
@@ -477,14 +482,18 @@ def manage_open_positions(ex: ccxt.Exchange):
                     # 1) Clôturer 50% (reduceOnly)
                     ex.create_market_order(pos['symbol'], close_side, qty_to_close, params={'reduceOnly': True})
 
-                    # 2) Passer le reste à BE (annule anciens ordres puis recrée OCO)
+                    # 2) Passer le reste à BE: annule anciens ordres puis recrée SL et TP séparément
                     ex.cancel_all_orders(pos['symbol'])
                     fees_bps = float(database.get_setting('FEES_BPS', 5))  # 5 bps = 0.05%
                     fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                     new_sl_be = pos['entry_price'] * fee_factor
 
-                    params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price'], 'reduceOnly': True}
-                    ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None, params=params)
+                    # SL seul
+                    ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None,
+                                    params={'stopLossPrice': new_sl_be, 'reduceOnly': True})
+                    # TP inchangé seul
+                    ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None,
+                                    params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True})
 
                     # 3) DB + notif
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
@@ -511,8 +520,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                         new_sl_be = float(pos['entry_price']) * fee_factor
 
                         close_side = 'sell' if is_long else 'buy'
-                        params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price'], 'reduceOnly': True}
-                        ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None, params=params)
+                        # SL BE seul
+                        ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
+                                        params={'stopLossPrice': new_sl_be, 'reduceOnly': True})
+                        # TP inchangé seul
+                        ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
+                                        params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True})
 
                         database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl_be)
                         notifier.send_breakeven_notification(pos['symbol'], 0.0, pos['quantity'])
@@ -529,8 +542,8 @@ def manage_open_positions(ex: ccxt.Exchange):
 
                 # Garde-fou BE dynamique : activer le trailing seulement après K clôtures au-delà du BE, sans réintégration
                 try:
-                    k_needed = int(database.get_setting('BE_ACTIVATION_K', 2))         # nb de clôtures consécutives > BE (long) ou < BE (short)
-                    m_window = int(database.get_setting('BE_NO_REENTRY_M', 3))         # fenêtre de bougies où aucune réintégration BE n'est tolérée
+                    k_needed = int(database.get_setting('BE_ACTIVATION_K', 2))
+                    m_window = int(database.get_setting('BE_NO_REENTRY_M', 3))
                 except Exception:
                     k_needed, m_window = 2, 3
 
@@ -570,11 +583,15 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-                # Remplacer l’OCO existant par un nouveau avec SL trailé
+                # Remplacer les ordres existants par 2 ordres séparés : SL trailé + TP courant
                 ex.cancel_all_orders(pos['symbol'])
                 close_side = 'sell' if is_long else 'buy'
-                params = {'stopLossPrice': new_sl, 'takeProfitPrice': pos['tp_price'], 'reduceOnly': True}
-                ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None, params=params)
+                # SL trailé seul
+                ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
+                                params={'stopLossPrice': new_sl, 'reduceOnly': True})
+                # TP inchangé seul
+                ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
+                                params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True})
 
                 # DB + notif
                 try:
@@ -614,7 +631,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 current_tp = float(pos['tp_price'])
                 improve = (is_long and target_tp > current_tp * 1.0002) or ((not is_long) and target_tp < current_tp * 0.9998)
                 if improve:
-                    # Ajuster la précision
+                    # Ajuster la précision (optionnel)
                     try:
                         target_tp = float(ex.price_to_precision(pos['symbol'], target_tp))
                     except Exception:
@@ -628,12 +645,16 @@ def manage_open_positions(ex: ccxt.Exchange):
                     except Exception:
                         pass
 
-                    # Remplacer l'OCO avec le nouveau TP (SL inchangé)
+                    # Remplacer l'existant par 2 ordres : SL courant + nouveau TP
                     ex.cancel_all_orders(pos['symbol'])
                     close_side = 'sell' if is_long else 'buy'
                     sl_price = float(pos.get('sl_price') or pos['entry_price'])
-                    params = {'stopLossPrice': sl_price, 'takeProfitPrice': target_tp, 'reduceOnly': True}
-                    ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None, params=params)
+                    # SL (inchangé) seul
+                    ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
+                                    params={'stopLossPrice': sl_price, 'reduceOnly': True})
+                    # TP (nouveau) seul
+                    ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
+                                    params={'takeProfitPrice': target_tp, 'reduceOnly': True})
 
                     # DB + notif (si update_tp absent, on ignore)
                     try:
@@ -643,6 +664,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {pos['symbol']} → {target_tp:.6f}")
         except Exception as e:
             print(f"Erreur TP dynamique {pos['symbol']}: {e}")
+
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
