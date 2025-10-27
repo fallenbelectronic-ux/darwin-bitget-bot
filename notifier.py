@@ -442,7 +442,6 @@ def send_config_message(config: Dict):
     tg_send("\n".join(lines))
     
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
     """Calcule les stats et affiche le rapport dans le même message épinglé (pas de spam)."""
     stats = reporting.calculate_performance_stats(trades)
     text = reporting.format_report_message(title, stats, balance)
