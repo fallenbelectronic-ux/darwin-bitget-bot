@@ -472,6 +472,63 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur trailing {pos['symbol']}: {e}")
 
+        # --- TP dynamique proche des bornes de Bollinger (NORMAL & SPLIT) ---
+        try:
+            df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+            if df is None or len(df) == 0:
+                pass
+            else:
+                last = df.iloc[-1]
+                is_long = (pos['side'] == 'buy')
+                regime = pos.get('regime', 'Tendance')
+
+                bb20_mid = float(last['bb20_mid'])
+                bb80_up  = float(last['bb80_up'])
+                bb80_lo  = float(last['bb80_lo'])
+
+                # Décalage avant la borne (ex: 0.15%) configurable
+                offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
+
+                # Cible “un peu avant” la borne pertinente
+                if regime == 'Tendance':
+                    target_tp = bb80_up * (1.0 - offset_pct) if is_long else bb80_lo * (1.0 + offset_pct)
+                else:  # Contre-tendance
+                    target_tp = bb20_mid * (1.0 - offset_pct) if is_long else bb20_mid * (1.0 + offset_pct)
+
+                # N'améliorer que dans le bon sens (jamais réduire le TP)
+                current_tp = float(pos['tp_price'])
+                improve = (is_long and target_tp > current_tp * 1.0002) or ((not is_long) and target_tp < current_tp * 0.9998)
+                if improve:
+                    # Ajuster la précision
+                    try:
+                        target_tp = float(ex.price_to_precision(pos['symbol'], target_tp))
+                    except Exception:
+                        pass
+
+                    # Recharger quantité restante au cas où (post-split)
+                    try:
+                        pos_ref = database.get_trade_by_id(pos['id'])
+                        if pos_ref and float(pos_ref.get('quantity', 0)) > 0:
+                            pos['quantity'] = float(pos_ref['quantity'])
+                    except Exception:
+                        pass
+
+                    # Remplacer l'OCO avec le nouveau TP (SL inchangé)
+                    ex.cancel_all_orders(pos['symbol'])
+                    close_side = 'sell' if is_long else 'buy'
+                    sl_price = float(pos.get('sl_price') or pos['entry_price'])
+                    params = {'stopLossPrice': sl_price, 'takeProfitPrice': target_tp, 'reduceOnly': True}
+                    ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None, params=params)
+
+                    # DB + notif (si update_tp absent, on ignore)
+                    try:
+                        database.update_trade_tp(pos['id'], target_tp)
+                    except Exception:
+                        pass
+                    notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {pos['symbol']} → {target_tp:.6f}")
+        except Exception as e:
+            print(f"Erreur TP dynamique {pos['symbol']}: {e}")
+
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
     try:
