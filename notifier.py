@@ -286,7 +286,11 @@ def send_main_menu(is_paused: bool):
     mode_text = "PAPIER" if is_paper else "RÉEL"
     etat_text = "PAUSE" if is_paused else "ACTIF"
 
-    # --- Config actuelle (DB ou valeurs par défaut/env) ---
+    # Chips d’état
+    mode_chip = "🟦 Mode: <b>PAPIER</b>" if is_paper else "🟩 Mode: <b>RÉEL</b>"
+    status_chip = "🟠 État: <b>PAUSE</b>" if is_paused else "🟢 État: <b>ACTIF</b>"
+
+    # Config actuelle
     try:
         min_rr = float(database.get_setting('MIN_RR', os.getenv("MIN_RR", "3.0")))
     except Exception:
@@ -299,20 +303,25 @@ def send_main_menu(is_paused: bool):
     leverage = getattr(trader, "LEVERAGE", 1)
 
     text = (
-        f"<b>💹🤖 Darwin Bot Démarré</b>\n"
-        f"<b>Panneau de Contrôle</b>\n\n"
-        f"Mode: <b>{mode_text}</b> • État: <b>{etat_text}</b>\n\n"
+        f"<b>💹🤖 Darwin Bot</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{mode_chip} • {status_chip}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🔧 Configuration</b>\n"
-        f"- RR Min: <code>{min_rr:.1f}</code>\n"
-        f"- Risque/Trade: <code>{risk:.1f}%</code>\n"
-        f"- Positions Max: <code>{max_pos}</code>\n"
-        f"- Levier: <code>{leverage}</code>"
+        f"🟩 Risque/Trade : <code>{risk:.1f}%</code>\n"
+        f"🟦 Levier       : <code>x{leverage}</code>\n"
+        f"🎯 RR Minimum   : <code>{min_rr:.1f}</code>\n"
+        f"📊 Positions Max: <code>{max_pos}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>🛠️ Commandes</b>\n"
+        f"🌐 <code>/setuniverse &lt;nombre&gt;</code> — Taille du scan\n"
+        f"🔢 <code>/setmaxpos &lt;nombre&gt;</code> — Nb max de trades"
     )
 
     keyboard = get_main_menu_keyboard(is_paused)
     msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
 
-    # 1) Essayer d'éditer le message existant pour éviter le spam
+    # Essayer d'éditer pour éviter le spam
     if TG_TOKEN and TG_CHAT_ID and msg_id:
         try:
             payload_edit = {
@@ -329,24 +338,13 @@ def send_main_menu(is_paused: bool):
         except Exception as e:
             print(f"Erreur editMessageText: {e}")
 
-    # 2) Sinon, envoyer un nouveau message, mémoriser son id et tenter de l’épingler
+    # Sinon envoyer et mémoriser l'id (⚠️ pas d’épinglage)
     try:
-        payload_send = {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "reply_markup": keyboard
-        }
+        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
         r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
         data = r.json()
         if data.get("ok"):
-            new_id = str(data["result"]["message_id"])
-            database.set_setting('MAIN_MENU_MESSAGE_ID', new_id)
-            try:
-                pin_payload = {"chat_id": TG_CHAT_ID, "message_id": int(new_id), "disable_notification": True}
-                requests.post(f"{TELEGRAM_API}/pinChatMessage", json=pin_payload, timeout=10)
-            except Exception as e:
-                print(f"Erreur pinChatMessage: {e}")
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (menu): {e}")
 
