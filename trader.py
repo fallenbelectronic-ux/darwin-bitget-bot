@@ -4,7 +4,6 @@ import time
 import ccxt
 import pandas as pd
 from typing import Dict, Any, Optional, Tuple
-
 import database
 import notifier
 import charting
@@ -16,10 +15,36 @@ LEVERAGE = int(os.getenv("LEVERAGE", "2"))
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 MIN_RR = float(os.getenv("MIN_RR", "3.0"))
 MM_DEAD_ZONE_PERCENT = float(os.getenv("MM_DEAD_ZONE_PERCENT", "0.1"))
+MIN_NOTIONAL_VALUE = float(os.getenv("MIN_NOTIONAL_VALUE", "5"))
 
 # ==============================================================================
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
 # ==============================================================================
+
+def _maybe_improve_rr_with_cut_wick(prev: pd.Series, entry: float, sl: float, tp: float, side: str) -> Tuple[float, float]:
+    """
+    Si CUT_WICK_FOR_RR est ON (DB) et si RR initial < MIN_RR mais >= 2.8,
+    recalcule un RR en 'coupant la mèche' (SL basé sur le corps de la bougie de déclenchement).
+    Retourne (rr_alternatif, sl_original_ignoré). Le SL réel n’est pas modifié ici.
+    """
+    enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    if not enabled:
+        if side == 'buy':
+            return ((tp - entry) / (entry - sl), sl)
+        else:
+            return ((entry - tp) / (sl - entry), sl)
+
+    open_, close_ = float(prev['open']), float(prev['close'])
+    body_high, body_low = (max(open_, close_), min(open_, close_))
+    if side == 'buy':
+        sl_body = body_low  # coupe la mèche basse
+        rr_alt = (tp - entry) / (entry - sl_body) if (entry - sl_body) > 0 else 0.0
+        return rr_alt, sl
+    else:
+        sl_body = body_high # coupe la mèche haute
+        rr_alt = (entry - tp) / (sl_body - entry) if (sl_body - entry) > 0 else 0.0
+        return rr_alt, sl
+
 def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
     """Analyse la forme de la bougie de réaction pour valider le signal."""
     body = abs(candle['close'] - candle['open'])
@@ -40,7 +65,7 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
         
     return False
 
-def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
+def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """Logique de détection complète avec les règles avancées."""
     if df is None or len(df) < 81: return None
     
@@ -77,8 +102,14 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
         tp = last['bb80_up']
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
-            if rr >= MIN_RR:
-                signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+            rr_final = rr
+            if rr < MIN_RR and rr >= 2.8:
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                rr_final = max(rr, rr_alt)
+            if rr_final >= MIN_RR:
+                signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
+
                 
     elif not is_above_mm80 and touched_bb20_high:
         regime = "Tendance"
@@ -87,8 +118,12 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
         tp = last['bb80_lo']
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
-            if rr >= MIN_RR:
-                signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+            rr_final = rr
+            if rr < MIN_RR and rr >= 2.8:
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                rr_final = max(rr, rr_alt)
+            if rr_final >= MIN_RR:
+                signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
     # Pattern 2: Contre-Tendance (Double Extrême)
     if not signal:
@@ -102,8 +137,14 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
             tp = last['bb20_mid']
             if (entry - sl) > 0:
                 rr = (tp - entry) / (entry - sl)
-                if rr >= MIN_RR:
-                    signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+                rr_final = rr
+                if rr < MIN_RR and rr >= 2.8:
+                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                    rr_final = max(rr, rr_alt)
+                if rr_final >= MIN_RR:
+                    signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
+        
         elif touched_double_high:
             regime = "Contre-tendance"
             entry = last['close']
@@ -111,8 +152,13 @@ def detect_signal(df: pd.DataFrame, sym: str) -> Optional[Dict[str, Any]]:
             tp = last['bb20_mid']
             if (sl - entry) > 0:
                 rr = (entry - tp) / (sl - entry)
-                if rr >= MIN_RR:
-                    signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr}
+                rr_final = rr
+                if rr < MIN_RR and rr >= 2.8:
+                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                    rr_final = max(rr, rr_alt)
+                if rr_final >= MIN_RR:
+                    signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
     
     if signal:
         signal['bb20_mid'] = last['bb20_mid']
@@ -171,7 +217,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     signal['entry'] = final_entry_price
     
     management_strategy = "NORMAL"
-    if database.get_setting('STRATEGY_MODE', 'NORMAL').upper() == 'SPLIT' and signal['regime'] == 'Contre-tendance':
+    if database.get_setting('STRATEGY_MODE', 'NORMAL').upper() == 'SPLIT':
         management_strategy = "SPLIT"
         
     database.create_trade(
@@ -230,7 +276,10 @@ def manage_open_positions(ex: ccxt.Exchange):
                     
                     # 2. Mettre à Breakeven le reste (approche robuste)
                     ex.cancel_all_orders(pos['symbol']) # Annuler les anciens SL/TP
-                    new_sl_be = pos['entry_price']
+                    fees_bps = float(database.get_setting('FEES_BPS', 5))  # 5 bps = 0.05% par défaut
+                    fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
+                    new_sl_be = pos['entry_price'] * fee_factor
+
                     # Créer un nouvel ordre OCO (One-Cancels-the-Other) pour SL et TP
                     params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price']}
                     ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None, params=params)
@@ -273,7 +322,7 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             ex.create_market_order(trade['symbol'], 'sell' if trade['side'] == 'buy' else 'buy', trade['quantity'], params={'reduceOnly': True})
         
         # Calcule un PNL approximatif, mais l'idéal serait d'avoir le prix de sortie réel
-        database.close_trade(trade_id, status='CLOSED_MANUAL', exit_price=trade['entry_price'])
+        database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
         notifier.tg_send(f"✅ Position sur {trade['symbol']} (Trade #{trade_id}) fermée manuellement.")
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {trade['symbol']}", e)
