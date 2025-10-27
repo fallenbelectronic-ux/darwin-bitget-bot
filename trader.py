@@ -65,6 +65,97 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
         
     return False
 
+def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
+    """
+    Calcule le SL à partir de la bougie d'ancrage (AU-DESSUS/EN-DESSOUS de l'extrême de sa MÈCHE) + ATR*K.
+    Règle:
+      - Short  : SL = au-dessus du PLUS HAUT de la bougie d'ancrage + ATR*K
+      - Long   : SL = au-dessous du PLUS BAS  de la bougie d'ancrage - ATR*K
+
+    Sélection de la bougie d'ancrage:
+      - On cherche dans une fenêtre récente (par défaut ANCHOR_WINDOW, def=3).
+      - On EXCLUT la bougie de réaction (la toute dernière) pour se caler sur le "contact/anchoring".
+      - Pour un Short : on prend la bougie au PLUS HAUT max (tie-break: mèche haute la plus longue).
+      - Pour un Long  : on prend la bougie au PLUS BAS  min (tie-break: mèche basse la plus longue).
+
+    K = SL_ATR_K (def 0.125). ATR de la bougie d’ancrage si dispo, sinon fallback sur la dernière.
+    """
+    if df is None or len(df) < 3:
+        return 0.0
+
+    # Fenêtre de recherche (exclut la dernière bougie = réaction)
+    try:
+        window = int(database.get_setting('ANCHOR_WINDOW', 3))
+    except Exception:
+        window = 3
+    window = max(1, min(window, len(df) - 1))  # -1 car on exclut la dernière
+    search = df.iloc[-(window+1):-1].copy()    # [ ... , avant-dernière ]  (exclut la dernière)
+
+    # Coefficient ATR (réduction confirmée à 0.125)
+    try:
+        atr_k = float(database.get_setting('SL_ATR_K', 0.125))
+    except Exception:
+        atr_k = 0.125
+
+    if len(search) == 0:
+        search = df.iloc[:-1]  # fallback : tout sauf la dernière
+        if len(search) == 0:
+            return 0.0
+
+    # Helpers mèche
+    def wick_high(row):
+        o, c, h = float(row['open']), float(row['close']), float(row['high'])
+        body_top = max(o, c)
+        return max(0.0, h - body_top)
+
+    def wick_low(row):
+        o, c, l = float(row['open']), float(row['close']), float(row['low'])
+        body_bot = min(o, c)
+        return max(0.0, body_bot - l)
+
+    # Sélection de l’ancre
+    if side == 'sell':
+        # 1) indice du plus haut absolu
+        idx_max_high = search['high'].astype(float).idxmax()
+        candidate = search.loc[idx_max_high]
+        # 2) parmi les égalités éventuelles, on préfère la plus grande mèche haute
+        same_high = search[search['high'].astype(float) == float(candidate['high'])]
+        if len(same_high) > 1:
+            idx = same_high.apply(wick_high, axis=1).astype(float).idxmax()
+            anchor = same_high.loc[idx]
+        else:
+            anchor = candidate
+
+        high_anchor = float(anchor['high'])
+        # ATR sur l’ancre, fallback dernière ligne
+        try:
+            atr_anchor = float(anchor.get('atr', df.iloc[-1].get('atr', 0.0)))
+        except Exception:
+            atr_anchor = float(df.iloc[-1].get('atr', 0.0))
+        atr_anchor = max(0.0, atr_anchor)
+
+        return high_anchor + atr_anchor * atr_k
+
+    else:  # side == 'buy'
+        idx_min_low = search['low'].astype(float).idxmin()
+        candidate = search.loc[idx_min_low]
+        same_low = search[search['low'].astype(float) == float(candidate['low'])]
+        if len(same_low) > 1:
+            idx = same_low.apply(wick_low, axis=1).astype(float).idxmax()
+            anchor = same_low.loc[idx]
+        else:
+            anchor = candidate
+
+        low_anchor = float(anchor['low'])
+        try:
+            atr_anchor = float(anchor.get('atr', df.iloc[-1].get('atr', 0.0)))
+        except Exception:
+            atr_anchor = float(df.iloc[-1].get('atr', 0.0))
+        atr_anchor = max(0.0, atr_anchor)
+
+        return low_anchor - atr_anchor * atr_k
+
+
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """Logique de détection complète avec les règles avancées."""
     if df is None or len(df) < 81:
@@ -129,7 +220,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_above_mm80 and touched_bb20_low:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(prev['low']) - (float(prev['atr']) * 0.25)
+        sl = float(_anchor_sl_from_extreme(df, 'buy'))
         tp = float(last['bb80_up']) - max(
             0.25 * float(prev.get('atr', 0.0)),
             0.12 * max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0)
@@ -151,7 +242,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     elif (not is_above_mm80) and touched_bb20_high:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(prev['high']) + (float(prev['atr']) * 0.25)
+        sl = float(_anchor_sl_from_extreme(df, 'sell'))
         tp = float(last['bb80_lo']) + max(
             0.25 * float(prev.get('atr', 0.0)),
             0.12 * max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0)
@@ -187,7 +278,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if touched_double_low:
             regime = "Contre-tendance"
             entry = float(last['close'])
-            sl = float(prev['low']) - (float(prev['atr']) * 0.25)
+            sl = float(_anchor_sl_from_extreme(df, 'buy'))
             tp = float(last['bb20_mid']) - max(
                 0.25 * float(prev.get('atr', 0.0)),
                 0.12 * max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0)
@@ -209,7 +300,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         elif touched_double_high:
             regime = "Contre-tendance"
             entry = float(last['close'])
-            sl = float(prev['high']) + (float(prev['atr']) * 0.25)
+            sl = float(_anchor_sl_from_extreme(df, 'sell'))
             tp = float(last['bb20_mid']) + max(
                 0.25 * float(prev.get('atr', 0.0)),
                 0.12 * max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0)
@@ -235,6 +326,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return signal
 
     return None
+
 
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
