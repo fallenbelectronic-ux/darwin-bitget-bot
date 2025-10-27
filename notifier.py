@@ -6,6 +6,7 @@ import requests
 import io
 from typing import List, Dict, Any, Optional
 import reporting
+import database
 
 # --- PARAMÈTRES TELEGRAM ---
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -256,7 +257,57 @@ def send_start_banner(platform: str, trading: str, risk: float):
     tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n- Plateforme: <code>{_escape(platform)}</code>\n- Mode: <b>{_escape(trading)}</b>\n- Risque: <code>{risk}%</code>")
     
 def send_main_menu(is_paused: bool):
-    tg_send("🤖 **Panneau de Contrôle**", reply_markup=get_main_menu_keyboard(is_paused))
+    mode_raw = database.get_setting('PAPER_TRADING_MODE', 'true')
+    is_paper = str(mode_raw).lower() == 'true'
+    mode_text = "PAPIER" if is_paper else "RÉEL"
+    etat_text = "PAUSE" if is_paused else "ACTIF"
+
+    text = (
+        f"🤖 <b>Panneau de Contrôle</b>\n\n"
+        f"Mode: <b>{mode_text}</b> • État: <b>{etat_text}</b>"
+    )
+
+    keyboard = get_main_menu_keyboard(is_paused)
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
+
+    # 1) Essayer d'éditer le message existant pour éviter le spam
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload_edit = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return
+        except Exception as e:
+            print(f"Erreur editMessageText: {e}")
+
+    # 2) Sinon, envoyer un nouveau message, mémoriser son id et tenter de l’épingler
+    try:
+        payload_send = {
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": keyboard
+        }
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            new_id = str(data["result"]["message_id"])
+            database.set_setting('MAIN_MENU_MESSAGE_ID', new_id)
+            # Pin (ignoré si le bot n'a pas les droits)
+            try:
+                pin_payload = {"chat_id": TG_CHAT_ID, "message_id": int(new_id), "disable_notification": True}
+                requests.post(f"{TELEGRAM_API}/pinChatMessage", json=pin_payload, timeout=10)
+            except Exception as e:
+                print(f"Erreur pinChatMessage: {e}")
+    except Exception as e:
+        print(f"Erreur sendMessage (menu): {e}")
 
 def send_config_menu():
     tg_send("⚙️ **Menu Configuration**", reply_markup=get_config_menu_keyboard())
