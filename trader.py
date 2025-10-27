@@ -265,7 +265,51 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     if not is_paper_mode:
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            params = {'stopLoss': {'triggerPrice': signal['sl']}, 'takeProfit': {'triggerPrice': signal['tp']}}
+
+            # Garde-fou SL/TP vs prix d'entrée (Bitget: long -> SL < entry < TP ; short -> TP < entry < SL)
+            gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))  # 0.03% par défaut
+            price_ref = float(entry_price)
+            side = signal['side']
+
+            sl = float(signal['sl'])
+            tp = float(signal['tp'])
+
+            if side == 'sell':  # SHORT
+                if sl <= price_ref:
+                    sl = price_ref * (1.0 + gap_pct)
+                if tp >= price_ref:
+                    tp = price_ref * (1.0 - gap_pct)
+            else:  # BUY (LONG)
+                if sl >= price_ref:
+                    sl = price_ref * (1.0 - gap_pct)
+                if tp <= price_ref:
+                    tp = price_ref * (1.0 + gap_pct)
+
+            # Ajuster à la précision de l'exchange
+            try:
+                sl = float(ex.price_to_precision(symbol, sl))
+                tp = float(ex.price_to_precision(symbol, tp))
+            except Exception:
+                pass
+
+            signal['sl'] = sl
+            signal['tp'] = tp
+
+            # recalcul prudent de la taille sur le SL ajusté (sans augmenter le risque prévu)
+            qty_adj = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, sl)
+            quantity = min(quantity, qty_adj)
+            
+            # Recheck notional après ajustement de la quantité
+            notional_value = quantity * entry_price
+            if notional_value < MIN_NOTIONAL_VALUE:
+                return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
+
+            # Utiliser ces valeurs corrigées dans params (convention Bitget)
+            params = {
+                'stopLossPrice': sl,
+                'takeProfitPrice': tp
+            }
+
             order = ex.create_market_order(symbol, signal['side'], quantity, params=params)
             
             time.sleep(3)
