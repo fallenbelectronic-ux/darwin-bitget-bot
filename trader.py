@@ -99,7 +99,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         regime = "Tendance"
         entry = last['close']
         sl = prev['low'] - (prev['atr'] * 0.25)
-        tp = last['bb80_up']
+        tp = float(last['bb80_up']) - max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0))
+        if tp <= entry: tp = float(last.get('bb20_up', tp))
+
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
             rr_final = rr
@@ -115,7 +117,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         regime = "Tendance"
         entry = last['close']
         sl = prev['high'] + (prev['atr'] * 0.25)
-        tp = last['bb80_lo']
+        tp = float(last['bb80_lo']) + max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0))
+        if tp >= entry: tp = float(last.get('bb20_lo', tp))
+
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
             rr_final = rr
@@ -134,7 +138,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             regime = "Contre-tendance"
             entry = last['close']
             sl = prev['low'] - (prev['atr'] * 0.25)
-            tp = last['bb20_mid']
+            tp = float(last['bb20_mid']) - max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0))
+            if tp <= entry: tp = float(last.get('bb20_up', tp))
+
             if (entry - sl) > 0:
                 rr = (tp - entry) / (entry - sl)
                 rr_final = rr
@@ -149,7 +155,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             regime = "Contre-tendance"
             entry = last['close']
             sl = prev['high'] + (prev['atr'] * 0.25)
-            tp = last['bb20_mid']
+            tp = float(last['bb20_mid']) + max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0))
+            if tp >= entry: tp = float(last.get('bb20_lo', tp))
+
             if (sl - entry) > 0:
                 rr = (entry - tp) / (sl - entry)
                 rr_final = rr
