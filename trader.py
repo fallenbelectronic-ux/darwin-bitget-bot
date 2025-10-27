@@ -435,8 +435,31 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if df is None or len(df) == 0:
                     continue
 
-                trail_ref = float(df.iloc[-1]['bb20_mid'])  # rail de trailing (MM20)
+                # Garde-fou BE dynamique : activer le trailing seulement après K clôtures au-delà du BE, sans réintégration
+                try:
+                    k_needed = int(database.get_setting('BE_ACTIVATION_K', 2))         # nb de clôtures consécutives > BE (long) ou < BE (short)
+                    m_window = int(database.get_setting('BE_NO_REENTRY_M', 3))         # fenêtre de bougies où aucune réintégration BE n'est tolérée
+                except Exception:
+                    k_needed, m_window = 2, 3
+
                 is_long = (pos['side'] == 'buy')
+                entry_px = float(pos.get('sl_price') or pos['entry_price'])
+
+                # 1) K clôtures consécutives au-delà du BE
+                closes = df['close'].astype(float).iloc[-max(k_needed, 1):]
+                if len(closes) < k_needed:
+                    continue
+                ok_streak = all(c > entry_px for c in closes) if is_long else all(c < entry_px for c in closes)
+                if not ok_streak:
+                    continue
+
+                # 2) Pas de réintégration côté opposé dans la fenêtre M
+                window = df['close'].astype(float).iloc[-max(m_window, 1):]
+                reentered = any(c <= entry_px for c in window) if is_long else any(c >= entry_px for c in window)
+                if reentered:
+                    continue
+
+                trail_ref = float(df.iloc[-1]['bb20_mid'])  # rail de trailing (MM20)
                 current_sl = float(pos.get('sl_price') or pos['entry_price'])
 
                 # Pousser le SL seulement dans le bon sens (jamais le reculer)
