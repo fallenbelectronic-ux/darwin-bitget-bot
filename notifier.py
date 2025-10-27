@@ -484,9 +484,14 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
         print(f"Erreur sendMessage (report): {e}")
 
 def format_open_positions(positions: List[Dict[str, Any]]):
-    """Formate et envoie la liste des positions ouvertes depuis la DB."""
+    """Affiche les positions ouvertes dans le message principal (pas de spam)."""
+    keyboard = get_positions_keyboard(positions) or {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
+
     if not positions:
-        return tg_send("📊 Aucune position n'est actuellement ouverte.")
+        notifier_text = "📊 Aucune position n'est actuellement ouverte."
+        edit_main(notifier_text, keyboard)
+        return
+
     lines = ["<b>📊 Positions Ouvertes (DB)</b>\n"]
     for pos in positions:
         side_icon = "📈" if pos.get('side') == 'buy' else "📉"
@@ -496,8 +501,7 @@ def format_open_positions(positions: List[Dict[str, Any]]):
             f"   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>"
         )
     message = "\n\n".join(lines)
-    keyboard = get_positions_keyboard(positions)
-    tg_send(message, reply_markup=keyboard)
+    edit_main(message, keyboard)
 
 def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
     """Formate et envoie un rapport complet des positions ouvertes, synchronisé avec l'exchange."""
