@@ -141,10 +141,6 @@ def send_mode_message(is_testnet: bool, is_paper: bool):
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (mode): {e}")
-
-
-def tg_send(text: str, reply_markup: Optional[Dict] = None):
-    if not TG_TOKEN or not TG_CHAT_ID: return
         
 def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
     """Fonction principale d'envoi de message texte."""
@@ -541,15 +537,6 @@ def tg_send_error(title: str, error: Any):
     error_text = str(error)
     tg_send(f"❌ <b>Erreur: {html.escape(title)}</b>\n<code>{html.escape(error_text)}</code>")
 
-def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-    """Calcule les stats et envoie un rapport."""
-    stats = reporting.calculate_performance_stats(trades)
-    message = reporting.format_report_message(title, stats, balance)
-    tg_send(message)
-
-def tg_send_error(title: str, error: Any):
-    tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(str(error))}</code>")
-
 def format_trade_message(symbol: str, signal: Dict, quantity: float, mode: str, risk: float) -> str:
     """Construit le message pour un trade qui vient d'être ouvert."""
     side_icon = "📈" if signal['side'] == 'buy' else "📉"
@@ -594,3 +581,41 @@ def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty:
         f"Le reste de la position est maintenant à breakeven (risque zéro)."
     )
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID)
+
+def edit_main(text: str, reply_markup: Optional[Dict] = None) -> bool:
+    """Édite le message principal (épinglé). Envoie un nouveau message si l'id n'existe pas encore."""
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
+
+    # 1) Essayer d'éditer
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML"
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return True
+        except Exception as e:
+            print(f"Erreur edit_main (edit): {e}")
+
+    # 2) Sinon, envoyer et mémoriser l'id
+    try:
+        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            payload_send["reply_markup"] = reply_markup
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
+            return True
+    except Exception as e:
+        print(f"Erreur edit_main (send): {e}")
+
+    return False
+
