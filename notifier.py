@@ -64,47 +64,9 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
     target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
     tg_send(message, chat_id=target_chat_id)
 
-def send_confirmed_signal_notification(symbol: str, signal: Dict):
-    """Envoie une notification pour un signal 100% confirmé, avant la sélection."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
-    message = (
-        f"🎯 <b>Signal Confirmé {side_icon} {side_text}</b>\n\n"
-        f" paire: <code>{html.escape(symbol)}</code>\n"
-        f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n"
-        f" RR à l'ouverture: <b>x{signal['rr']:.2f}</b>"
-    )
-    tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
-
-def format_trade_message(symbol, signal, quantity, mode, risk) -> str:
-    """Formate le message pour un trade réellement ouvert."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    mode_icon = "📝" if mode == 'PAPIER' else "✅"
-    side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
-    return (
-        f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon} {side_text}</b>\n\n"
-        f" paire: <code>{html.escape(symbol)}</code>\n"
-        f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
-        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
-        f" SL: <code>{signal['sl']:.5f}</code>\n"
-        f" TP: <code>{signal['tp']:.5f}</code>\n\n"
-        f" Quantité: <code>{quantity:.4f}</code>\n"
-        f" Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
-    )
 # ==============================================================================
 # FONCTIONS DE COMMUNICATION DE BASE
 # ==============================================================================
-
-def send_config_message(min_rr: float, risk: float, max_pos: int, leverage: int):
-    """Envoie un message affichant la configuration actuelle du bot."""
-    message = ( f"<b>⚙️ Configuration Actuelle</b>\n\n"
-               f" - RR Min: <code>{min_rr}</code>\n - Risque: <code>{risk}%</code>\n"
-               f" - Positions Max: <code>{max_pos}</code>\n - Levier: <code>x{leverage}</code>" )
-    tg_send(message)
-    
-def _escape(text: str) -> str:
-    """Échappe les caractères HTML."""
-    return html.escape(str(text))
 
 def send_mode_message(is_testnet: bool, is_paper: bool):
     platform_mode = "TESTNET" if is_testnet else "LIVE"
@@ -143,19 +105,6 @@ def send_mode_message(is_testnet: bool, is_paper: bool):
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (mode): {e}")
-        
-def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[str] = None):
-    """Fonction principale d'envoi de message texte."""
-    target_chat_id = chat_id or TG_CHAT_ID
-    if not TG_TOKEN or not target_chat_id:
-        return
-    try:
-        payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
-        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Erreur d'envoi Telegram: {e}")
         
 def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
     """Envoie une notification de mise à breakeven."""
@@ -208,9 +157,12 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 
 def get_config_menu_keyboard() -> Dict:
     """Crée le clavier pour le menu de configuration."""
+    cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    cw_label = f"{'🟢' if cw else '⚪️'} Cut-wick RR≥2.8 : {'ON' if cw else 'OFF'}"
     return {
         "inline_keyboard": [
             [{"text": "🔩 Afficher Config Actuelle", "callback_data": "show_config"}],
+            [{"text": cw_label, "callback_data": "toggle_cutwick"}],
             [{"text": "🖥️ Changer Mode (Papier/Réel)", "callback_data": "show_mode"}],
             [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
             [{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]
@@ -453,8 +405,10 @@ def send_config_message(config: Dict):
     lines = ["<b>🔩 Configuration Actuelle</b>\n"]
     for key, value in config.items():
         lines.append(f"- {_escape(key)}: <code>{_escape(value)}</code>")
+    cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    lines.append(f"- Cut-wick RR≥2.8: <code>{'ON' if cw else 'OFF'}</code>")  
     tg_send("\n".join(lines))
-    
+
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
     """Calcule les stats et affiche le rapport dans le même message épinglé (pas de spam)."""
     stats = reporting.calculate_performance_stats(trades)
@@ -588,15 +542,6 @@ def send_pending_signal_notification(symbol: str, signal: Dict):
         f"Type: {_escape(signal['regime'])}\n"
         f"RR Potentiel: x{signal['rr']:.2f}\n\n"
         f"<i>En attente de la clôture de la bougie pour validation finale.</i>"
-    )
-    tg_send(message, chat_id=TG_ALERTS_CHAT_ID)
-
-def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty: float):
-    """Envoie une notification de mise à breakeven."""
-    message = (
-        f"🛡️ **Trade Sécurisé sur {_escape(symbol)} !**\n\n"
-        f"Prise de profit partielle à la MM20 avec un gain de <code>{pnl_realised:.2f} USDT</code>.\n"
-        f"Le reste de la position est maintenant à breakeven (risque zéro)."
     )
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID)
 
