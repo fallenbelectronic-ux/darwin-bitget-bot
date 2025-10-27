@@ -279,10 +279,6 @@ def get_trading_mode_keyboard(is_paper: bool) -> Dict:
 # ==============================================================================
 # MESSAGES FORMATÉS
 # ==============================================================================
-
-def send_start_banner(platform: str, trading: str, risk: float):
-    """Envoie la bannière de démarrage."""
-    tg_send(f"<b>🔔 Darwin Bot Démarré</b>\n\n- Plateforme: <code>{_escape(platform)}</code>\n- Mode: <b>{_escape(trading)}</b>\n- Risque: <code>{risk}%</code>")
     
 def send_main_menu(is_paused: bool):
     mode_raw = database.get_setting('PAPER_TRADING_MODE', 'true')
@@ -303,7 +299,8 @@ def send_main_menu(is_paused: bool):
     leverage = getattr(trader, "LEVERAGE", 1)
 
     text = (
-        f"🤖 <b>Panneau de Contrôle</b>\n\n"
+        f"<b>💹🤖 Darwin Bot Démarré</b>\n"
+        f"<b>Panneau de Contrôle</b>\n\n"
         f"Mode: <b>{mode_text}</b> • État: <b>{etat_text}</b>\n\n"
         f"<b>🔧 Configuration</b>\n"
         f"- RR Min: <code>{min_rr:.1f}</code>\n"
