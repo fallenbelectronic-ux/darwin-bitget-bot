@@ -105,13 +105,43 @@ def _escape(text: str) -> str:
     return html.escape(str(text))
 
 def send_mode_message(is_testnet: bool, is_paper: bool):
-    """Envoie un message affichant les modes de fonctionnement avec des boutons."""
     platform_mode = "TESTNET" if is_testnet else "LIVE"
     trading_mode = "PAPIER" if is_paper else "RÉEL"
-    message = ( f"<b>🖥️ Modes de Fonctionnement</b>\n\n"
-               f"<b>Plateforme :</b> {platform_mode}\n<i>(Défini au démarrage)</i>\n\n"
-               f"<b>Trading :</b> {trading_mode}\n<i>(Changez ci-dessous)</i>" )
-    tg_send(message, reply_markup=get_trading_mode_keyboard(is_paper))
+    text = (
+        f"<b>🖥️ Modes de Fonctionnement</b>\n\n"
+        f"<b>Plateforme :</b> {platform_mode}\n"
+        f"<i>(Défini au démarrage du bot)</i>\n\n"
+        f"<b>Trading :</b> {trading_mode}\n"
+        f"<i>(Vous pouvez changer le mode de trading ci-dessous)</i>"
+    )
+    keyboard = get_trading_mode_keyboard(is_paper)
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
+
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload_edit = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return
+        except Exception as e:
+            print(f"Erreur editMessageText (mode): {e}")
+
+    try:
+        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
+    except Exception as e:
+        print(f"Erreur sendMessage (mode): {e}")
+
 
 def tg_send(text: str, reply_markup: Optional[Dict] = None):
     if not TG_TOKEN or not TG_CHAT_ID: return
@@ -310,34 +340,100 @@ def send_main_menu(is_paused: bool):
         print(f"Erreur sendMessage (menu): {e}")
 
 def send_config_menu():
-    tg_send("⚙️ **Menu Configuration**", reply_markup=get_config_menu_keyboard())
-    
+    text = "⚙️ <b>Menu Configuration</b>"
+    keyboard = get_config_menu_keyboard()
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
+
+    # Essayer d'éditer le message de menu existant
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload_edit = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return
+        except Exception as e:
+            print(f"Erreur editMessageText (config): {e}")
+
+    # Sinon, envoyer puis mémoriser l'id (premier lancement)
+    try:
+        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
+    except Exception as e:
+        print(f"Erreur sendMessage (config): {e}")
+
 def send_signals_menu():
-    tg_send("🚀 **Menu Signaux**", reply_markup=get_signals_menu_keyboard())
+    text = "🚀 <b>Menu Signaux</b>"
+    keyboard = get_signals_menu_keyboard()
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
+
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload_edit = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return
+        except Exception as e:
+            print(f"Erreur editMessageText (signaux): {e}")
+
+    try:
+        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
+    except Exception as e:
+        print(f"Erreur sendMessage (signaux): {e}")
 
 def send_strategy_menu(current_strategy: str):
-    """Envoie le menu de sélection de stratégie."""
-    message = (
+    text = (
         f"<b>⚙️ Gestion de la Stratégie</b>\n\n"
         f"Définit comment les trades de <b>contre-tendance</b> sont gérés.\n\n"
-        f"Stratégie Actuelle: <b><code>{current_strategy}</code></b>"
+        f"Stratégie Actuelle: <b><code>{_escape(current_strategy)}</code></b>"
     )
-    tg_send(message, reply_markup=get_strategy_menu_keyboard(current_strategy))
+    keyboard = get_strategy_menu_keyboard(current_strategy)
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
 
-def send_mode_message(is_testnet: bool, is_paper: bool):
-    """Envoie un message affichant les modes de fonctionnement avec des boutons."""
-    platform_mode = "TESTNET" if is_testnet else "LIVE"
-    trading_mode = "PAPIER" if is_paper else "RÉEL"
-    
-    message = (
-        f"<b>🖥️ Modes de Fonctionnement</b>\n\n"
-        f"<b>Plateforme :</b> {platform_mode}\n"
-        f"<i>(Défini au démarrage du bot)</i>\n\n"
-        f"<b>Trading :</b> {trading_mode}\n"
-        f"<i>(Vous pouvez changer le mode de trading ci-dessous)</i>"
-    )
-    
-    tg_send(message, reply_markup=get_trading_mode_keyboard(is_paper))
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload_edit = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return
+        except Exception as e:
+            print(f"Erreur editMessageText (stratégie): {e}")
+
+    try:
+        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
+    except Exception as e:
+        print(f"Erreur sendMessage (stratégie): {e}")
 
 def send_config_message(config: Dict):
     lines = ["<b>🔩 Configuration Actuelle</b>\n"]
@@ -346,10 +442,47 @@ def send_config_message(config: Dict):
     tg_send("\n".join(lines))
     
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-    """Calcule les statistiques et envoie un rapport."""
+def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
+    """Calcule les stats et affiche le rapport dans le même message épinglé (pas de spam)."""
     stats = reporting.calculate_performance_stats(trades)
-    message = reporting.format_report_message(title, stats, balance)
-    tg_send(message)
+    text = reporting.format_report_message(title, stats, balance)
+
+    # petit clavier avec un bouton retour vers le menu principal
+    keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
+
+    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
+
+    # 1) Essayer d'éditer le message existant
+    if TG_TOKEN and TG_CHAT_ID and msg_id:
+        try:
+            payload_edit = {
+                "chat_id": TG_CHAT_ID,
+                "message_id": int(msg_id),
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard
+            }
+            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
+            data = r.json()
+            if data.get("ok"):
+                return
+        except Exception as e:
+            print(f"Erreur editMessageText (report): {e}")
+
+    # 2) Sinon, envoyer puis mémoriser le nouvel id (premier lancement)
+    try:
+        payload_send = {
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": keyboard
+        }
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
+    except Exception as e:
+        print(f"Erreur sendMessage (report): {e}")
 
 def format_open_positions(positions: List[Dict[str, Any]]):
     """Formate et envoie la liste des positions ouvertes depuis la DB."""
