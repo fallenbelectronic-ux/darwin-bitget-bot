@@ -302,6 +302,10 @@ def send_main_menu(is_paused: bool):
     risk = getattr(trader, "RISK_PER_TRADE_PERCENT", 1.0)
     leverage = getattr(trader, "LEVERAGE", 1)
 
+        # Stratégie actuelle
+    current_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
+
+
     text = (
         f"<b>💹🤖 Darwin Bot</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -312,6 +316,7 @@ def send_main_menu(is_paused: bool):
         f"🟦 Levier       : <code>x{leverage}</code>\n"
         f"🎯 RR Minimum   : <code>{min_rr:.1f}</code>\n"
         f"📊 Positions Max: <code>{max_pos}</code>\n"
+        f"🧭 Stratégie    : <code>{_escape(current_strategy)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🛠️ Commandes</b>\n"
         f"🌐 <code>/setuniverse &lt;nombre&gt;</code> — Taille du scan\n"
