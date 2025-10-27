@@ -215,7 +215,8 @@ def process_callback_query(callback_query: Dict):
                 database.set_setting('STRATEGY_MODE', new_strategy)
                 notifier.tg_send(f"✅ Stratégie mise à jour en <b>{new_strategy}</b>.")
                 notifier.send_strategy_menu(new_strategy)
-
+                notifier.send_main_menu(_paused)
+                
         elif data.startswith('close_trade_'):
             try:
                 trade_id_str = data.replace('close_trade_', '')
