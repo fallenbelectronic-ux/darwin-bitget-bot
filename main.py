@@ -382,7 +382,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                              _pending_signals[symbol] = {'signal': signal, 'symbol': symbol, 'candle_timestamp': df.index[-1], 'df': df}
                              #notifier.send_pending_signal_notification(symbol, signal)
 
-                            if str(database.get_setting('PENDING_ALERTS', 'false') or 'false').lower() == 'true':
+                           if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
                             notifier.send_pending_signal_notification(symbol, signal)
                                 
                         # On l'ajoute toujours à l'historique récent
