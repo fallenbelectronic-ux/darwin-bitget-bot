@@ -146,9 +146,9 @@ def process_callback_query(callback_query: Dict):
             notifier.tg_answer_callback_query(callback_query.get('id'), "▶️ Reprise")
             notifier.send_main_menu(_paused)
 
-
         elif data == 'ping':
-            notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
+            notifier.tg_answer_callback_query(callback_query.get('id'), "🛰️ Pong!")
+            notifier.send_main_menu(_paused)
             
         elif data == 'list_positions':
             notifier.format_open_positions(database.get_open_positions())
@@ -177,10 +177,14 @@ def process_callback_query(callback_query: Dict):
             notifier.send_signals_menu()
             
         elif data == 'signals_1h':
-            notifier.tg_send(get_recent_signals_message(1))
+            txt = get_recent_signals_message(1)
+            kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
+            notifier.edit_main(txt, kb)
             
         elif data == 'signals_6h':
-            notifier.tg_send(get_recent_signals_message(6))
+            txt = get_recent_signals_message(6)
+            kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
+            notifier.edit_main(txt, kb)
             
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
@@ -196,12 +200,12 @@ def process_callback_query(callback_query: Dict):
         # --- SWITCH MODE (placé avant le bloc startswith('switch_to_')) ---
         elif data == 'switch_to_REAL':
             database.set_setting('PAPER_TRADING_MODE', 'false')
-            notifier.tg_send("🚨 <b>ATTENTION:</b> Le bot est maintenant en mode de trading <b>RÉEL</b>.")
+            notifier.tg_answer_callback_query(callback_query.get('id'), "🔁 Mode: RÉEL")
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=False)
 
         elif data == 'switch_to_PAPER':
             database.set_setting('PAPER_TRADING_MODE', 'true')
-            notifier.tg_send("✅ Le bot est repassé en mode <b>PAPIER</b> (simulation).")
+            notifier.tg_answer_callback_query(callback_query.get('id'), "🔁 Mode: PAPIER")
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
 
         # --- STRATÉGIE (laisse tel quel) ---
