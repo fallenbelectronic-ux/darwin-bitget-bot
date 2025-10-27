@@ -72,6 +72,20 @@ def get_recent_signals_message(hours: int) -> str:
         side_icon = "📈" if s['signal']['side'] == 'buy' else "📉"
         lines.append(f"- <code>{ts}</code> | {side_icon} <b>{s['symbol']}</b> | RR: {s['signal']['rr']:.2f}")
     return "\n".join(lines)
+    
+def get_pending_signals_message() -> str:
+    with _lock:
+        items = list(_pending_signals.items())
+    if not items:
+        return "⏱️ Aucun signal en attente."
+    lines = [f"<b>⏱️ {len(items)} Signal(s) en attente</b>\n"]
+    for symbol, pending in items:
+        sig = pending.get('signal', {})
+        side_icon = "📈" if sig.get('side') == 'buy' else "📉"
+        rr = sig.get('rr', 0.0)
+        regime = sig.get('regime', 'N/A')
+        lines.append(f"- {side_icon} <b>{symbol}</b> | {regime} | RR: <b>{rr:.2f}</b>")
+    return "\n".join(lines)
 
 def create_exchange():
     """Crée l'objet exchange CCXT."""
@@ -138,7 +152,6 @@ def process_callback_query(callback_query: Dict):
             notifier.tg_answer_callback_query(callback_query.get('id'), "⏸️ Pause")
             notifier.send_main_menu(_paused)
 
-
         elif data == 'resume':
             with _lock: _paused = False
             notifier.tg_send("▶️ Bot relancé.")
@@ -180,7 +193,12 @@ def process_callback_query(callback_query: Dict):
 
         elif data == 'menu_signals':
             notifier.send_signals_menu()
-            
+
+        elif data == 'signals_pending':
+            txt = get_pending_signals_message()
+            kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
+            notifier.edit_main(txt, kb)  # <-- édite le message principal, ne crée pas de nouveau message
+
         elif data == 'signals_1h':
             txt = get_recent_signals_message(1)
             kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
@@ -362,8 +380,11 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                         if symbol not in _pending_signals:
                              print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
                              _pending_signals[symbol] = {'signal': signal, 'symbol': symbol, 'candle_timestamp': df.index[-1], 'df': df}
-                             notifier.send_pending_signal_notification(symbol, signal)
-                        
+                             #notifier.send_pending_signal_notification(symbol, signal)
+
+                            if str(database.get_setting('PENDING_ALERTS', 'false') or 'false').lower() == 'true':
+                            notifier.send_pending_signal_notification(symbol, signal)
+                                
                         # On l'ajoute toujours à l'historique récent
                         if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
                              _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
