@@ -140,13 +140,17 @@ def process_callback_query(callback_query: Dict):
             with _lock: _paused = True
             notifier.tg_send("⏸️ Bot mis en pause.")
             database.set_setting('PAUSED', 'true')
+            notifier.tg_answer_callback_query(callback_query.get('id'), "⏸️ Pause")
             notifier.send_main_menu(_paused)
+
 
         elif data == 'resume':
             with _lock: _paused = False
             notifier.tg_send("▶️ Bot relancé.")
             database.set_setting('PAUSED', 'false')
+            notifier.tg_answer_callback_query(callback_query.get('id'), "▶️ Reprise")
             notifier.send_main_menu(_paused)
+
 
         elif data == 'ping':
             notifier.tg_send("🛰️ Pong! Le bot est en ligne et réactif.")
