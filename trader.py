@@ -67,9 +67,10 @@ def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """Logique de détection complète avec les règles avancées."""
-    if df is None or len(df) < 81: return None
+    if df is None or len(df) < 81:
+        return None
     
-    last, prev = df.iloc[-1], df.iloc[-2] # last=réaction, prev=contact
+    last, prev = df.iloc[-1], df.iloc[-2]  # last=réaction, prev=contact
 
     # --- Filtre 0: Analyse de la bougie de réaction ---
     side_guess = 'buy' if last['close'] > last['open'] else 'sell'
@@ -77,31 +78,66 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return None
 
     # --- Filtre 1: Réintégration BB20 ---
-    # Note: Vous devez avoir une fonction close_inside_bb20 dans utils.py
     if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']):
         return None
     
     # --- Filtre 2: Zone neutre MM80 ---
-    dead_zone = last['bb80_mid'] * (MM_DEAD_ZONE_PERCENT / 100.0)
-    if abs(last['close'] - last['bb80_mid']) < dead_zone:
+    dead_zone = float(last['bb80_mid']) * (MM_DEAD_ZONE_PERCENT / 100.0)
+    if abs(float(last['close']) - float(last['bb80_mid'])) < dead_zone:
         return None
+
+    # --- Anti-excès : ignorer la CONTRE-TENDANCE après ≥ N bougies au-delà de la BB80 ---
+    skip_threshold = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
+    lookback = max(skip_threshold, 8)
+    allow_countertrend = True
+    if len(df) >= lookback:
+        recent = df.iloc[-lookback:]
+
+        # Streak haussier (clôtures >= bb80_up consécutives en partant de la plus récente)
+        streak_up = 0
+        for i in range(len(recent)):
+            row = recent.iloc[-1 - i]
+            c = float(row['close'])
+            b_up = float(row['bb80_up'])
+            if c >= b_up:
+                streak_up += 1
+            else:
+                break
+
+        # Streak baissier (clôtures <= bb80_lo consécutives)
+        streak_down = 0
+        for i in range(len(recent)):
+            row = recent.iloc[-1 - i]
+            c = float(row['close'])
+            b_lo = float(row['bb80_lo'])
+            if c <= b_lo:
+                streak_down += 1
+            else:
+                break
+
+        if streak_up >= skip_threshold or streak_down >= skip_threshold:
+            allow_countertrend = False
 
     signal = None
     
     # --- Détection des Patterns ---
-    is_above_mm80 = last['close'] > last['bb80_mid']
-    # Note: Vous devez avoir une fonction touched_or_crossed dans utils.py
+    is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
     touched_bb20_low = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_up'], "sell")
 
     # Pattern 1: Tendance (Extrême Correction)
     if is_above_mm80 and touched_bb20_low:
         regime = "Tendance"
-        entry = last['close']
-        sl = prev['low'] - (prev['atr'] * 0.25)
-        tp = float(last['bb80_up']) - max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0))
-        if tp <= entry: tp = float(last.get('bb20_up', tp))
-        if tp <= entry: return None
+        entry = float(last['close'])
+        sl = float(prev['low']) - (float(prev['atr']) * 0.25)
+        tp = float(last['bb80_up']) - max(
+            0.25 * float(prev.get('atr', 0.0)),
+            0.12 * max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0)
+        )
+        if tp <= entry:
+            tp = float(last.get('bb20_up', tp))
+        if tp <= entry:
+            return None
 
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
@@ -112,15 +148,18 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-
-                
-    elif not is_above_mm80 and touched_bb20_high:
+    elif (not is_above_mm80) and touched_bb20_high:
         regime = "Tendance"
-        entry = last['close']
-        sl = prev['high'] + (prev['atr'] * 0.25)
-        tp = float(last['bb80_lo']) + max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0))
-        if tp >= entry: tp = float(last.get('bb20_lo', tp))
-        if tp >= entry: return None
+        entry = float(last['close'])
+        sl = float(prev['high']) + (float(prev['atr']) * 0.25)
+        tp = float(last['bb80_lo']) + max(
+            0.25 * float(prev.get('atr', 0.0)),
+            0.12 * max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0)
+        )
+        if tp >= entry:
+            tp = float(last.get('bb20_lo', tp))
+        if tp >= entry:
+            return None
 
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
@@ -131,18 +170,32 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
+    # Garde-fou : si excès prolongé, on saute la contre-tendance (on conserve un éventuel signal de tendance)
+    if not allow_countertrend:
+        if signal:
+            signal['bb20_mid'] = last['bb20_mid']
+            signal['entry_atr'] = prev.get('atr', 0.0)
+            signal['entry_rsi'] = 0.0
+            return signal
+        return None
+
     # Pattern 2: Contre-Tendance (Double Extrême)
     if not signal:
-        touched_double_low = prev['low'] <= min(prev['bb20_lo'], prev['bb80_lo'])
-        touched_double_high = prev['high'] >= max(prev['bb20_up'], prev['bb80_up'])
+        touched_double_low = float(prev['low']) <= min(float(prev['bb20_lo']), float(prev['bb80_lo']))
+        touched_double_high = float(prev['high']) >= max(float(prev['bb20_up']), float(prev['bb80_up']))
 
         if touched_double_low:
             regime = "Contre-tendance"
-            entry = last['close']
-            sl = prev['low'] - (prev['atr'] * 0.25)
-            tp = float(last['bb20_mid']) - max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0))
-            if tp <= entry: tp = float(last.get('bb20_up', tp))
-            if tp <= entry: return None
+            entry = float(last['close'])
+            sl = float(prev['low']) - (float(prev['atr']) * 0.25)
+            tp = float(last['bb20_mid']) - max(
+                0.25 * float(prev.get('atr', 0.0)),
+                0.12 * max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0)
+            )
+            if tp <= entry:
+                tp = float(last.get('bb20_up', tp))
+            if tp <= entry:
+                return None
 
             if (entry - sl) > 0:
                 rr = (tp - entry) / (entry - sl)
@@ -153,14 +206,18 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 if rr_final >= MIN_RR:
                     signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-        
         elif touched_double_high:
             regime = "Contre-tendance"
-            entry = last['close']
-            sl = prev['high'] + (prev['atr'] * 0.25)
-            tp = float(last['bb20_mid']) + max(0.25*float(prev.get('atr', 0.0)), 0.12*max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0))
-            if tp >= entry: tp = float(last.get('bb20_lo', tp))
-            if tp >= entry: return None
+            entry = float(last['close'])
+            sl = float(prev['high']) + (float(prev['atr']) * 0.25)
+            tp = float(last['bb20_mid']) + max(
+                0.25 * float(prev.get('atr', 0.0)),
+                0.12 * max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0)
+            )
+            if tp >= entry:
+                tp = float(last.get('bb20_lo', tp))
+            if tp >= entry:
+                return None
 
             if (sl - entry) > 0:
                 rr = (entry - tp) / (sl - entry)
@@ -171,13 +228,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 if rr_final >= MIN_RR:
                     signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    
     if signal:
         signal['bb20_mid'] = last['bb20_mid']
-        signal['entry_atr'] = prev.get('atr', 0.0) # Utiliser .get pour plus de sécurité
-        signal['entry_rsi'] = 0.0 # Placeholder
+        signal['entry_atr'] = prev.get('atr', 0.0)
+        signal['entry_rsi'] = 0.0
         return signal
-        
+
     return None
 
 # ==============================================================================
@@ -254,7 +310,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     return True,"Position ouverte avec succès."
 
 def manage_open_positions(ex: ccxt.Exchange):
-    """Gère les positions ouvertes, notamment la stratégie SPLIT."""
+    """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/Contre-tendance, puis trailing après BE."""
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
         return
 
@@ -263,47 +319,114 @@ def manage_open_positions(ex: ccxt.Exchange):
         return
 
     for pos in open_positions:
-        # Applique la stratégie SPLIT uniquement aux trades concernés et non encore gérés
+        # --- SPLIT : demi-sortie + passage BE sur franchissement MM20/BB20_mid ---
         if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
             try:
                 current_price = ex.fetch_ticker(pos['symbol'])['last']
                 df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
-                if df is None:
+                if df is None or len(df) == 0:
                     continue
-                
-                management_trigger_price = df.iloc[-1]['bb20_mid']
-                is_long = pos['side'] == 'buy'
 
-                # Vérifie si la cible est atteinte
-                if (is_long and current_price >= management_trigger_price) or \
-                   (not is_long and current_price <= management_trigger_price):
-                    
+                management_trigger_price = df.iloc[-1]['bb20_mid']
+                is_long = (pos['side'] == 'buy')
+
+                # Déclencheur atteint ?
+                if (is_long and current_price >= management_trigger_price) or (not is_long and current_price <= management_trigger_price):
                     print(f"✅ Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
+
                     qty_to_close = pos['quantity'] / 2
                     remaining_qty = pos['quantity'] - qty_to_close
                     close_side = 'sell' if is_long else 'buy'
-                    
-                    # 1. Clôturer 50% de la position
+
+                    # 1) Clôturer 50% (reduceOnly)
                     ex.create_market_order(pos['symbol'], close_side, qty_to_close, params={'reduceOnly': True})
-                    
-                    # 2. Mettre à Breakeven le reste (approche robuste)
-                    ex.cancel_all_orders(pos['symbol']) # Annuler les anciens SL/TP
-                    fees_bps = float(database.get_setting('FEES_BPS', 5))  # 5 bps = 0.05% par défaut
+
+                    # 2) Passer le reste à BE (annule anciens ordres puis recrée OCO)
+                    ex.cancel_all_orders(pos['symbol'])
+                    fees_bps = float(database.get_setting('FEES_BPS', 5))  # 5 bps = 0.05%
                     fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                     new_sl_be = pos['entry_price'] * fee_factor
 
-                    # Créer un nouvel ordre OCO (One-Cancels-the-Other) pour SL et TP
-                    params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price']}
+                    params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price'], 'reduceOnly': True}
                     ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None, params=params)
 
-                    # 3. Mettre à jour la base de données et notifier
+                    # 3) DB + notif
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
                     database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
                     notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
-                    
+
             except Exception as e:
                 print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
-    pass
+
+        # --- NORMALE / Contre-tendance : passage BE sur franchissement MM20/BB20_mid ---
+        if pos['management_strategy'] == 'NORMAL' and pos.get('regime') == 'Contre-tendance' and pos.get('breakeven_status') == 'PENDING':
+            try:
+                df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+                if df is not None and len(df) > 0:
+                    last_close = float(df.iloc[-1]['close'])
+                    mm20 = float(df.iloc[-1]['bb20_mid'])
+                    is_long = (pos['side'] == 'buy')
+
+                    crossed = (is_long and last_close >= mm20) or ((not is_long) and last_close <= mm20)
+                    if crossed:
+                        ex.cancel_all_orders(pos['symbol'])
+                        fees_bps = float(database.get_setting('FEES_BPS', 5))
+                        fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
+                        new_sl_be = float(pos['entry_price']) * fee_factor
+
+                        close_side = 'sell' if is_long else 'buy'
+                        params = {'stopLossPrice': new_sl_be, 'takeProfitPrice': pos['tp_price'], 'reduceOnly': True}
+                        ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None, params=params)
+
+                        database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl_be)
+                        notifier.send_breakeven_notification(pos['symbol'], 0.0, pos['quantity'])
+
+            except Exception as e:
+                print(f"Erreur BE NORMAL contre-tendance {pos['symbol']}: {e}")
+
+        # --- Trailing après BE (NORMAL & SPLIT) en suivant BB20_mid ---
+        if pos.get('breakeven_status') in ('ACTIVE', 'DONE', 'BE'):
+            try:
+                df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+                if df is None or len(df) == 0:
+                    continue
+
+                trail_ref = float(df.iloc[-1]['bb20_mid'])  # rail de trailing (MM20)
+                is_long = (pos['side'] == 'buy')
+                current_sl = float(pos.get('sl_price') or pos['entry_price'])
+
+                # Pousser le SL seulement dans le bon sens (jamais le reculer)
+                new_sl = max(current_sl, trail_ref) if is_long else min(current_sl, trail_ref)
+
+                # Seuil anti-spam (~0.02%)
+                moved = (is_long and new_sl > current_sl * 1.0002) or ((not is_long) and new_sl < current_sl * 0.9998)
+                if not moved:
+                    continue
+
+                # Recharger la quantité restante depuis la DB (après éventuels splits)
+                try:
+                    pos_ref = database.get_trade_by_id(pos['id'])
+                    if pos_ref and float(pos_ref.get('quantity', 0)) > 0:
+                        pos['quantity'] = float(pos_ref['quantity'])
+                except Exception:
+                    pass
+
+                # Remplacer l’OCO existant par un nouveau avec SL trailé
+                ex.cancel_all_orders(pos['symbol'])
+                close_side = 'sell' if is_long else 'buy'
+                params = {'stopLossPrice': new_sl, 'takeProfitPrice': pos['tp_price'], 'reduceOnly': True}
+                ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None, params=params)
+
+                # DB + notif
+                try:
+                    database.update_trade_sl(pos['id'], new_sl)
+                except AttributeError:
+                    database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl)
+
+                notifier.tg_send(f"🔁 Trailing SL mis à jour sur {pos['symbol']} → {new_sl:.6f}")
+
+            except Exception as e:
+                print(f"Erreur trailing {pos['symbol']}: {e}")
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
