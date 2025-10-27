@@ -181,6 +181,7 @@ def get_signals_menu_keyboard() -> Dict:
     """Crée le clavier pour le menu des signaux."""
     return {
         "inline_keyboard": [
+            [{"text": "⏱️ Signal(s) en attente", "callback_data": "signals_pending"}],
             [{"text": "🚀 Signaux (Dernière Heure)", "callback_data": "signals_1h"}],
             [{"text": "⏱️ Signaux (6 Dernières Heures)", "callback_data": "signals_6h"}],
             [{"text": "↩️ Retour", "callback_data": "main_menu"}]
