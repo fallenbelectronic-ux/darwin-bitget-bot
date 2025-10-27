@@ -129,11 +129,6 @@ def process_callback_query(callback_query: Dict):
     """Gère les clics sur les boutons interactifs de manière robuste et lisible."""
     global _paused
     data = callback_query.get('data', '')
-
-    try:
-        notifier.tg_answer_callback_query(callback_query.get('id'), "")
-    except Exception as _:
-        pass
     
     try:
         if data == 'pause':
