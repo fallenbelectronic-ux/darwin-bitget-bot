@@ -20,7 +20,8 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
         if not getattr(ex, "markets", None):
             ex.load_markets()
 
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+        # Récupération OHLCV avec retries robustes (5xx/timeouts) — ajouté sans rien supprimer
+        ohlcv = _safe_fetch_ohlcv_with_retries(ex, symbol, timeframe, limit=limit, params={})
         if not ohlcv or len(ohlcv) < _MIN_ROWS:
             return None
 
@@ -60,6 +61,12 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
         df = df.dropna().copy()
         if len(df) < _MIN_ROWS:
             return None
+
+        return df
+
+    except Exception as e:
+        print(f"fetch_and_prepare_df error on {symbol} {timeframe}: {e}")
+        return None
 
         return df
 
