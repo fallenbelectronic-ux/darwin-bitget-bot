@@ -2,6 +2,8 @@
 import ccxt
 import pandas as pd
 import numpy as np
+import time
+import random
 from typing import Optional
 from ta.volatility import BollingerBands, AverageTrueRange
 
@@ -73,6 +75,32 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
     except Exception as e:
         print(f"fetch_and_prepare_df error on {symbol} {timeframe}: {e}")
         return None
+def _safe_fetch_ohlcv_with_retries(ex, symbol: str, timeframe: str, limit: int = 200, params: Optional[dict] = None):
+    """
+    Wrapper robuste autour ex.fetch_ohlcv avec retries exponentiels + jitter.
+    Retourne [] en cas d'échec final (le caller gère ensuite len/None).
+    """
+    if params is None:
+        params = {}
+
+    max_retries = 4
+    backoffs = [0.5, 1.0, 2.0, 4.0]  # secondes
+
+    for attempt in range(max_retries):
+        try:
+            return ex.fetch_ohlcv(symbol, timeframe, limit=limit, params=params)
+        except Exception as e:
+            msg = str(e)
+            retriable = any(substr in msg for substr in (
+                "502", "504", "429", "timeout", "timed out",
+                "Service Unavailable", "Bad Gateway", "Temporary", "Connection", "Network"
+            ))
+            if attempt < max_retries - 1 and retriable:
+                sleep_s = backoffs[min(attempt, len(backoffs)-1)] + random.random() * 0.3
+                time.sleep(sleep_s)
+                continue
+            print(f"_safe_fetch_ohlcv_with_retries final error on {symbol} {timeframe}: {e}")
+            return []
 
 def close_inside_bb20(close_price: float, bb_lo: float, bb_up: float) -> bool:
     """Vrai si la clôture est à l'intérieur (ou sur) la BB20. Garde-fous NaN."""
