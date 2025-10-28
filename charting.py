@@ -1,4 +1,3 @@
-# Fichier: charting.py
 import io
 import pandas as pd
 import mplfinance as mpf
@@ -13,16 +12,19 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             print("Erreur graphique: le DataFrame ne contient pas toutes les colonnes de BB nécessaires.")
             return None
 
+        # >>> Zoom x2 (plus proche) : 50 bougies au lieu de 100
+        BARS = 50
+
         # Style
         style = mpf.make_mpf_style(base_mpf_style='charles', gridstyle=':')
 
-        # Indicateurs (on limite à 100 bougies pour garder un rendu lisible)
+        # Indicateurs (on limite à BARS bougies pour garder un rendu lisible)
         plots = [
-            mpf.make_addplot(df['bb20_up'].tail(100), color='lightblue', width=0.8),
-            mpf.make_addplot(df['bb20_lo'].tail(100), color='lightblue', width=0.8),
-            mpf.make_addplot(df['bb80_up'].tail(100), color='orange', linestyle='dashdot', width=0.9),
-            mpf.make_addplot(df['bb80_lo'].tail(100), color='orange', linestyle='dashdot', width=0.9),
-            mpf.make_addplot(df['bb80_mid'].tail(100), color='orange', width=1.2),
+            mpf.make_addplot(df['bb20_up'].tail(BARS), color='lightblue', width=0.8),
+            mpf.make_addplot(df['bb20_lo'].tail(BARS), color='lightblue', width=0.8),
+            mpf.make_addplot(df['bb80_up'].tail(BARS), color='orange', linestyle='dashdot', width=0.9),
+            mpf.make_addplot(df['bb80_lo'].tail(BARS), color='orange', linestyle='dashdot', width=0.9),
+            mpf.make_addplot(df['bb80_mid'].tail(BARS), color='orange', width=1.2),
         ]
 
         # Lignes horizontales pour Entrée / SL / TP (cast en float pour robustesse)
@@ -31,7 +33,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
         h_widths  = [1.2, 1.2, 1.2]
 
         fig, axes = mpf.plot(
-            df.tail(100),
+            df.tail(BARS),
             type='candle',
             style=style,
             title=f"Setup de Trade: {symbol} ({signal['regime']})",
