@@ -454,6 +454,19 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         try:
             ex.set_leverage(LEVERAGE, symbol)
 
+            # -- Forcer Bitget en cross + one-way --
+            try:
+                ex.set_margin_mode('cross', symbol)
+            except Exception:
+                pass
+            try:
+                # False => one-way (unilatéral)
+                ex.set_position_mode(False, symbol)
+            except Exception:
+                pass
+
+            common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+
             # Garde-fou SL/TP vs prix d'entrée (Bitget: long -> SL < entry < TP ; short -> TP < entry < SL)
             gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))  # 0.03% par défaut
             price_ref = float(entry_price)
@@ -493,7 +506,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
                 return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
 
             # 1) Entrée au marché (AUCUN stopLossPrice / takeProfitPrice ici)
-            order = ex.create_market_order(symbol, signal['side'], quantity)
+            order = ex.create_market_order(symbol, signal['side'], quantity, params=common_params)
 
             # 2) Créer les 2 ordres reduceOnly SÉPARÉS (Bitget n'accepte qu'UNE clé par appel)
             close_side = 'sell' if signal['side'] == 'buy' else 'buy'
@@ -501,12 +514,12 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             # SL
             ex.create_order(
                 symbol, 'limit', close_side, quantity, price=None,
-                params={'stopLossPrice': sl, 'reduceOnly': True}
+                params={**common_params, 'stopLossPrice': sl, 'reduceOnly': True}
             )
             # TP
             ex.create_order(
                 symbol, 'limit', close_side, quantity, price=None,
-                params={'takeProfitPrice': tp, 'reduceOnly': True}
+                params={**common_params, 'takeProfitPrice': tp, 'reduceOnly': True}
             )
 
             if order and order.get('price'):
@@ -516,7 +529,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             # Tentative de clôture d'urgence si l'un des ordres a échoué
             try:
                 close_side = 'sell' if signal['side'] == 'buy' else 'buy'
-                ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True})
+                ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
@@ -550,6 +563,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     return True,"Position ouverte avec succès."
 
 
+
 def manage_open_positions(ex: ccxt.Exchange):
     """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/Contre-tendance, puis trailing après BE."""
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
@@ -579,8 +593,9 @@ def manage_open_positions(ex: ccxt.Exchange):
                     remaining_qty = pos['quantity'] - qty_to_close
                     close_side = 'sell' if is_long else 'buy'
 
-                    # 1) Clôturer 50% (reduceOnly)
-                    ex.create_market_order(pos['symbol'], close_side, qty_to_close, params={'reduceOnly': True})
+                    # 1) Clôturer 50% (reduceOnly + mode)
+                    ex.create_market_order(pos['symbol'], close_side, qty_to_close,
+                                           params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
 
                     # 2) Passer le reste à BE: annule anciens ordres puis recrée SL et TP séparément
                     ex.cancel_all_orders(pos['symbol'])
@@ -590,10 +605,10 @@ def manage_open_positions(ex: ccxt.Exchange):
 
                     # SL seul
                     ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None,
-                                    params={'stopLossPrice': new_sl_be, 'reduceOnly': True})
+                                    params={'stopLossPrice': new_sl_be, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
                     # TP inchangé seul
                     ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None,
-                                    params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True})
+                                    params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
 
                     # 3) DB + notif
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
@@ -622,10 +637,10 @@ def manage_open_positions(ex: ccxt.Exchange):
                         close_side = 'sell' if is_long else 'buy'
                         # SL BE seul
                         ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                        params={'stopLossPrice': new_sl_be, 'reduceOnly': True})
+                                        params={'stopLossPrice': new_sl_be, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
                         # TP inchangé seul
                         ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                        params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True})
+                                        params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
 
                         database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl_be)
                         notifier.send_breakeven_notification(pos['symbol'], 0.0, pos['quantity'])
@@ -688,10 +703,10 @@ def manage_open_positions(ex: ccxt.Exchange):
                 close_side = 'sell' if is_long else 'buy'
                 # SL trailé seul
                 ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                params={'stopLossPrice': new_sl, 'reduceOnly': True})
+                                params={'stopLossPrice': new_sl, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
                 # TP inchangé seul
                 ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True})
+                                params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
 
                 # DB + notif
                 try:
@@ -751,10 +766,10 @@ def manage_open_positions(ex: ccxt.Exchange):
                     sl_price = float(pos.get('sl_price') or pos['entry_price'])
                     # SL (inchangé) seul
                     ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                    params={'stopLossPrice': sl_price, 'reduceOnly': True})
+                                    params={'stopLossPrice': sl_price, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
                     # TP (nouveau) seul
                     ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                    params={'takeProfitPrice': target_tp, 'reduceOnly': True})
+                                    params={'takeProfitPrice': target_tp, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
 
                     # DB + notif (si update_tp absent, on ignore)
                     try:
@@ -764,6 +779,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {pos['symbol']} → {target_tp:.6f}")
         except Exception as e:
             print(f"Erreur TP dynamique {pos['symbol']}: {e}")
+
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
@@ -792,10 +808,12 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     
     try:
         if not is_paper_mode:
-            ex.create_market_order(trade['symbol'], 'sell' if trade['side'] == 'buy' else 'buy', trade['quantity'], params={'reduceOnly': True})
+            ex.create_market_order(trade['symbol'], 'sell' if trade['side'] == 'buy' else 'buy', trade['quantity'],
+                                   params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
         
         # Calcule un PNL approximatif, mais l'idéal serait d'avoir le prix de sortie réel
         database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
         notifier.tg_send(f"✅ Position sur {trade['symbol']} (Trade #{trade_id}) fermée manuellement.")
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {trade['symbol']}", e)
+
