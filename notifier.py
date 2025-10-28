@@ -156,7 +156,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
 # ==============================================================================
 
 def get_config_menu_keyboard() -> Dict:
-    """Crée le clavier pour le menu de configuration."""
+    """Crée le clavier pour le menu de configuration (avec bouton Redémarrer, protégé dans ce menu)."""
     cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
     cw_label = f"{'🟢' if cw else '⚪️'} Cut-wick RR≥2.8 : {'ON' if cw else 'OFF'}"
     return {
@@ -165,9 +165,11 @@ def get_config_menu_keyboard() -> Dict:
             [{"text": cw_label, "callback_data": "toggle_cutwick"}],
             [{"text": "🖥️ Changer Mode (Papier/Réel)", "callback_data": "show_mode"}],
             [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
+            [{"text": "🔁 Redémarrer le bot", "callback_data": "restart_bot"}],
             [{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]
         ]
     }
+
 
 def get_main_menu_keyboard(is_paused: bool) -> Dict:
     pause_resume_btn = {"text": "💹 Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pause", "callback_data": "pause"}
@@ -228,7 +230,148 @@ def get_trading_mode_keyboard(is_paper: bool) -> Dict:
     
     buttons.append([{"text": "↩️ Retour", "callback_data": "main_menu"}])
     return {"inline_keyboard": buttons}
-    
+
+def _restart_confirm_keyboard() -> Dict:
+    """Clavier de confirmation pour le redémarrage (2 étapes)."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Oui, redémarrer", "callback_data": "confirm_restart_bot"},
+                {"text": "❌ Annuler", "callback_data": "cancel_restart_bot"}
+            ]
+        ]
+    }
+
+
+def handle_restart_callback(callback_query: Dict[str, Any]) -> None:
+    """
+    Étape 1 : clic sur '🔁 Redémarrer le bot' dans le menu Configuration.
+    Affiche une confirmation en 2 boutons (Oui/Annuler), avec cooldown.
+    """
+    try:
+        cq_id = str(callback_query.get("id", "")) if callback_query else ""
+        if cq_id:
+            tg_answer_callback_query(cq_id, "Confirmez le redémarrage…")
+
+        # Cooldown anti-spam (paramétrable)
+        try:
+            cooldown = int(database.get_setting('RESTART_COOLDOWN_SEC', 60))
+        except Exception:
+            cooldown = 60
+        now = int(time.time())
+        try:
+            last = int(database.get_setting('LAST_RESTART_TS', 0))
+        except Exception:
+            last = 0
+        remaining = cooldown - (now - last)
+        if remaining > 0:
+            if cq_id:
+                tg_answer_callback_query(cq_id, f"Cooldown actif ({remaining}s)…")
+            tg_send(f"⏱️ Redémarrage refusé (cooldown {remaining}s).")
+            return
+
+        # Éditer le message courant pour afficher la confirmation
+        message = (callback_query or {}).get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        if chat_id and message_id:
+            try:
+                requests.post(
+                    f"{TELEGRAM_API}/editMessageReplyMarkup",
+                    json={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "reply_markup": _restart_confirm_keyboard()
+                    },
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"Erreur editMessageReplyMarkup (restart confirm): {e}")
+    except Exception as e:
+        tg_send_error("Redémarrage (étape 1)", e)
+
+def handle_restart_confirm(callback_query: Dict[str, Any]) -> None:
+    """
+    Étape 2 : confirmation '✅ Oui, redémarrer'.
+    Pose le timestamp de cooldown, notifie, puis quitte le process (superviseur relance).
+    """
+    try:
+        cq_id = str(callback_query.get("id", "")) if callback_query else ""
+        if cq_id:
+            tg_answer_callback_query(cq_id, "Redémarrage…")
+
+        # Poser le timestamp pour le cooldown
+        try:
+            now = int(time.time())
+            database.set_setting('LAST_RESTART_TS', str(now))
+        except Exception:
+            pass
+
+        from_obj = (callback_query or {}).get("from", {}) or {}
+        user_label = from_obj.get("username") or from_obj.get("first_name") or "inconnu"
+
+        msg_chat_id = (((callback_query or {}).get("message", {}) or {}).get("chat", {}) or {}).get("id")
+        tg_send(f"♻️ Redémarrage demandé par <b>{_escape(user_label)}</b>. Le bot va redémarrer…", chat_id=msg_chat_id or TG_CHAT_ID)
+
+        time.sleep(1.0)
+        os._exit(0)
+    except Exception as e:
+        tg_send_error("Redémarrage (étape 2)", e)
+        
+def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
+    """Annule la confirmation et ré-affiche le menu Configuration."""
+    try:
+        cq_id = str(callback_query.get("id", "")) if callback_query else ""
+        if cq_id:
+            tg_answer_callback_query(cq_id, "Annulé.")
+        # Réafficher le menu configuration
+        try:
+            text = "⚙️ <b>Menu Configuration</b>"
+            keyboard = get_config_menu_keyboard()
+            msg = (callback_query or {}).get("message") or {}
+            chat_id = (msg.get("chat") or {}).get("id")
+            message_id = msg.get("message_id")
+            if chat_id and message_id:
+                requests.post(
+                    f"{TELEGRAM_API}/editMessageText",
+                    json={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "reply_markup": keyboard
+                    },
+                    timeout=10
+                )
+        except Exception as e:
+            print(f"Erreur retour menu config: {e}")
+    except Exception as e:
+        tg_send_error("Redémarrage (annulation)", e)
+
+def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
+    """
+    Routeur minimal à appeler depuis la boucle d'updates.
+    Retourne True si géré ici (restart), sinon False.
+    """
+    try:
+        if not data:
+            return False
+        cmd = data.get("data")
+        if cmd == "restart_bot":
+            handle_restart_callback(data)
+            return True
+        if cmd == "confirm_restart_bot":
+            handle_restart_confirm(data)
+            return True
+        if cmd == "cancel_restart_bot":
+            handle_restart_cancel(data)
+            return True
+        return False
+    except Exception as e:
+        tg_send_error("Callback routing", e)
+        return False
+
+
 # ==============================================================================
 # MESSAGES FORMATÉS
 # ==============================================================================
