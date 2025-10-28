@@ -345,6 +345,7 @@ def telegram_listener_loop():
     while True:
         try:
             poll_telegram_updates()
+            check_scheduled_reports()
             time.sleep(0.5)
         except Exception as e:
             print(f"Erreur dans le thread Telegram: {e}")
@@ -365,6 +366,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 select_and_execute_best_pending_signal(ex)
                 last_hour = curr_hour
 
+            check_scheduled_reports()
             cleanup_recent_signals()
             trader.manage_open_positions(ex)
 
