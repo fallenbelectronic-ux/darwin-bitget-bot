@@ -566,7 +566,8 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
 
 def manage_open_positions(ex: ccxt.Exchange):
-    """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/Contre-tendance, puis trailing après BE."""
+    """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/Contre-tendance, puis trailing après BE.
+       Tous les ordres (clôtures, SL, TP) sont envoyés en MARKET avec reduceOnly, tdMode=cross, posMode=oneway."""
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
         return
 
@@ -593,23 +594,27 @@ def manage_open_positions(ex: ccxt.Exchange):
                     qty_to_close = pos['quantity'] / 2
                     remaining_qty = pos['quantity'] - qty_to_close
                     close_side = 'sell' if is_long else 'buy'
+                    common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
-                    # 1) Clôturer 50% (reduceOnly + mode)
-                    ex.create_market_order(pos['symbol'], close_side, qty_to_close,
-                                           params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                    # 1) Clôturer 50% (MARKET reduceOnly)
+                    ex.create_market_order(pos['symbol'], close_side, qty_to_close, params=common_params)
 
-                    # 2) Passer le reste à BE: annule anciens ordres puis recrée SL et TP séparément
+                    # 2) Passer le reste à BE: annule anciens ordres puis recrée SL et TP séparément en MARKET (triggers)
                     ex.cancel_all_orders(pos['symbol'])
                     fees_bps = float(database.get_setting('FEES_BPS', 5))  # 5 bps = 0.05%
                     fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                     new_sl_be = pos['entry_price'] * fee_factor
 
-                    # SL seul
-                    ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None,
-                                    params={'stopLossPrice': new_sl_be, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
-                    # TP inchangé seul
-                    ex.create_order(pos['symbol'], 'limit', close_side, remaining_qty, price=None,
-                                    params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                    # SL seul (market trigger)
+                    ex.create_order(
+                        pos['symbol'], 'market', close_side, remaining_qty, price=None,
+                        params={**common_params, 'stopLossPrice': float(new_sl_be), 'triggerType': 'mark'}
+                    )
+                    # TP inchangé seul (market trigger)
+                    ex.create_order(
+                        pos['symbol'], 'market', close_side, remaining_qty, price=None,
+                        params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
+                    )
 
                     # 3) DB + notif
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
@@ -636,12 +641,18 @@ def manage_open_positions(ex: ccxt.Exchange):
                         new_sl_be = float(pos['entry_price']) * fee_factor
 
                         close_side = 'sell' if is_long else 'buy'
-                        # SL BE seul
-                        ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                        params={'stopLossPrice': new_sl_be, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
-                        # TP inchangé seul
-                        ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                        params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+
+                        # SL BE seul (market trigger)
+                        ex.create_order(
+                            pos['symbol'], 'market', close_side, pos['quantity'], price=None,
+                            params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'}
+                        )
+                        # TP inchangé seul (market trigger)
+                        ex.create_order(
+                            pos['symbol'], 'market', close_side, pos['quantity'], price=None,
+                            params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
+                        )
 
                         database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl_be)
                         notifier.send_breakeven_notification(pos['symbol'], 0.0, pos['quantity'])
@@ -699,15 +710,20 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-                # Remplacer les ordres existants par 2 ordres séparés : SL trailé + TP courant
                 ex.cancel_all_orders(pos['symbol'])
                 close_side = 'sell' if is_long else 'buy'
-                # SL trailé seul
-                ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                params={'stopLossPrice': new_sl, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
-                # TP inchangé seul
-                ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                params={'takeProfitPrice': pos['tp_price'], 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+
+                # SL trailé seul (market trigger)
+                ex.create_order(
+                    pos['symbol'], 'market', close_side, pos['quantity'], price=None,
+                    params={**common_params, 'stopLossPrice': float(new_sl), 'triggerType': 'mark'}
+                )
+                # TP inchangé seul (market trigger)
+                ex.create_order(
+                    pos['symbol'], 'market', close_side, pos['quantity'], price=None,
+                    params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
+                )
 
                 # DB + notif
                 try:
@@ -747,12 +763,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 current_tp = float(pos['tp_price'])
                 improve = (is_long and target_tp > current_tp * 1.0002) or ((not is_long) and target_tp < current_tp * 0.9998)
                 if improve:
-                    # Ajuster la précision (optionnel)
-                    try:
-                        target_tp = float(ex.price_to_precision(pos['symbol'], target_tp))
-                    except Exception:
-                        pass
-
                     # Recharger quantité restante au cas où (post-split)
                     try:
                         pos_ref = database.get_trade_by_id(pos['id'])
@@ -761,27 +771,32 @@ def manage_open_positions(ex: ccxt.Exchange):
                     except Exception:
                         pass
 
-                    # Remplacer l'existant par 2 ordres : SL courant + nouveau TP
+                    # Remplacer l'existant par 2 ordres : SL courant + nouveau TP — en MARKET triggers
                     ex.cancel_all_orders(pos['symbol'])
                     close_side = 'sell' if is_long else 'buy'
                     sl_price = float(pos.get('sl_price') or pos['entry_price'])
-                    # SL (inchangé) seul
-                    ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                    params={'stopLossPrice': sl_price, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
-                    # TP (nouveau) seul
-                    ex.create_order(pos['symbol'], 'limit', close_side, pos['quantity'], price=None,
-                                    params={'takeProfitPrice': target_tp, 'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                    common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+
+                    # SL (inchangé) seul (market trigger)
+                    ex.create_order(
+                        pos['symbol'], 'market', close_side, pos['quantity'], price=None,
+                        params={**common_params, 'stopLossPrice': sl_price, 'triggerType': 'mark'}
+                    )
+                    # TP (nouveau) seul (market trigger)
+                    ex.create_order(
+                        pos['symbol'], 'market', close_side, pos['quantity'], price=None,
+                        params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'}
+                    )
 
                     # DB + notif (si update_tp absent, on ignore)
                     try:
-                        database.update_trade_tp(pos['id'], target_tp)
+                        database.update_trade_tp(pos['id'], float(target_tp))
                     except Exception:
                         pass
-                    notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {pos['symbol']} → {target_tp:.6f}")
+                    notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {pos['symbol']} → {float(target_tp):.6f}")
         except Exception as e:
             print(f"Erreur TP dynamique {pos['symbol']}: {e}")
-
-
+            
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
