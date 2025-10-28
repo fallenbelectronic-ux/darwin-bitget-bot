@@ -304,25 +304,25 @@ def check_scheduled_reports():
     global _last_daily_report_day, _last_weekly_report_day
     try:
         tz = pytz.timezone(TIMEZONE)
-    except:
+    except Exception:
         tz = pytz.timezone("UTC")
     now = datetime.now(tz)
 
-    # Rapport quotidien
-    if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
-        _last_daily_report_day = now.day
-        trades = database.get_closed_trades_since(int(time.time()) - 86400) # 24 heures en secondes
-        balance = trader.get_usdt_balance(create_exchange())
-        # CORRECTION: L'argument "days" est retiré
-        notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
+    # Protéger les variables _last_* contre les accès concurrents
+    with _lock:
+        # Rapport quotidien
+        if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
+            _last_daily_report_day = now.day
+            trades = database.get_closed_trades_since(int(time.time()) - 86400)  # 24 heures
+            balance = trader.get_usdt_balance(create_exchange())
+            notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
 
-    # Rapport hebdomadaire
-    if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
-        _last_weekly_report_day = now.day
-        trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400) # 7 jours en secondes
-        balance = trader.get_usdt_balance(create_exchange())
-        # CORRECTION: L'argument "days" est retiré
-        notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
+        # Rapport hebdomadaire (dimanche = 6 en Europe/Lisbon par défaut)
+        if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
+            _last_weekly_report_day = now.day
+            trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)  # 7 jours
+            balance = trader.get_usdt_balance(create_exchange())
+            notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
         
 # ==============================================================================
 # BOUCLES ET MAIN
