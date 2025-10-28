@@ -13,7 +13,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             return None
 
         # >>> Zoom x2 (plus proche) : 50 bougies au lieu de 100
-        BARS = 50
+        BARS = 20
 
         # Style
         style = mpf.make_mpf_style(base_mpf_style='charles', gridstyle=':')
