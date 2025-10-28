@@ -269,14 +269,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # Si contact est à -2, vérifier qu'il n'y a pas un nouvel excès sur la barre intermédiaire
     if contact_idx == len(df) - 3:
         mid = df.iloc[-2]
-        # nouvel excès = close au-delà d'une borne jaune dans le même sens
         if float(contact['close']) > float(contact['open']):  # contact vert (probable long)
             if float(mid['close']) < float(mid['bb80_lo']):
-                pass  # ok (pas un excès contre le long)
+                pass
         if float(contact['close']) < float(contact['open']):  # contact rouge (probable short)
             if float(mid['close']) > float(mid['bb80_up']):
-                pass  # ok
-        # sinon, on ne bloque pas—tolérance légère
+                pass
 
     # --- Déterminer le sens supposé via la réaction ---
     side_guess = 'buy' if float(last['close']) > float(last['open']) else 'sell'
@@ -287,9 +285,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return None
 
     # --- Réintégrations (toujours à la réaction = last) ---
-    # Tendance : close inside BB20
     inside_bb20 = _inside(float(last['close']), float(last['bb20_lo']), float(last['bb20_up']))
-    # CT : close inside BB20 ET inside BB80 (si activé)
     inside_bb80 = _inside(float(last['close']), float(last['bb80_lo']), float(last['bb80_up']))
     ct_reintegration_ok = inside_bb20 and (inside_bb80 if ct_reintegrate_both else True)
 
@@ -301,24 +297,29 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # --- Détection des Patterns (avec contact choisi) ---
     is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
-    # contact côté BB20
     touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_up'], "sell")
+
+    # ATR de référence pour TP (par défaut 1*ATR, paramétrable via TP_ATR_K)
+    atr_ref = float(contact.get('atr', last.get('atr', 0.0)))
+    tp_atr_k = float(database.get_setting('TP_ATR_K', 1.0))
+    tp_offset = atr_ref * tp_atr_k
 
     # --- TENDANCE (extrême->réintégration BB20) ---
     if is_above_mm80 and touched_bb20_low and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(_anchor_sl_from_extreme(df, 'buy'))
+        sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL long = bas bougie - ATR*K (déjà conforme)
         prev = contact
-        tp = float(last['bb80_up']) - max(
-            0.12 * float(prev.get('atr', 0.0)),
-            0.12 * max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0)
-        )
+
+        # TP long = BB pertinente - ATR
+        target_band = float(last['bb80_up'])
+        tp = target_band - tp_offset
         if tp <= entry:
-            tp = float(last.get('bb20_up', tp))
+            tp = target_band  # fallback sans décalage
         if tp <= entry:
             return None
+
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
             rr_final = rr
@@ -331,16 +332,17 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     elif (not is_above_mm80) and touched_bb20_high and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(_anchor_sl_from_extreme(df, 'sell'))
+        sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL short = haut bougie + ATR*K (déjà conforme)
         prev = contact
-        tp = float(last['bb80_lo']) + max(
-            0.12 * float(prev.get('atr', 0.0)),
-            0.12 * max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0)
-        )
+
+        # TP short = BB pertinente - ATR
+        target_band = float(last['bb80_lo'])
+        tp = target_band - tp_offset
         if tp >= entry:
-            tp = float(last.get('bb20_lo', tp))
+            tp = target_band  # fallback sans décalage
         if tp >= entry:
             return None
+
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
             rr_final = rr
@@ -361,60 +363,55 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # --- CONTRE-TENDANCE (double extrême + réintégration stricte) ---
     if not signal:
-        # contact avec les 2 bandes (BB20 & BB80) côté pertinent,
-        # en acceptant une tolérance de contact sur la jaune (BB80)
-        if True:
-            prev = contact
-            # Long CT : low <= bb20_lo ET (low <= bb80_lo OU tolérance)
-            touched_ct_low  = (float(prev['low']) <= float(prev['bb20_lo'])) and (
-                float(prev['low']) <= float(prev['bb80_lo']) or _touched_with_tol(float(prev['low']), float(prev['bb80_lo']), 'buy', tol_yellow)
-            )
-            # Short CT : high >= bb20_up ET (high >= bb80_up OU tolérance)
-            touched_ct_high = (float(prev['high']) >= float(prev['bb20_up'])) and (
-                float(prev['high']) >= float(prev['bb80_up']) or _touched_with_tol(float(prev['high']), float(prev['bb80_up']), 'sell', tol_yellow)
-            )
+        prev = contact
+        touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
+            float(prev['low'])  <= float(prev['bb80_lo']) or _touched_with_tol(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow)
+        )
+        touched_ct_high = (float(prev['high']) >= float(prev['bb20_up'])) and (
+            float(prev['high']) >= float(prev['bb80_up']) or _touched_with_tol(float(prev['high']), float(prev['bb80_up']), 'sell', tol_yellow)
+        )
 
-            if touched_ct_low and ct_reintegration_ok:
-                regime = "Contre-tendance"
-                entry = float(last['close'])
-                sl = float(_anchor_sl_from_extreme(df, 'buy'))
-                tp = float(last['bb20_mid']) - max(
-                    0.12 * float(prev.get('atr', 0.0)),
-                    0.12 * max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0)
-                )
-                if tp <= entry:
-                    tp = float(last.get('bb20_up', tp))
-                if tp <= entry:
-                    return None
-                if (entry - sl) > 0:
-                    rr = (tp - entry) / (entry - sl)
-                    rr_final = rr
-                    if rr < MIN_RR and rr >= 2.8:
-                        rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
-                        rr_final = max(rr, rr_alt)
-                    if rr_final >= MIN_RR:
-                        signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+        if touched_ct_low and ct_reintegration_ok:
+            regime = "Contre-tendance"
+            entry = float(last['close'])
+            sl = float(_anchor_sl_from_extreme(df, 'buy'))  # conforme
+            # TP long CT = BB20_mid - ATR
+            target_band = float(last['bb20_mid'])
+            tp = target_band - tp_offset
+            if tp <= entry:
+                tp = target_band
+            if tp <= entry:
+                return None
 
-            elif touched_ct_high and ct_reintegration_ok:
-                regime = "Contre-tendance"
-                entry = float(last['close'])
-                sl = float(_anchor_sl_from_extreme(df, 'sell'))
-                tp = float(last['bb20_mid']) + max(
-                    0.12 * float(prev.get('atr', 0.0)),
-                    0.12 * max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0)
-                )
-                if tp >= entry:
-                    tp = float(last.get('bb20_lo', tp))
-                if tp >= entry:
-                    return None
-                if (sl - entry) > 0:
-                    rr = (entry - tp) / (sl - entry)
-                    rr_final = rr
-                    if rr < MIN_RR and rr >= 2.8:
-                        rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
-                        rr_final = max(rr, rr_alt)
-                    if rr_final >= MIN_RR:
-                        signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+            if (entry - sl) > 0:
+                rr = (tp - entry) / (entry - sl)
+                rr_final = rr
+                if rr < MIN_RR and rr >= 2.8:
+                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                    rr_final = max(rr, rr_alt)
+                if rr_final >= MIN_RR:
+                    signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
+        elif touched_ct_high and ct_reintegration_ok:
+            regime = "Contre-tendance"
+            entry = float(last['close'])
+            sl = float(_anchor_sl_from_extreme(df, 'sell'))  # conforme
+            # TP short CT = BB20_mid - ATR
+            target_band = float(last['bb20_mid'])
+            tp = target_band - tp_offset
+            if tp >= entry:
+                tp = target_band
+            if tp >= entry:
+                return None
+
+            if (sl - entry) > 0:
+                rr = (entry - tp) / (sl - entry)
+                rr_final = rr
+                if rr < MIN_RR and rr >= 2.8:
+                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                    rr_final = max(rr, rr_alt)
+                if rr_final >= MIN_RR:
+                    signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
     if signal:
         signal['bb20_mid'] = last['bb20_mid']
@@ -424,13 +421,194 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     return None
 
+
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
+def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
+    """
+    Vérifie la cohérence entre les positions ouvertes sur l'exchange (Bitget via CCXT)
+    et les trades 'OPEN' en base. Ne supprime rien côté exchange. Peut, en option,
+    fermer en DB les orphelins (présents en DB mais absents sur l'exchange) selon
+    le paramètre AUTO_CLOSE_DB_ORPHANS (DB, défaut false).
+
+    Retourne un dict récapitulatif:
+      {
+        "only_on_exchange": [(symbol, side, qty_ex, entry_ex), ...],
+        "only_in_db": [(id, symbol, side, qty_db), ...],
+        "qty_mismatch": [((id, symbol, side), qty_db, qty_ex), ...],
+        "matched": [(id, symbol, side, qty), ...]
+      }
+    """
+    report = {
+        "only_on_exchange": [],
+        "only_in_db": [],
+        "qty_mismatch": [],
+        "matched": [],
+    }
+
+    try:
+        # --- Récup Exchange ---
+        ex_positions_raw = []
+        try:
+            ex_positions_raw = ex.fetch_positions()
+        except Exception as e:
+            notifier.tg_send_error("Lecture des positions exchange", e)
+            ex_positions_raw = []
+
+        # Filtrer les positions réellement ouvertes (> 0)
+        ex_open = []
+        for p in ex_positions_raw or []:
+            try:
+                symbol = p.get('symbol') or (p.get('info', {}) or {}).get('symbol')
+                if not symbol:
+                    continue
+                # Unifié CCXT: 'side' (long/short), 'contracts' > 0 si ouverte (oneway)
+                contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+                if contracts <= 0:
+                    continue
+                side_raw = (p.get('side') or '').lower()
+                if side_raw in ('long', 'buy'):
+                    side = 'buy'
+                elif side_raw in ('short', 'sell'):
+                    side = 'sell'
+                else:
+                    # Fallback simple en oneway: quantité > 0 -> buy
+                    side = 'buy'
+                entry = float(p.get('entryPrice') or 0.0)
+                ex_open.append({
+                    'symbol': symbol,
+                    'side': side,
+                    'quantity': contracts,
+                    'entry_price': entry,
+                })
+            except Exception:
+                continue
+
+        # Indexation exchange par (symbol, side)
+        ex_map = {}
+        for r in ex_open:
+            ex_map[(r['symbol'], r['side'])] = r
+
+        # --- Récup DB ---
+        db_open = database.get_open_positions() or []
+        db_map = {}
+        for d in db_open:
+            try:
+                key = (d['symbol'], d['side'])
+                # Si plusieurs trades même (symbol, side), on agrège les quantités pour comparer à la position oneway
+                if key not in db_map:
+                    db_map[key] = {'ids': [d['id']], 'quantity': float(d['quantity']), 'entry_price': float(d.get('entry_price') or 0.0)}
+                else:
+                    db_map[key]['ids'].append(d['id'])
+                    db_map[key]['quantity'] += float(d['quantity'])
+            except Exception:
+                continue
+
+        # --- Comparaison ---
+        tol_qty_pct = float(database.get_setting('SYNC_QTY_TOL_PCT', 0.01))  # 1% par défaut
+        only_on_exchange, only_in_db, qty_mismatch, matched = [], [], [], []
+
+        # Cas présents côté exchange
+        for key, ex_pos in ex_map.items():
+            symbol, side = key
+            ex_qty = float(ex_pos['quantity'])
+            if key not in db_map:
+                only_on_exchange.append((symbol, side, ex_qty, ex_pos.get('entry_price', 0.0)))
+            else:
+                db_qty = float(db_map[key]['quantity'])
+                # mismatch si > tolérance
+                if db_qty == 0 and ex_qty > 0:
+                    qty_mismatch.append(((db_map[key]['ids'], symbol, side), db_qty, ex_qty))
+                else:
+                    diff_pct = abs(ex_qty - db_qty) / max(ex_qty, db_qty)
+                    if diff_pct > tol_qty_pct:
+                        qty_mismatch.append(((db_map[key]['ids'], symbol, side), db_qty, ex_qty))
+                    else:
+                        matched.append((db_map[key]['ids'], symbol, side, min(db_qty, ex_qty)))
+
+        # Cas présents uniquement en DB
+        for key, d in db_map.items():
+            if key not in ex_map:
+                symbol, side = key
+                only_in_db.append((d['ids'], symbol, side, float(d['quantity'])))
+
+        report["only_on_exchange"] = only_on_exchange
+        report["only_in_db"] = only_in_db
+        report["qty_mismatch"] = qty_mismatch
+        report["matched"] = matched
+
+        # --- Actions automatiques limitées (sûres) ---
+        auto_close_orphans = str(database.get_setting('AUTO_CLOSE_DB_ORPHANS', 'false')).lower() == 'true'
+        if auto_close_orphans and only_in_db:
+            for ids, symbol, side, qty in only_in_db:
+                try:
+                    # On ferme *en base* les trades orphelins (pas de position réelle)
+                    for tid in (ids if isinstance(ids, list) else [ids]):
+                        database.close_trade(tid, status='SYNC_CLOSED_ORPHAN', pnl=0.0)
+                    notifier.tg_send(f"🧹 Sync: trades DB orphelins fermés ({symbol} {side}, qty≈{qty}).")
+                except Exception as e:
+                    notifier.tg_send_error(f"Sync — fermeture orphelin {symbol}", e)
+
+        # Alerte synthèse
+        lines = ["🧭 Vérification positions (Exchange vs DB)"]
+        if only_on_exchange:
+            lines.append("• Uniquement sur l'exchange:")
+            for symbol, side, q, ep in only_on_exchange:
+                lines.append(f"   - {symbol} {side} qty={q} entry≈{ep}")
+        if only_in_db:
+            lines.append("• Uniquement en DB (status OPEN, pas de position réelle):")
+            for ids, symbol, side, q in only_in_db:
+                lines.append(f"   - {symbol} {side} qtyDB={q} (ids={ids})")
+        if qty_mismatch:
+            lines.append("• Écarts de quantités:")
+            for (ids, symbol, side), qdb, qex in qty_mismatch:
+                lines.append(f"   - {symbol} {side} DB={qdb} vs EX={qex} (ids={ids})")
+        if matched and not (only_on_exchange or only_in_db or qty_mismatch):
+            lines.append("• OK: toutes les positions concordent.")
+        notifier.tg_send("\n".join(lines))
+
+    except Exception as e:
+        notifier.tg_send_error("Sync positions — erreur inattendue", e)
+
+    return report
+
+
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
+
+    # --- Sync/guard optionnels avant toute exécution ---
+    try:
+        if str(database.get_setting('SYNC_BEFORE_EXECUTE', 'true')).lower() == 'true':
+            sync_positions_with_exchange(ex)
+    except Exception:
+        pass
+
+    # Si une position réelle existe déjà sur l'exchange pour ce symbole en mode oneway,
+    # on évite d'ouvrir une nouvelle entrée (risque de sur-exposition).
+    try:
+        market = None
+        try:
+            market = ex.market(symbol)
+        except Exception:
+            pass
+        ex_positions = ex.fetch_positions([symbol])
+        already_open = False
+        for p in ex_positions or []:
+            same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
+            if not same:
+                continue
+            contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+            if contracts > 0:
+                already_open = True
+                break
+        if already_open and not database.is_position_open(symbol):
+            return False, f"Rejeté: Position déjà ouverte sur l'exchange pour {symbol} (DB non alignée)."
+    except Exception:
+        # En cas d'échec de lecture des positions, on continue normalement
+        pass
 
     if len(database.get_open_positions()) >= max_pos:
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
@@ -452,22 +630,16 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     final_entry_price = entry_price
     if not is_paper_mode:
         try:
+            # 2) S’assurer du contexte (avant ordres/lectures)
             ex.set_leverage(LEVERAGE, symbol)
-
-            # -- Forcer Bitget en cross + one-way --
-            try:
-                ex.set_margin_mode('cross', symbol)
-            except Exception:
-                pass
-            try:
-                # False => one-way (unilatéral)
-                ex.set_position_mode(False, symbol)
-            except Exception:
-                pass
+            try: ex.set_margin_mode('cross', symbol)
+            except Exception: pass
+            try: ex.set_position_mode(False, symbol)  # False => oneway
+            except Exception: pass
 
             common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
 
-            # Garde-fou SL/TP vs prix d'entrée (Bitget: long -> SL < entry < TP ; short -> TP < entry < SL)
+            # Garde-fou SL/TP vs prix d'entrée
             gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
             price_ref = float(entry_price)
             side = signal['side']
@@ -476,17 +648,13 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             tp = float(signal['tp'])
 
             if side == 'sell':  # SHORT
-                if sl <= price_ref:
-                    sl = price_ref * (1.0 + gap_pct)
-                if tp >= price_ref:
-                    tp = price_ref * (1.0 - gap_pct)
+                if sl <= price_ref: sl = price_ref * (1.0 + gap_pct)
+                if tp >= price_ref: tp = price_ref * (1.0 - gap_pct)
             else:  # BUY (LONG)
-                if sl >= price_ref:
-                    sl = price_ref * (1.0 - gap_pct)
-                if tp <= price_ref:
-                    tp = price_ref * (1.0 + gap_pct)
+                if sl >= price_ref: sl = price_ref * (1.0 - gap_pct)
+                if tp <= price_ref: tp = price_ref * (1.0 + gap_pct)
 
-            # Ajuster à la précision de l'exchange
+            # Précision prix
             try:
                 sl = float(ex.price_to_precision(symbol, sl))
                 tp = float(ex.price_to_precision(symbol, tp))
@@ -496,39 +664,38 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             signal['sl'] = sl
             signal['tp'] = tp
 
-            # recalcul prudent de la taille sur le SL ajusté (sans augmenter le risque prévu)
+            # Recalcule taille avec SL ajusté (puis arrondi quantité)
             qty_adj = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, sl)
             quantity = min(quantity, qty_adj)
-            
-            # Recheck notional après ajustement de la quantité
+            try:
+                quantity = float(ex.amount_to_precision(symbol, quantity))
+            except Exception:
+                pass
+            if quantity <= 0:
+                return False, "Rejeté: quantité arrondie à 0."
+
+            # Recheck notional
             notional_value = quantity * entry_price
             if notional_value < MIN_NOTIONAL_VALUE:
                 return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
 
-            # 1) Entrée au marché (MARKET)
+            # 1) Entrée au marché
             order = ex.create_market_order(symbol, signal['side'], quantity, params=common_params)
 
-            # 2) Créer les 2 ordres reduceOnly en MARKET (Bitget: TP/SL déclenchés doivent être MARKET)
+            # 2) SL/TP triggers en MARKET, reduceOnly
             close_side = 'sell' if signal['side'] == 'buy' else 'buy'
-
-            # SL (market trigger)
-            ex.create_order(
-                symbol, 'market', close_side, quantity, price=None,
-                params={**common_params, 'stopLossPrice': sl, 'reduceOnly': True, 'triggerType': 'mark'}
-            )
-            # TP (market trigger)
-            ex.create_order(
-                symbol, 'market', close_side, quantity, price=None,
-                params={**common_params, 'takeProfitPrice': tp, 'reduceOnly': True, 'triggerType': 'mark'}
-            )
+            ex.create_order(symbol, 'market', close_side, quantity, price=None,
+                            params={**common_params, 'stopLossPrice': sl, 'reduceOnly': True, 'triggerType': 'mark'})
+            ex.create_order(symbol, 'market', close_side, quantity, price=None,
+                            params={**common_params, 'takeProfitPrice': tp, 'reduceOnly': True, 'triggerType': 'mark'})
 
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
         except Exception as e:
-            # Tentative de clôture d'urgence si l'un des ordres a échoué
             try:
                 close_side = 'sell' if signal['side'] == 'buy' else 'buy'
+                # on tente de réduire ce qui a pu s’ouvrir
                 ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
             except Exception:
                 pass
@@ -564,120 +731,137 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
 
 
-
 def manage_open_positions(ex: ccxt.Exchange):
-    """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/Contre-tendance, puis trailing après BE.
-       Tous les ordres (clôtures, SL, TP) sont envoyés en MARKET avec reduceOnly, tdMode=cross, posMode=oneway."""
+    """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/CT, trailing après BE.
+       Tous les ordres sont MARKET reduceOnly (triggers) + precision quantité + sécurisation modes."""
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
         return
+
+    try:
+        need_sync = str(database.get_setting('SYNC_BEFORE_MANAGE', 'true')).lower() == 'true'
+    except Exception:
+        need_sync = True
+    if need_sync:
+        sync_positions_with_exchange(ex)
 
     open_positions = database.get_open_positions()
     if not open_positions:
         return
 
     for pos in open_positions:
-        # --- SPLIT : demi-sortie + passage BE sur franchissement MM20/BB20_mid ---
+        symbol = pos['symbol']
+        is_long = (pos['side'] == 'buy')
+        close_side = 'sell' if is_long else 'buy'
+        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+
+        # 2) Sécuriser les modes AVANT toute action marché sur ce symbole
+        try:
+            ex.set_leverage(LEVERAGE, symbol)
+            try: ex.set_margin_mode('cross', symbol)
+            except Exception: pass
+            try: ex.set_position_mode(False, symbol)
+            except Exception: pass
+        except Exception:
+            pass
+
+        # --- SPLIT ---
         if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
             try:
-                current_price = ex.fetch_ticker(pos['symbol'])['last']
-                df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+                current_price = ex.fetch_ticker(symbol)['last']
+                df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
                 if df is None or len(df) == 0:
                     continue
 
                 management_trigger_price = df.iloc[-1]['bb20_mid']
-                is_long = (pos['side'] == 'buy')
 
-                # Déclencheur atteint ?
                 if (is_long and current_price >= management_trigger_price) or (not is_long and current_price <= management_trigger_price):
-                    print(f"✅ Gestion SPLIT: Déclencheur MM20 atteint pour {pos['symbol']}!")
+                    print(f"✅ Gestion SPLIT: Déclencheur MM20 atteint pour {symbol}!")
 
                     qty_to_close = pos['quantity'] / 2
-                    remaining_qty = pos['quantity'] - qty_to_close
-                    close_side = 'sell' if is_long else 'buy'
-                    common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                    try: qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
+                    except Exception: pass
+                    if qty_to_close <= 0: 
+                        continue
+                    remaining_qty = max(0.0, pos['quantity'] - qty_to_close)
 
-                    # 1) Clôturer 50% (MARKET reduceOnly)
-                    ex.create_market_order(pos['symbol'], close_side, qty_to_close, params=common_params)
+                    # 1) Clôturer 50%
+                    ex.create_market_order(symbol, close_side, qty_to_close, params=common_params)
 
-                    # 2) Passer le reste à BE: annule anciens ordres puis recrée SL et TP séparément en MARKET (triggers)
-                    ex.cancel_all_orders(pos['symbol'])
-                    fees_bps = float(database.get_setting('FEES_BPS', 5))  # 5 bps = 0.05%
+                    # 2) BE sur le restant
+                    try:
+                        ex.cancel_all_orders(symbol)
+                    except Exception as e:
+                        if '22001' not in str(e): raise
+                    fees_bps = float(database.get_setting('FEES_BPS', 5))
                     fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                     new_sl_be = pos['entry_price'] * fee_factor
 
-                    # SL seul (market trigger)
-                    ex.create_order(
-                        pos['symbol'], 'market', close_side, remaining_qty, price=None,
-                        params={**common_params, 'stopLossPrice': float(new_sl_be), 'triggerType': 'mark'}
-                    )
-                    # TP inchangé seul (market trigger)
-                    ex.create_order(
-                        pos['symbol'], 'market', close_side, remaining_qty, price=None,
-                        params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
-                    )
+                    # Arrondi quantité restante
+                    try: remaining_qty = float(ex.amount_to_precision(symbol, remaining_qty))
+                    except Exception: pass
+                    if remaining_qty > 0:
+                        ex.create_order(symbol, 'market', close_side, remaining_qty, price=None,
+                                        params={**common_params, 'stopLossPrice': float(new_sl_be), 'triggerType': 'mark'})
+                        ex.create_order(symbol, 'market', close_side, remaining_qty, price=None,
+                                        params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'})
 
-                    # 3) DB + notif
                     pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
                     database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
-                    notifier.send_breakeven_notification(pos['symbol'], pnl_realised, remaining_qty)
+                    notifier.send_breakeven_notification(symbol, pnl_realised, remaining_qty)
 
             except Exception as e:
-                print(f"Erreur de gestion SPLIT pour {pos['symbol']}: {e}")
+                print(f"Erreur de gestion SPLIT pour {symbol}: {e}")
 
-        # --- NORMALE / Contre-tendance : passage BE sur franchissement MM20/BB20_mid ---
+        # --- BE NORMAL (CT) ---
         if pos['management_strategy'] == 'NORMAL' and pos.get('regime') == 'Contre-tendance' and pos.get('breakeven_status') == 'PENDING':
             try:
-                df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+                df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
                 if df is not None and len(df) > 0:
                     last_close = float(df.iloc[-1]['close'])
                     mm20 = float(df.iloc[-1]['bb20_mid'])
-                    is_long = (pos['side'] == 'buy')
 
                     crossed = (is_long and last_close >= mm20) or ((not is_long) and last_close <= mm20)
                     if crossed:
-                        ex.cancel_all_orders(pos['symbol'])
+                        try:
+                            ex.cancel_all_orders(symbol)
+                        except Exception as e:
+                            if '22001' not in str(e): raise
                         fees_bps = float(database.get_setting('FEES_BPS', 5))
                         fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                         new_sl_be = float(pos['entry_price']) * fee_factor
 
-                        close_side = 'sell' if is_long else 'buy'
-                        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                        qty = float(pos['quantity'])
+                        try: qty = float(ex.amount_to_precision(symbol, qty))
+                        except Exception: pass
+                        if qty <= 0: 
+                            continue
 
-                        # SL BE seul (market trigger)
-                        ex.create_order(
-                            pos['symbol'], 'market', close_side, pos['quantity'], price=None,
-                            params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'}
-                        )
-                        # TP inchangé seul (market trigger)
-                        ex.create_order(
-                            pos['symbol'], 'market', close_side, pos['quantity'], price=None,
-                            params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
-                        )
+                        ex.create_order(symbol, 'market', close_side, qty, price=None,
+                                        params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'})
+                        ex.create_order(symbol, 'market', close_side, qty, price=None,
+                                        params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'})
 
-                        database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl_be)
-                        notifier.send_breakeven_notification(pos['symbol'], 0.0, pos['quantity'])
+                        database.update_trade_to_breakeven(pos['id'], qty, new_sl_be)
+                        notifier.send_breakeven_notification(symbol, 0.0, qty)
 
             except Exception as e:
-                print(f"Erreur BE NORMAL contre-tendance {pos['symbol']}: {e}")
+                print(f"Erreur BE NORMAL contre-tendance {symbol}: {e}")
 
-        # --- Trailing après BE (NORMAL & SPLIT) en suivant BB20_mid ---
+        # --- Trailing après BE ---
         if pos.get('breakeven_status') in ('ACTIVE', 'DONE', 'BE'):
             try:
-                df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
+                df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
                 if df is None or len(df) == 0:
                     continue
 
-                # Garde-fou BE dynamique : activer le trailing seulement après K clôtures au-delà du BE, sans réintégration
                 try:
                     k_needed = int(database.get_setting('BE_ACTIVATION_K', 2))
                     m_window = int(database.get_setting('BE_NO_REENTRY_M', 3))
                 except Exception:
                     k_needed, m_window = 2, 3
 
-                is_long = (pos['side'] == 'buy')
                 entry_px = float(pos.get('sl_price') or pos['entry_price'])
 
-                # 1) K clôtures consécutives au-delà du BE
                 closes = df['close'].astype(float).iloc[-max(k_needed, 1):]
                 if len(closes) < k_needed:
                     continue
@@ -685,24 +869,19 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if not ok_streak:
                     continue
 
-                # 2) Pas de réintégration côté opposé dans la fenêtre M
                 window = df['close'].astype(float).iloc[-max(m_window, 1):]
                 reentered = any(c <= entry_px for c in window) if is_long else any(c >= entry_px for c in window)
                 if reentered:
                     continue
 
-                trail_ref = float(df.iloc[-1]['bb20_mid'])  # rail de trailing (MM20)
+                trail_ref = float(df.iloc[-1]['bb20_mid'])
                 current_sl = float(pos.get('sl_price') or pos['entry_price'])
-
-                # Pousser le SL seulement dans le bon sens (jamais le reculer)
                 new_sl = max(current_sl, trail_ref) if is_long else min(current_sl, trail_ref)
 
-                # Seuil anti-spam (~0.02%)
                 moved = (is_long and new_sl > current_sl * 1.0002) or ((not is_long) and new_sl < current_sl * 0.9998)
                 if not moved:
                     continue
 
-                # Recharger la quantité restante depuis la DB (après éventuels splits)
                 try:
                     pos_ref = database.get_trade_by_id(pos['id'])
                     if pos_ref and float(pos_ref.get('quantity', 0)) > 0:
@@ -710,93 +889,79 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-                ex.cancel_all_orders(pos['symbol'])
-                close_side = 'sell' if is_long else 'buy'
-                common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                try:
+                    ex.cancel_all_orders(symbol)
+                except Exception as e:
+                    if '22001' not in str(e): raise
 
-                # SL trailé seul (market trigger)
-                ex.create_order(
-                    pos['symbol'], 'market', close_side, pos['quantity'], price=None,
-                    params={**common_params, 'stopLossPrice': float(new_sl), 'triggerType': 'mark'}
-                )
-                # TP inchangé seul (market trigger)
-                ex.create_order(
-                    pos['symbol'], 'market', close_side, pos['quantity'], price=None,
-                    params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
-                )
+                qty = float(pos['quantity'])
+                try: qty = float(ex.amount_to_precision(symbol, qty))
+                except Exception: pass
+                if qty <= 0:
+                    continue
 
-                # DB + notif
+                ex.create_order(symbol, 'market', close_side, qty, price=None,
+                                params={**common_params, 'stopLossPrice': float(new_sl), 'triggerType': 'mark'})
+                ex.create_order(symbol, 'market', close_side, qty, price=None,
+                                params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'})
+
                 try:
                     database.update_trade_sl(pos['id'], new_sl)
                 except AttributeError:
-                    database.update_trade_to_breakeven(pos['id'], pos['quantity'], new_sl)
+                    database.update_trade_to_breakeven(pos['id'], qty, new_sl)
 
-                notifier.tg_send(f"🔁 Trailing SL mis à jour sur {pos['symbol']} → {new_sl:.6f}")
+                notifier.tg_send(f"🔁 Trailing SL mis à jour sur {symbol} → {new_sl:.6f}")
 
             except Exception as e:
-                print(f"Erreur trailing {pos['symbol']}: {e}")
+                print(f"Erreur trailing {symbol}: {e}")
 
-        # --- TP dynamique proche des bornes de Bollinger (NORMAL & SPLIT) ---
+        # --- TP dynamique ---
         try:
-            df = utils.fetch_and_prepare_df(ex, pos['symbol'], TIMEFRAME)
-            if df is None or len(df) == 0:
-                pass
-            else:
+            df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+            if df is not None and len(df) > 0:
                 last = df.iloc[-1]
-                is_long = (pos['side'] == 'buy')
                 regime = pos.get('regime', 'Tendance')
 
                 bb20_mid = float(last['bb20_mid'])
                 bb80_up  = float(last['bb80_up'])
                 bb80_lo  = float(last['bb80_lo'])
 
-                # Décalage avant la borne (ex: 0.15%) configurable
                 offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
+                target_tp = bb80_up * (1.0 - offset_pct) if is_long else bb80_lo * (1.0 + offset_pct) if regime == 'Tendance' \
+                            else bb20_mid * (1.0 - offset_pct if is_long else 1.0 + offset_pct)
 
-                # Cible “un peu avant” la borne pertinente
-                if regime == 'Tendance':
-                    target_tp = bb80_up * (1.0 - offset_pct) if is_long else bb80_lo * (1.0 + offset_pct)
-                else:  # Contre-tendance
-                    target_tp = bb20_mid * (1.0 - offset_pct) if is_long else bb20_mid * (1.0 + offset_pct)
-
-                # N'améliorer que dans le bon sens (jamais réduire le TP)
                 current_tp = float(pos['tp_price'])
                 improve = (is_long and target_tp > current_tp * 1.0002) or ((not is_long) and target_tp < current_tp * 0.9998)
                 if improve:
-                    # Recharger quantité restante au cas où (post-split)
                     try:
-                        pos_ref = database.get_trade_by_id(pos['id'])
-                        if pos_ref and float(pos_ref.get('quantity', 0)) > 0:
-                            pos['quantity'] = float(pos_ref['quantity'])
+                        ex.cancel_all_orders(symbol)
+                    except Exception as e:
+                        if '22001' not in str(e): raise
+                    sl_price = float(pos.get('sl_price') or pos['entry_price'])
+
+                    qty = float(pos['quantity'])
+                    try:
+                        qty = float(ex.amount_to_precision(symbol, qty))
+                        target_tp = float(ex.price_to_precision(symbol, target_tp))
+                        sl_price = float(ex.price_to_precision(symbol, sl_price))
                     except Exception:
                         pass
+                    if qty <= 0:
+                        continue
 
-                    # Remplacer l'existant par 2 ordres : SL courant + nouveau TP — en MARKET triggers
-                    ex.cancel_all_orders(pos['symbol'])
-                    close_side = 'sell' if is_long else 'buy'
-                    sl_price = float(pos.get('sl_price') or pos['entry_price'])
-                    common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                    ex.create_order(symbol, 'market', close_side, qty, price=None,
+                                    params={**common_params, 'stopLossPrice': sl_price, 'triggerType': 'mark'})
+                    ex.create_order(symbol, 'market', close_side, qty, price=None,
+                                    params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'})
 
-                    # SL (inchangé) seul (market trigger)
-                    ex.create_order(
-                        pos['symbol'], 'market', close_side, pos['quantity'], price=None,
-                        params={**common_params, 'stopLossPrice': sl_price, 'triggerType': 'mark'}
-                    )
-                    # TP (nouveau) seul (market trigger)
-                    ex.create_order(
-                        pos['symbol'], 'market', close_side, pos['quantity'], price=None,
-                        params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'}
-                    )
-
-                    # DB + notif (si update_tp absent, on ignore)
                     try:
                         database.update_trade_tp(pos['id'], float(target_tp))
                     except Exception:
                         pass
-                    notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {pos['symbol']} → {float(target_tp):.6f}")
+                    notifier.tg_send(f"🎯 TP ajusté dynamiquement sur {symbol} → {float(target_tp):.6f}")
         except Exception as e:
-            print(f"Erreur TP dynamique {pos['symbol']}: {e}")
-            
+            print(f"Erreur TP dynamique {symbol}: {e}")
+
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
@@ -816,20 +981,69 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
-    """Clôture manuellement une position."""
+    """Clôture manuelle robuste : vérifie la position réelle, arrondit la quantité, et ferme en MARKET reduceOnly.
+       Sécurise leverage/modes avant lecture des positions sur le symbole."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     trade = database.get_trade_by_id(trade_id)
     if not trade or trade.get('status') != 'OPEN':
         return notifier.tg_send(f"Trade #{trade_id} déjà fermé ou invalide.")
     
+    symbol = trade['symbol']
+    side = trade['side']
+    qty_db = float(trade['quantity'])
+
     try:
+        # 2) Contexte du symbole AVANT fetch_positions
+        try:
+            ex.set_leverage(LEVERAGE, symbol)
+            try: ex.set_margin_mode('cross', symbol)
+            except Exception: pass
+            try: ex.set_position_mode(False, symbol)
+            except Exception: pass
+        except Exception:
+            pass
+
+        # 1) Vérifier la position réelle
+        real_qty = 0.0
+        market = None
+        try:
+            market = ex.market(symbol)
+        except Exception:
+            pass
+
+        try:
+            positions = ex.fetch_positions([symbol])
+            for p in positions:
+                same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
+                if same:
+                    contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+                    if contracts and contracts > 0:
+                        real_qty = contracts
+                        break
+        except Exception:
+            pass
+
+        if real_qty <= 0:
+            database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
+            return notifier.tg_send(f"ℹ️ Aucune position ouverte détectée pour {symbol}. Trade #{trade_id} marqué fermé.")
+
+        qty_to_close = min(qty_db, real_qty)
+        try: qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
+        except Exception: pass
+        if qty_to_close <= 0:
+            database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
+            return notifier.tg_send(f"ℹ️ Quantité nulle à clôturer sur {symbol}. Trade #{trade_id} marqué fermé.")
+
         if not is_paper_mode:
-            ex.create_market_order(trade['symbol'], 'sell' if trade['side'] == 'buy' else 'buy', trade['quantity'],
-                                   params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
-        
-        # Calcule un PNL approximatif, mais l'idéal serait d'avoir le prix de sortie réel
+            close_side = 'sell' if side == 'buy' else 'buy'
+            params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+            ex.create_market_order(symbol, close_side, qty_to_close, params=params)
+
         database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
-        notifier.tg_send(f"✅ Position sur {trade['symbol']} (Trade #{trade_id}) fermée manuellement.")
+        notifier.tg_send(f"✅ Position sur {symbol} (Trade #{trade_id}) fermée manuellement (qty={qty_to_close}).")
+
     except Exception as e:
-        notifier.tg_send_error(f"Fermeture manuelle de {trade['symbol']}", e)
+        notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
+
+
 
