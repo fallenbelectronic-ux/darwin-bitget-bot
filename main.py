@@ -328,12 +328,30 @@ def check_scheduled_reports():
 # BOUCLES ET MAIN
 # ==============================================================================
 
+def route_inline_restart_callback(update: Dict[str, Any]) -> bool:
+    """
+    À appeler en tête de la boucle qui parcourt les updates Telegram.
+    Retourne True si le callback (ex. restart) a été géré ici, sinon False.
+    """
+    try:
+        if not update or 'callback_query' not in update:
+            return False
+        return notifier.try_handle_inline_callback(update['callback_query'])
+    except Exception as e:
+        notifier.tg_send_error("Loop callback routing", e)
+        return False
+
 def poll_telegram_updates():
     """Récupère et distribue les mises à jour de Telegram. C'est le cœur de la réactivité."""
     global _last_update_id
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
     for upd in updates:
         _last_update_id = upd.get("update_id", _last_update_id)
+
+        # --- Ajout: routage prioritaire des callbacks spéciaux (ex: restart) ---
+        if route_inline_restart_callback(upd):
+            continue
+
         if 'callback_query' in upd:
             process_callback_query(upd['callback_query'])
         elif 'message' in upd:
