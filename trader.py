@@ -468,7 +468,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
 
             # Garde-fou SL/TP vs prix d'entrée (Bitget: long -> SL < entry < TP ; short -> TP < entry < SL)
-            gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))  # 0.03% par défaut
+            gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
             price_ref = float(entry_price)
             side = signal['side']
 
@@ -505,21 +505,21 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             if notional_value < MIN_NOTIONAL_VALUE:
                 return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
 
-            # 1) Entrée au marché (AUCUN stopLossPrice / takeProfitPrice ici)
+            # 1) Entrée au marché (MARKET)
             order = ex.create_market_order(symbol, signal['side'], quantity, params=common_params)
 
-            # 2) Créer les 2 ordres reduceOnly SÉPARÉS (Bitget n'accepte qu'UNE clé par appel)
+            # 2) Créer les 2 ordres reduceOnly en MARKET (Bitget: TP/SL déclenchés doivent être MARKET)
             close_side = 'sell' if signal['side'] == 'buy' else 'buy'
 
-            # SL
+            # SL (market trigger)
             ex.create_order(
-                symbol, 'limit', close_side, quantity, price=None,
-                params={**common_params, 'stopLossPrice': sl, 'reduceOnly': True}
+                symbol, 'market', close_side, quantity, price=None,
+                params={**common_params, 'stopLossPrice': sl, 'reduceOnly': True, 'triggerType': 'mark'}
             )
-            # TP
+            # TP (market trigger)
             ex.create_order(
-                symbol, 'limit', close_side, quantity, price=None,
-                params={**common_params, 'takeProfitPrice': tp, 'reduceOnly': True}
+                symbol, 'market', close_side, quantity, price=None,
+                params={**common_params, 'takeProfitPrice': tp, 'reduceOnly': True, 'triggerType': 'mark'}
             )
 
             if order and order.get('price'):
@@ -561,6 +561,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
     
     return True,"Position ouverte avec succès."
+
 
 
 
