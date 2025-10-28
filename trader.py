@@ -21,6 +21,21 @@ MIN_NOTIONAL_VALUE = float(os.getenv("MIN_NOTIONAL_VALUE", "5"))
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
 # ==============================================================================
 
+def _inside(val: float, lo: float, up: float) -> bool:
+    return float(lo) <= float(val) <= float(up)
+
+def _touched_with_tol(price: float, band: float, side: str, tol_pct: float) -> bool:
+    """
+    Tolérance de contact sur la BB80 (jaune).
+    - Long : on accepte si low <= bb80_lo * (1 + tol_pct)
+    - Short: on accepte si high >= bb80_up * (1 - tol_pct)
+    """
+    band = float(band); price = float(price); tol = float(tol_pct)
+    if side == 'buy':
+        return price <= band * (1.0 + tol)
+    else:
+        return price >= band * (1.0 - tol)
+
 def _maybe_improve_rr_with_cut_wick(prev: pd.Series, entry: float, sl: float, tp: float, side: str) -> Tuple[float, float]:
     """
     Si CUT_WICK_FOR_RR est ON (DB) et si RR initial < MIN_RR mais >= 2.8,
@@ -46,24 +61,61 @@ def _maybe_improve_rr_with_cut_wick(prev: pd.Series, entry: float, sl: float, tp
         return rr_alt, sl
 
 def is_valid_reaction_candle(candle: pd.Series, side: str) -> bool:
-    """Analyse la forme de la bougie de réaction pour valider le signal."""
-    body = abs(candle['close'] - candle['open'])
-    total_range = candle['high'] - candle['low']
-    if total_range == 0 or body < total_range * 0.15: # Ignorer les Dojis / corps trop petits
+    """Validation stricte de la bougie de réaction (patterns + seuils).
+    Règles (paramétrables via DB) :
+      - Doji rejeté : body/range < 10%  (DOJI_BODY_MAX)
+      - Pinbar : body/range ≤ 30%, mèche côté signal ≥ 30%, mèche opposée ≤ 20%
+      - Impulsion/Marubozu relatif : body/range ≥ 30%
+      - Mèche côté signal « énorme » rejetée si > 70% (WICK_HUGE_MAX)
+      - Couleur non bloquante si la réintégration est respectée (gérée ailleurs)
+    """
+    try:
+        doji_max              = float(database.get_setting('DOJI_BODY_MAX', 0.10))
+        pinbar_max_body       = float(database.get_setting('PINBAR_MAX_BODY', 0.30))
+        simple_wick_min       = float(database.get_setting('SIMPLE_WICK_MIN', 0.30))
+        pinbar_opp_wick_max   = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.20))
+        marubozu_min_body     = float(database.get_setting('MARUBOZU_MIN_BODY', 0.30))
+        wick_huge_max         = float(database.get_setting('WICK_HUGE_MAX', 0.70))
+    except Exception:
+        doji_max, pinbar_max_body, simple_wick_min = 0.10, 0.30, 0.30
+        pinbar_opp_wick_max, marubozu_min_body, wick_huge_max = 0.20, 0.30, 0.70
+
+    o, c = float(candle['open']), float(candle['close'])
+    h, l = float(candle['high']), float(candle['low'])
+    rng = max(1e-12, h - l)
+    body = abs(c - o)
+    w_up = max(0.0, h - max(o, c))
+    w_dn = max(0.0, min(o, c) - l)
+
+    body_r = body / rng
+    w_up_r = w_up / rng
+    w_dn_r = w_dn / rng
+
+    # Rejet doji / micro-corps
+    if body_r < doji_max:
         return False
 
-    wick_high = candle['high'] - max(candle['open'], candle['close'])
-    wick_low = min(candle['open'], candle['close']) - candle['low']
+    # Mèche côté signal « énorme » -> rejet
+    if side == 'buy' and w_dn_r > wick_huge_max:
+        return False
+    if side == 'sell' and w_up_r > wick_huge_max:
+        return False
 
-    if side == 'buy':
-        # Bougie verte, petite mèche haute (pas un "pinbar inversé")
-        return candle['close'] > candle['open'] and wick_high < body * 1.5
-    
-    if side == 'sell':
-        # Bougie rouge, petite mèche basse
-        return candle['close'] < candle['open'] and wick_low < body * 1.5
-        
+    # Pinbar (bicolore toléré)
+    if body_r <= pinbar_max_body:
+        if side == 'buy':
+            if w_dn_r >= simple_wick_min and w_up_r <= pinbar_opp_wick_max:
+                return True
+        else:
+            if w_up_r >= simple_wick_min and w_dn_r <= pinbar_opp_wick_max:
+                return True
+
+    # Impulsion / marubozu relatif (grand corps)
+    if body_r >= marubozu_min_body:
+        return True
+
     return False
+
 
 def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
     """
@@ -157,25 +209,21 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
 
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Logique de détection complète avec les règles avancées."""
+    """Logique de détection avec fenêtre contact→réaction (≤2), réintégration stricte CT (BB20 & BB80),
+    tolérance contact BB80 (jaune), neutralité MM80 et anti-excès BB80."""
     if df is None or len(df) < 81:
         return None
-    
-    last, prev = df.iloc[-1], df.iloc[-2]  # last=réaction, prev=contact
 
-    # --- Filtre 0: Analyse de la bougie de réaction ---
-    side_guess = 'buy' if last['close'] > last['open'] else 'sell'
-    if not is_valid_reaction_candle(last, side_guess):
-        return None
-
-    # --- Filtre 1: Réintégration BB20 ---
-    if not utils.close_inside_bb20(last['close'], last['bb20_lo'], last['bb20_up']):
-        return None
-    
-    # --- Filtre 2: Zone neutre MM80 ---
-    dead_zone = float(last['bb80_mid']) * (MM_DEAD_ZONE_PERCENT / 100.0)
-    if abs(float(last['close']) - float(last['bb80_mid'])) < dead_zone:
-        return None
+    # --- Paramètres ---
+    try:
+        reaction_max_bars = int(database.get_setting('REACTION_MAX_BARS', 2))
+    except Exception:
+        reaction_max_bars = 2
+    try:
+        tol_yellow = float(database.get_setting('YELLOW_BB_CONTACT_TOL_PCT', 0.001))  # 0.10%
+    except Exception:
+        tol_yellow = 0.001
+    ct_reintegrate_both = str(database.get_setting('CT_REINTEGRATE_BOTH_BB', 'true')).lower() == 'true'
 
     # --- Anti-excès : ignorer la CONTRE-TENDANCE après ≥ N bougies au-delà de la BB80 ---
     skip_threshold = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
@@ -183,42 +231,86 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     allow_countertrend = True
     if len(df) >= lookback:
         recent = df.iloc[-lookback:]
-
         streak_up = 0
         for i in range(len(recent)):
             row = recent.iloc[-1 - i]
-            c = float(row['close'])
-            b_up = float(row['bb80_up'])
-            if c >= b_up:
+            if float(row['close']) >= float(row['bb80_up']):
                 streak_up += 1
             else:
                 break
-
         streak_down = 0
         for i in range(len(recent)):
             row = recent.iloc[-1 - i]
-            c = float(row['close'])
-            b_lo = float(row['bb80_lo'])
-            if c <= b_lo:
+            if float(row['close']) <= float(row['bb80_lo']):
                 streak_down += 1
             else:
                 break
-
         if streak_up >= skip_threshold or streak_down >= skip_threshold:
             allow_countertrend = False
 
-    signal = None
-    
-    # --- Détection des Patterns ---
-    is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
-    touched_bb20_low = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_lo'], "buy")
-    touched_bb20_high = utils.touched_or_crossed(prev['low'], prev['high'], prev['bb20_up'], "sell")
+    # --- Chercher un couple (contact, réaction) dans la fenêtre autorisée ---
+    last = df.iloc[-1]  # réaction candidate par défaut
+    contact = None
+    contact_idx = None
 
-    # Pattern 1: Tendance (Extrême Correction)
-    if is_above_mm80 and touched_bb20_low:
+    for back in range(1, reaction_max_bars + 1):  # 1 ou 2 barres avant
+        cand = df.iloc[-1 - back]
+        # contact BB20 côté pertinent (touche ou traverse)
+        touched_lo = utils.touched_or_crossed(cand['low'], cand['high'], cand['bb20_lo'], "buy")
+        touched_up = utils.touched_or_crossed(cand['low'], cand['high'], cand['bb20_up'], "sell")
+        if touched_lo or touched_up:
+            contact = cand
+            contact_idx = len(df) - 1 - back
+            break
+
+    if contact is None:
+        return None  # pas de contact récent
+
+    # Si contact est à -2, vérifier qu'il n'y a pas un nouvel excès sur la barre intermédiaire
+    if contact_idx == len(df) - 3:
+        mid = df.iloc[-2]
+        # nouvel excès = close au-delà d'une borne jaune dans le même sens
+        if float(contact['close']) > float(contact['open']):  # contact vert (probable long)
+            if float(mid['close']) < float(mid['bb80_lo']):
+                pass  # ok (pas un excès contre le long)
+        if float(contact['close']) < float(contact['open']):  # contact rouge (probable short)
+            if float(mid['close']) > float(mid['bb80_up']):
+                pass  # ok
+        # sinon, on ne bloque pas—tolérance légère
+
+    # --- Déterminer le sens supposé via la réaction ---
+    side_guess = 'buy' if float(last['close']) > float(last['open']) else 'sell'
+
+    # --- Filtre MM80 neutralité ---
+    dead_zone = float(last['bb80_mid']) * (MM_DEAD_ZONE_PERCENT / 100.0)
+    if abs(float(last['close']) - float(last['bb80_mid'])) < dead_zone:
+        return None
+
+    # --- Réintégrations (toujours à la réaction = last) ---
+    # Tendance : close inside BB20
+    inside_bb20 = _inside(float(last['close']), float(last['bb20_lo']), float(last['bb20_up']))
+    # CT : close inside BB20 ET inside BB80 (si activé)
+    inside_bb80 = _inside(float(last['close']), float(last['bb80_lo']), float(last['bb80_up']))
+    ct_reintegration_ok = inside_bb20 and (inside_bb80 if ct_reintegrate_both else True)
+
+    # --- Valider la bougie de réaction (patterns) ---
+    if not is_valid_reaction_candle(last, side_guess):
+        return None
+
+    signal = None
+
+    # --- Détection des Patterns (avec contact choisi) ---
+    is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
+    # contact côté BB20
+    touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
+    touched_bb20_high = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_up'], "sell")
+
+    # --- TENDANCE (extrême->réintégration BB20) ---
+    if is_above_mm80 and touched_bb20_low and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
         sl = float(_anchor_sl_from_extreme(df, 'buy'))
+        prev = contact
         tp = float(last['bb80_up']) - max(
             0.25 * float(prev.get('atr', 0.0)),
             0.12 * max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0)
@@ -227,7 +319,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             tp = float(last.get('bb20_up', tp))
         if tp <= entry:
             return None
-
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
             rr_final = rr
@@ -237,10 +328,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    elif (not is_above_mm80) and touched_bb20_high:
+    elif (not is_above_mm80) and touched_bb20_high and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
         sl = float(_anchor_sl_from_extreme(df, 'sell'))
+        prev = contact
         tp = float(last['bb80_lo']) + max(
             0.25 * float(prev.get('atr', 0.0)),
             0.12 * max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0)
@@ -249,7 +341,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             tp = float(last.get('bb20_lo', tp))
         if tp >= entry:
             return None
-
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
             rr_final = rr
@@ -259,66 +350,75 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
+    # --- Garde-fou : si excès prolongé, on saute la contre-tendance ---
     if not allow_countertrend:
         if signal:
             signal['bb20_mid'] = last['bb20_mid']
-            signal['entry_atr'] = prev.get('atr', 0.0)
+            signal['entry_atr'] = contact.get('atr', 0.0)
             signal['entry_rsi'] = 0.0
             return signal
         return None
 
-    # Pattern 2: Contre-Tendance (Double Extrême)
+    # --- CONTRE-TENDANCE (double extrême + réintégration stricte) ---
     if not signal:
-        touched_double_low = float(prev['low']) <= min(float(prev['bb20_lo']), float(prev['bb80_lo']))
-        touched_double_high = float(prev['high']) >= max(float(prev['bb20_up']), float(prev['bb80_up']))
-
-        if touched_double_low:
-            regime = "Contre-tendance"
-            entry = float(last['close'])
-            sl = float(_anchor_sl_from_extreme(df, 'buy'))
-            tp = float(last['bb20_mid']) - max(
-                0.25 * float(prev.get('atr', 0.0)),
-                0.12 * max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0)
+        # contact avec les 2 bandes (BB20 & BB80) côté pertinent,
+        # en acceptant une tolérance de contact sur la jaune (BB80)
+        if True:
+            prev = contact
+            # Long CT : low <= bb20_lo ET (low <= bb80_lo OU tolérance)
+            touched_ct_low  = (float(prev['low']) <= float(prev['bb20_lo'])) and (
+                float(prev['low']) <= float(prev['bb80_lo']) or _touched_with_tol(float(prev['low']), float(prev['bb80_lo']), 'buy', tol_yellow)
             )
-            if tp <= entry:
-                tp = float(last.get('bb20_up', tp))
-            if tp <= entry:
-                return None
-
-            if (entry - sl) > 0:
-                rr = (tp - entry) / (entry - sl)
-                rr_final = rr
-                if rr < MIN_RR and rr >= 2.8:
-                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
-                    rr_final = max(rr, rr_alt)
-                if rr_final >= MIN_RR:
-                    signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
-
-        elif touched_double_high:
-            regime = "Contre-tendance"
-            entry = float(last['close'])
-            sl = float(_anchor_sl_from_extreme(df, 'sell'))
-            tp = float(last['bb20_mid']) + max(
-                0.25 * float(prev.get('atr', 0.0)),
-                0.12 * max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0)
+            # Short CT : high >= bb20_up ET (high >= bb80_up OU tolérance)
+            touched_ct_high = (float(prev['high']) >= float(prev['bb20_up'])) and (
+                float(prev['high']) >= float(prev['bb80_up']) or _touched_with_tol(float(prev['high']), float(prev['bb80_up']), 'sell', tol_yellow)
             )
-            if tp >= entry:
-                tp = float(last.get('bb20_lo', tp))
-            if tp >= entry:
-                return None
 
-            if (sl - entry) > 0:
-                rr = (entry - tp) / (sl - entry)
-                rr_final = rr
-                if rr < MIN_RR and rr >= 2.8:
-                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
-                    rr_final = max(rr, rr_alt)
-                if rr_final >= MIN_RR:
-                    signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+            if touched_ct_low and ct_reintegration_ok:
+                regime = "Contre-tendance"
+                entry = float(last['close'])
+                sl = float(_anchor_sl_from_extreme(df, 'buy'))
+                tp = float(last['bb20_mid']) - max(
+                    0.25 * float(prev.get('atr', 0.0)),
+                    0.12 * max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0)
+                )
+                if tp <= entry:
+                    tp = float(last.get('bb20_up', tp))
+                if tp <= entry:
+                    return None
+                if (entry - sl) > 0:
+                    rr = (tp - entry) / (entry - sl)
+                    rr_final = rr
+                    if rr < MIN_RR and rr >= 2.8:
+                        rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                        rr_final = max(rr, rr_alt)
+                    if rr_final >= MIN_RR:
+                        signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
+            elif touched_ct_high and ct_reintegration_ok:
+                regime = "Contre-tendance"
+                entry = float(last['close'])
+                sl = float(_anchor_sl_from_extreme(df, 'sell'))
+                tp = float(last['bb20_mid']) + max(
+                    0.25 * float(prev.get('atr', 0.0)),
+                    0.12 * max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0)
+                )
+                if tp >= entry:
+                    tp = float(last.get('bb20_lo', tp))
+                if tp >= entry:
+                    return None
+                if (sl - entry) > 0:
+                    rr = (entry - tp) / (sl - entry)
+                    rr_final = rr
+                    if rr < MIN_RR and rr >= 2.8:
+                        rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                        rr_final = max(rr, rr_alt)
+                    if rr_final >= MIN_RR:
+                        signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
     if signal:
         signal['bb20_mid'] = last['bb20_mid']
-        signal['entry_atr'] = prev.get('atr', 0.0)
+        signal['entry_atr'] = contact.get('atr', 0.0)
         signal['entry_rsi'] = 0.0
         return signal
 
