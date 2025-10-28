@@ -604,8 +604,56 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             if contracts > 0:
                 already_open = True
                 break
+
+        # --- Auto-import éventuel si position réelle mais pas en DB ---
         if already_open and not database.is_position_open(symbol):
-            return False, f"Rejeté: Position déjà ouverte sur l'exchange pour {symbol} (DB non alignée)."
+            try:
+                if str(database.get_setting('AUTO_IMPORT_EX_POS', 'false')).lower() == 'true':
+                    for p in ex_positions or []:
+                        same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
+                        if not same:
+                            continue
+                        contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+                        if contracts <= 0:
+                            continue
+                        side_raw = (p.get('side') or '').lower()
+                        if side_raw in ('long', 'buy'):
+                            side_import = 'buy'
+                        elif side_raw in ('short', 'sell'):
+                            side_import = 'sell'
+                        else:
+                            side_import = 'buy' if contracts > 0 else 'sell'
+                        entry_px = float(p.get('entryPrice') or 0.0)
+
+                        # Récup ATR pour enrichir le trade importé (optionnel)
+                        atr_ref = 0.0
+                        try:
+                            df_tmp = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+                            if df_tmp is not None and len(df_tmp) > 0:
+                                atr_ref = float(df_tmp.iloc[-1].get('atr', 0.0))
+                        except Exception:
+                            pass
+
+                        database.create_trade(
+                            symbol=symbol,
+                            side=side_import,
+                            regime="Importé",
+                            entry_price=entry_px,
+                            sl_price=entry_px,  # placeholders neutres (à gérer ensuite par manage_open_positions)
+                            tp_price=entry_px,
+                            quantity=contracts,
+                            risk_percent=RISK_PER_TRADE_PERCENT,
+                            management_strategy="NORMAL",
+                            entry_atr=atr_ref,
+                            entry_rsi=0.0,
+                        )
+                        notifier.tg_send(f"♻️ Position importée automatiquement depuis l'exchange : {symbol} {side_import} qty={contracts}, entry≈{entry_px}")
+                        return True, f"Position {symbol} importée depuis exchange."
+                else:
+                    return False, f"Rejeté: Position déjà ouverte sur l'exchange pour {symbol} (DB non alignée)."
+            except Exception as e:
+                notifier.tg_send_error(f"Auto-import {symbol}", e)
+                return False, f"Erreur auto-import: {e}"
     except Exception:
         # En cas d'échec de lecture des positions, on continue normalement
         pass
@@ -728,6 +776,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
     
     return True,"Position ouverte avec succès."
+
 
 
 
