@@ -255,7 +255,7 @@ def send_main_menu(is_paused: bool):
     risk = getattr(trader, "RISK_PER_TRADE_PERCENT", 1.0)
     leverage = getattr(trader, "LEVERAGE", 1)
 
-        # Stratégie actuelle
+    # Stratégie actuelle
     current_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
     cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
     cw_chip = f"✂️ Couper mèches      : <code>{'ON' if cw else 'OFF'}</code>\n"
@@ -514,18 +514,22 @@ def tg_send_error(title: str, error: Any):
 
 def format_trade_message(symbol: str, signal: Dict, quantity: float, mode: str, risk: float) -> str:
     """Construit le message pour un trade qui vient d'être ouvert."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
+    is_long = (signal['side'] == 'buy')
+    side_text = "Long" if is_long else "Short"
+    side_emoji = "📈" if is_long else "📉"
     mode_icon = "📝" if mode == 'PAPIER' else "✅"
+
     return (
-        f"{mode_icon} <b>{mode} | Nouveau Trade {side_icon}</b>\n\n"
-        f"Paire: <code>{_escape(symbol)}</code>\n"
-        f"Type: <b>{_escape(signal['regime'])}</b>\n\n"
+        f"{mode_icon} <b>{mode} | Nouveau Trade - {side_text} {side_emoji}</b>\n\n"
+        f"Paire: <code>{html.escape(symbol)}</code>\n"
+        f"Type: <b>{html.escape(signal['regime'])}</b>\n\n"
         f"Entrée: <code>{signal['entry']:.5f}</code>\n"
         f"SL: <code>{signal['sl']:.5f}</code>\n"
         f"TP: <code>{signal['tp']:.5f}</code>\n\n"
         f"Quantité: <code>{quantity:.4f}</code>\n"
         f"Risque: <code>{risk:.2f}%</code> | RR: <b>x{signal['rr']:.2f}</b>"
     )
+
 
 def send_confirmed_signal_notification(symbol: str, signal: Dict, total_found: int):
     """Notifie l'utilisateur que le bot a choisi le meilleur signal parmi plusieurs."""
