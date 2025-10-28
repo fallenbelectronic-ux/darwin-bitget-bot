@@ -141,6 +141,14 @@ def update_trade_tp(trade_id: int, new_tp_price: float):
         conn.commit()
     print(f"DB: TP pour le trade #{trade_id} mis à jour à {new_tp_price}.")
 
+def update_trade_sl(trade_id: int, new_sl_price: float):
+    """Met à jour le SL."""
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE trades SET sl_price = ? WHERE id = ?", (new_sl_price, trade_id))
+        conn.commit()
+    print(f"DB: SL pour le trade #{trade_id} mis à jour à {new_sl_price}.")
+
 def is_position_open(symbol: str) -> bool:
     with get_db_connection() as conn:
         cur = conn.cursor()
