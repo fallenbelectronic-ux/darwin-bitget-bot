@@ -458,12 +458,11 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
         # Filtrer les positions réellement ouvertes (> 0)
         ex_open = []
-        for p in ex_positions_raw or []:
+        for p in (ex_positions_raw or []):
             try:
                 symbol = p.get('symbol') or (p.get('info', {}) or {}).get('symbol')
                 if not symbol:
                     continue
-                # Unifié CCXT: 'side' (long/short), 'contracts' > 0 si ouverte (oneway)
                 contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
                 if contracts <= 0:
                     continue
@@ -473,7 +472,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                 elif side_raw in ('short', 'sell'):
                     side = 'sell'
                 else:
-                    # Fallback simple en oneway: quantité > 0 -> buy
                     side = 'buy'
                 entry = float(p.get('entryPrice') or 0.0)
                 ex_open.append({
@@ -496,9 +494,12 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
         for d in db_open:
             try:
                 key = (d['symbol'], d['side'])
-                # Si plusieurs trades même (symbol, side), on agrège les quantités pour comparer à la position oneway
                 if key not in db_map:
-                    db_map[key] = {'ids': [d['id']], 'quantity': float(d['quantity']), 'entry_price': float(d.get('entry_price') or 0.0)}
+                    db_map[key] = {
+                        'ids': [d['id']],
+                        'quantity': float(d['quantity']),
+                        'entry_price': float(d.get('entry_price') or 0.0)
+                    }
                 else:
                     db_map[key]['ids'].append(d['id'])
                     db_map[key]['quantity'] += float(d['quantity'])
@@ -509,7 +510,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
         tol_qty_pct = float(database.get_setting('SYNC_QTY_TOL_PCT', 0.01))  # 1% par défaut
         only_on_exchange, only_in_db, qty_mismatch, matched = [], [], [], []
 
-        # Cas présents côté exchange
         for key, ex_pos in ex_map.items():
             symbol, side = key
             ex_qty = float(ex_pos['quantity'])
@@ -517,7 +517,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                 only_on_exchange.append((symbol, side, ex_qty, ex_pos.get('entry_price', 0.0)))
             else:
                 db_qty = float(db_map[key]['quantity'])
-                # mismatch si > tolérance
                 if db_qty == 0 and ex_qty > 0:
                     qty_mismatch.append(((db_map[key]['ids'], symbol, side), db_qty, ex_qty))
                 else:
@@ -527,7 +526,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                     else:
                         matched.append((db_map[key]['ids'], symbol, side, min(db_qty, ex_qty)))
 
-        # Cas présents uniquement en DB
         for key, d in db_map.items():
             if key not in ex_map:
                 symbol, side = key
@@ -543,30 +541,36 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
         if auto_close_orphans and only_in_db:
             for ids, symbol, side, qty in only_in_db:
                 try:
-                    # On ferme *en base* les trades orphelins (pas de position réelle)
                     for tid in (ids if isinstance(ids, list) else [ids]):
                         database.close_trade(tid, status='SYNC_CLOSED_ORPHAN', pnl=0.0)
                     notifier.tg_send(f"🧹 Sync: trades DB orphelins fermés ({symbol} {side}, qty≈{qty}).")
                 except Exception as e:
                     notifier.tg_send_error(f"Sync — fermeture orphelin {symbol}", e)
 
-        # Alerte synthèse
-        lines = ["🧭 Vérification positions (Exchange vs DB)"]
-        if only_on_exchange:
-            lines.append("• Uniquement sur l'exchange:")
-            for symbol, side, q, ep in only_on_exchange:
-                lines.append(f"   - {symbol} {side} qty={q} entry≈{ep}")
-        if only_in_db:
-            lines.append("• Uniquement en DB (status OPEN, pas de position réelle):")
-            for ids, symbol, side, q in only_in_db:
-                lines.append(f"   - {symbol} {side} qtyDB={q} (ids={ids})")
-        if qty_mismatch:
-            lines.append("• Écarts de quantités:")
-            for (ids, symbol, side), qdb, qex in qty_mismatch:
-                lines.append(f"   - {symbol} {side} DB={qdb} vs EX={qex} (ids={ids})")
-        if matched and not (only_on_exchange or only_in_db or qty_mismatch):
-            lines.append("• OK: toutes les positions concordent.")
-        notifier.tg_send("\n".join(lines))
+        # --- Notification (désactivable) ---
+        # Par défaut: OFF. Mettre SYNC_NOTIFY=true dans la DB si tu veux l'activer.
+        try:
+            want_notify = str(database.get_setting('SYNC_NOTIFY', 'false')).lower() == 'true'
+        except Exception:
+            want_notify = False
+
+        if want_notify:
+            lines = ["🧭 Vérification positions (Exchange vs DB)"]
+            if only_on_exchange:
+                lines.append("• Uniquement sur l'exchange:")
+                for symbol, side, q, ep in only_on_exchange:
+                    lines.append(f"   - {symbol} {side} qty={q} entry≈{ep}")
+            if only_in_db:
+                lines.append("• Uniquement en DB (status OPEN, pas de position réelle):")
+                for ids, symbol, side, q in only_in_db:
+                    lines.append(f"   - {symbol} {side} qtyDB={q} (ids={ids})")
+            if qty_mismatch:
+                lines.append("• Écarts de quantités:")
+                for (ids, symbol, side), qdb, qex in qty_mismatch:
+                    lines.append(f"   - {symbol} {side} DB={qdb} vs EX={qex} (ids={ids})")
+            if matched and not (only_on_exchange or only_in_db or qty_mismatch):
+                lines.append("• OK: toutes les positions concordent.")
+            notifier.tg_send("\n".join(lines))
 
     except Exception as e:
         notifier.tg_send_error("Sync positions — erreur inattendue", e)
