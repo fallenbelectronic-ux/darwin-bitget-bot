@@ -312,7 +312,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         sl = float(_anchor_sl_from_extreme(df, 'buy'))
         prev = contact
         tp = float(last['bb80_up']) - max(
-            0.25 * float(prev.get('atr', 0.0)),
+            0.12 * float(prev.get('atr', 0.0)),
             0.12 * max(float(last['bb80_up']) - float(last.get('bb80_mid', last['close'])), 0.0)
         )
         if tp <= entry:
@@ -334,7 +334,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         sl = float(_anchor_sl_from_extreme(df, 'sell'))
         prev = contact
         tp = float(last['bb80_lo']) + max(
-            0.25 * float(prev.get('atr', 0.0)),
+            0.12 * float(prev.get('atr', 0.0)),
             0.12 * max(float(last.get('bb80_mid', last['close'])) - float(last['bb80_lo']), 0.0)
         )
         if tp >= entry:
@@ -379,7 +379,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 entry = float(last['close'])
                 sl = float(_anchor_sl_from_extreme(df, 'buy'))
                 tp = float(last['bb20_mid']) - max(
-                    0.25 * float(prev.get('atr', 0.0)),
+                    0.12 * float(prev.get('atr', 0.0)),
                     0.12 * max(float(last.get('bb20_up', float(last['bb20_mid']))) - float(last['bb20_mid']), 0.0)
                 )
                 if tp <= entry:
@@ -400,7 +400,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 entry = float(last['close'])
                 sl = float(_anchor_sl_from_extreme(df, 'sell'))
                 tp = float(last['bb20_mid']) + max(
-                    0.25 * float(prev.get('atr', 0.0)),
+                    0.12 * float(prev.get('atr', 0.0)),
                     0.12 * max(float(last['bb20_mid']) - float(last.get('bb20_lo', float(last['bb20_mid']))), 0.0)
                 )
                 if tp >= entry:
