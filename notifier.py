@@ -740,3 +740,12 @@ def edit_main(text: str, reply_markup: Optional[Dict] = None) -> bool:
 
     return False
 
+def tg_send_error(title: str, error: Any):
+    """Envoie un message d'erreur formaté sur Telegram (canal principal)."""
+    try:
+        err_txt = str(error)
+    except Exception:
+        err_txt = repr(error)
+    tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(err_txt)}</code>")
+
+
