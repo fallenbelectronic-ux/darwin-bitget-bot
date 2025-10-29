@@ -216,38 +216,28 @@ def _is_double_marubozu(prev: pd.Series, cur: pd.Series, side: str) -> bool:
 
 def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
     """
-    Calcule le SL à partir de la bougie d'ancrage (AU-DESSUS/EN-DESSOUS de l'extrême de sa MÈCHE) + ATR*K.
-    Règle:
-      - Short  : SL = au-dessus du PLUS HAUT de la bougie d'ancrage + ATR*K
-      - Long   : SL = au-dessous du PLUS BAS  de la bougie d'ancrage - ATR*K
+    Calcule le SL depuis la bougie d’ancrage avec coussin en POURCENTAGE (TP_BB_OFFSET_PCT).
+      - Short : SL = HIGH_ancre * (1 + pct)
+      - Long  : SL = LOW_ancre  * (1 - pct)
 
-    Sélection de la bougie d'ancrage:
-      - On cherche dans une fenêtre récente (par défaut ANCHOR_WINDOW, def=3).
-      - On EXCLUT la bougie de réaction (la toute dernière) pour se caler sur le "contact/anchoring".
-      - Pour un Short : on prend la bougie au PLUS HAUT max (tie-break: mèche haute la plus longue).
-      - Pour un Long  : on prend la bougie au PLUS BAS  min (tie-break: mèche basse la plus longue).
-
-    K = SL_ATR_K (def 0.125). ATR de la bougie d’ancrage si dispo, sinon fallback sur la dernière.
+    Sélection de l’ancre:
+      - Fenêtre récente ANCHOR_WINDOW (def=3) en excluant la dernière bougie (réaction).
+      - Short : plus haut absolu (tie-break: mèche haute la plus longue).
+      - Long  : plus bas  absolu (tie-break: mèche basse la plus longue).
     """
     if df is None or len(df) < 3:
         return 0.0
 
-    # Fenêtre de recherche (exclut la dernière bougie = réaction)
+    pct = get_tp_offset_pct()
+
     try:
         window = int(database.get_setting('ANCHOR_WINDOW', 3))
     except Exception:
         window = 3
-    window = max(1, min(window, len(df) - 1))  # -1 car on exclut la dernière
-    search = df.iloc[-(window+1):-1].copy()    # [ ... , avant-dernière ]  (exclut la dernière)
-
-    # Coefficient ATR (réduction confirmée à 0.125)
-    try:
-        atr_k = float(database.get_setting('SL_ATR_K', 0.125))
-    except Exception:
-        atr_k = 0.125
-
+    window = max(1, min(window, len(df) - 1))
+    search = df.iloc[-(window+1):-1].copy()
     if len(search) == 0:
-        search = df.iloc[:-1]  # fallback : tout sauf la dernière
+        search = df.iloc[:-1]
         if len(search) == 0:
             return 0.0
 
@@ -262,12 +252,9 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
         body_bot = min(o, c)
         return max(0.0, body_bot - l)
 
-    # Sélection de l’ancre
     if side == 'sell':
-        # 1) indice du plus haut absolu
         idx_max_high = search['high'].astype(float).idxmax()
         candidate = search.loc[idx_max_high]
-        # 2) parmi les égalités éventuelles, on préfère la plus grande mèche haute
         same_high = search[search['high'].astype(float) == float(candidate['high'])]
         if len(same_high) > 1:
             idx = same_high.apply(wick_high, axis=1).astype(float).idxmax()
@@ -276,14 +263,7 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
             anchor = candidate
 
         high_anchor = float(anchor['high'])
-        # ATR sur l’ancre, fallback dernière ligne
-        try:
-            atr_anchor = float(anchor.get('atr', df.iloc[-1].get('atr', 0.0)))
-        except Exception:
-            atr_anchor = float(df.iloc[-1].get('atr', 0.0))
-        atr_anchor = max(0.0, atr_anchor)
-
-        return high_anchor + atr_anchor * atr_k
+        return high_anchor * (1.0 + pct)
 
     else:  # side == 'buy'
         idx_min_low = search['low'].astype(float).idxmin()
@@ -296,19 +276,43 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
             anchor = candidate
 
         low_anchor = float(anchor['low'])
-        try:
-            atr_anchor = float(anchor.get('atr', df.iloc[-1].get('atr', 0.0)))
-        except Exception:
-            atr_anchor = float(df.iloc[-1].get('atr', 0.0))
-        atr_anchor = max(0.0, atr_anchor)
+        return low_anchor * (1.0 - pct)
 
-        return low_anchor - atr_anchor * atr_k
+        
+def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
+    """
+    Retourne l'index de la dernière bougie de CONTACT (avant la réaction si base_exclude_last=True),
+    c.-à-d. une bougie qui touche la BB20_lo (pour un long) ou la BB20_up (pour un short).
+    On ne déduit PAS le sens ici : on cherche juste la bougie la plus récente qui touche au moins une borne BB20.
+    """
+    if df is None or len(df) < 3:
+        return None
+
+    start = -2 if base_exclude_last else -1
+    base_idx = len(df) + start
+    lb = max(1, int(max_lookback))
+
+    for back in range(1, lb + 1):
+        idx = base_idx - back
+        if idx < 0:
+            break
+        row = df.iloc[idx]
+        # "touch" générique : low <= bb20_lo OU high >= bb20_up
+        try:
+            touched_lo = float(row['low'])  <= float(row['bb20_lo'])
+            touched_up = float(row['high']) >= float(row['bb20_up'])
+        except Exception:
+            continue
+        if touched_lo or touched_up:
+            return idx
+    return None
 
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """Détection avec: contact→réaction (≤N), Option E = entrée sur la bougie suivante (configurable),
     CT = réintégration stricte (configurable) BB20 &/ou BB80, tolérance % + coussin ATR
-    UNIQUEMENT sur le contact BB80, neutralité MM80 et anti-excès."""
+    UNIQUEMENT sur le contact BB80, neutralité MM80 et anti-excès.
+    ⚠️ SL et TP utilisent désormais toujours TP_BB_OFFSET_PCT (pourcentage « un peu avant/après »)."""
     if df is None or len(df) < 81:
         return None
 
@@ -326,17 +330,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         enforce_next_bar = True
     try:
-        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))
+        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))  # uniquement pour tolérance BB80 (contact)
     except Exception:
         atr_tol_k = 0.125
-    try:
-        ct_tp_atr_k = float(database.get_setting('CT_TP_ATR_K', 1.0))
-    except Exception:
-        ct_tp_atr_k = 1.0
-    try:
-        tp_atr_k = float(database.get_setting('TP_ATR_K', 1.0))
-    except Exception:
-        tp_atr_k = 1.0
     try:
         ct_reintegrate_both = str(database.get_setting('CT_REINTEGRATE_BOTH_BB', 'true')).lower() == 'true'
     except Exception:
@@ -345,6 +341,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         cut_wick_enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
     except Exception:
         cut_wick_enabled = False
+
+    # ⚙️ Offset unique en POURCENTAGE pour TP/SL (toujours appliqué)
+    tp_pct = get_tp_offset_pct()
 
     # --- Anti-excès BB80 ---
     try:
@@ -411,11 +410,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     signal = None
 
-    # --- Indicateurs pour TP ---
-    atr_ref = float(contact.get('atr', last.get('atr', 0.0)))
-    tp_offset_trend = atr_ref * tp_atr_k
-    tp_offset_ct    = atr_ref * ct_tp_atr_k
-
     # --- Pattern TENDANCE ---
     is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
     touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
@@ -424,12 +418,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_above_mm80 and touched_bb20_low and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(_anchor_sl_from_extreme(df, 'buy'))
-        prev = contact
+        sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL = low_ancre * (1 - tp_pct)
 
-        # TP long: un peu sous BB80_up
+        # TP long: un peu sous BB80_up (pourcentage)
         target_band = float(last['bb80_up'])
-        tp = target_band - tp_offset_trend
+        tp = target_band * (1.0 - tp_pct)
         if tp <= entry:
             tp = target_band
         if tp <= entry:
@@ -439,7 +432,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             rr = (tp - entry) / (entry - sl)
             rr_final = rr
             if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(contact, entry, sl, tp, 'buy')
                 rr_final = max(rr, rr_alt)
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
@@ -447,12 +440,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     elif (not is_above_mm80) and touched_bb20_high and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(_anchor_sl_from_extreme(df, 'sell'))
-        prev = contact
+        sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL = high_ancre * (1 + tp_pct)
 
-        # TP short: un peu au-dessus de BB80_lo (⚠️ correction: + offset)
+        # TP short: un peu au-dessus de BB80_lo (pourcentage)
         target_band = float(last['bb80_lo'])
-        tp = target_band + tp_offset_trend
+        tp = target_band * (1.0 + tp_pct)
         if tp >= entry:
             tp = target_band
         if tp >= entry:
@@ -462,7 +454,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             rr = (entry - tp) / (sl - entry)
             rr_final = rr
             if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(contact, entry, sl, tp, 'sell')
                 rr_final = max(rr, rr_alt)
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
@@ -479,7 +471,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # --- CONTRE-TENDANCE (double extrême + réintégration stricte) ---
     if not signal:
         prev = contact
-        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))
+        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))  # tolérance contact BB80 uniquement
 
         touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
             float(prev['low'])  <= float(prev['bb80_lo']) or _near_bb80_with_tolerance(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow, atr_contact, atr_tol_k)
@@ -493,9 +485,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             entry = float(last['close'])
             sl = float(_anchor_sl_from_extreme(df, 'buy'))
 
-            # TP long CT: un peu sous BB20_mid
+            # TP long CT: un peu sous BB20_mid (pourcentage)
             target_band = float(last['bb20_mid'])
-            tp = target_band - tp_offset_ct
+            tp = target_band * (1.0 - tp_pct)
             if tp <= entry:
                 tp = target_band
             if tp <= entry:
@@ -515,9 +507,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             entry = float(last['close'])
             sl = float(_anchor_sl_from_extreme(df, 'sell'))
 
-            # TP short CT: un peu au-dessus de BB20_mid (⚠️ correction: + offset)
+            # TP short CT: un peu au-dessus de BB20_mid (pourcentage)
             target_band = float(last['bb20_mid'])
-            tp = target_band + tp_offset_ct
+            tp = target_band * (1.0 + tp_pct)
             if tp >= entry:
                 tp = target_band
             if tp >= entry:
@@ -545,6 +537,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 # ==============================================================================
 
 def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
+    _ensure_bitget_mix_options(ex)
     """
     Vérifie la cohérence entre les positions ouvertes sur l'exchange (Bitget via CCXT)
     et les trades 'OPEN' en base. Ne supprime rien côté exchange. Peut, en option,
@@ -684,54 +677,39 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
 
 def _bitget_positions_params() -> Dict[str, str]:
-    """
-    Paramètres requis par Bitget pour les endpoints 'mix' USDT Perp.
-    umcbl = USDT-margined perpetual.
-    """
-    return {"productType": "umcbl", "marginCoin": "USDT"}
+    return {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
 
 
 def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
-    """
-    Sécurise la configuration Bitget pour les contrats UM (USDT Perp).
-    """
     try:
         if getattr(ex, "id", "") != "bitget":
             return
         if not hasattr(ex, "options") or ex.options is None:
             ex.options = {}
-        ex.options.setdefault("defaultType", "swap")
-        ex.options.setdefault("productType", "umcbl")
-        ex.options.setdefault("marginCoin", "USDT")
+        ex.options["defaultType"] = "swap"
+        ex.options["defaultSettle"] = "USDT"
+        ex.options["productType"] = "USDT-FUTURES"
     except Exception:
         pass
 
+
 def _resolve_bitget_route(exchange):
-    """
-    Route Bitget USDT-M uniquement.
-    Priorité v2: productType 'USDT-FUTURES', fallback alias 'umcbl'.
-    """
     try:
         if not hasattr(exchange, "options") or not isinstance(exchange.options, dict):
             exchange.options = {}
         exchange.options["defaultType"] = "swap"
         exchange.options["defaultSettle"] = "USDT"
+        exchange.options["productType"] = "USDT-FUTURES"
     except Exception:
         pass
 
     return {
         "marginCoin": "USDT",
         "primary": "USDT-FUTURES",
-        "fallback": "umcbl",
     }
 
+
 def _fetch_positions_safe(exchange, symbols=None):
-    """
-    Lecture robuste des positions Bitget (USDT-M only):
-    - Tente d'abord productType='USDT-FUTURES' (v2) avec marginCoin='USDT'
-    - Fallback alias 'umcbl'
-    - Fallback par symbole (uniquement marchés swap en USDT)
-    """
     try:
         exchange.load_markets()
     except Exception:
@@ -741,28 +719,16 @@ def _fetch_positions_safe(exchange, symbols=None):
     if ex_id == "bitget":
         route = _resolve_bitget_route(exchange)
         mc = route["marginCoin"]
-        pt_primary = route["primary"]
-        pt_fallback = route["fallback"]
 
-        def _try(params):
-            res = exchange.fetch_positions(symbols, params)
-            return res if res is not None else []
-
+        params_base = {"type": "swap", "productType": "USDT-FUTURES", "marginCoin": mc}
         last_err = None
 
-        # 1) Agrégé: USDT-FUTURES
         try:
-            return _try({"type": "swap", "productType": pt_primary, "marginCoin": mc})
+            res = exchange.fetch_positions(symbols, params_base)
+            return res if res is not None else []
         except Exception as e1:
             last_err = e1
 
-        # 2) Agrégé: umcbl (alias)
-        try:
-            return _try({"type": "swap", "productType": pt_fallback, "marginCoin": mc})
-        except Exception as e2:
-            last_err = e2
-
-        # 3) Fallback par symbole (USDT swap uniquement)
         positions = []
         try:
             if symbols is None:
@@ -776,17 +742,8 @@ def _fetch_positions_safe(exchange, symbols=None):
             swap_usdt = []
 
         for sym in swap_usdt[:100]:
-            # v2 d'abord
             try:
-                p = exchange.fetch_position(sym, {"type": "swap", "productType": pt_primary, "marginCoin": mc})
-                if p:
-                    positions.append(p)
-                    continue
-            except Exception:
-                pass
-            # alias ensuite
-            try:
-                p = exchange.fetch_position(sym, {"type": "swap", "productType": pt_fallback, "marginCoin": mc})
+                p = exchange.fetch_position(sym, params_base)
                 if p:
                     positions.append(p)
             except Exception:
@@ -801,7 +758,6 @@ def _fetch_positions_safe(exchange, symbols=None):
             pass
         return []
     else:
-        # Exchanges non-Bitget: standard
         try:
             res = exchange.fetch_positions(symbols)
             return res if res is not None else []
@@ -812,15 +768,9 @@ def _fetch_positions_safe(exchange, symbols=None):
                 pass
             return []
 
+
             
 def _fetch_balance_safe(exchange):
-    """
-    Récupère le solde/équity de manière robuste.
-    - Bitget: force type swap + marginCoin et essaie les variantes de productType v2.
-      Essaie dans l'ordre: 'USDT-FUTURES'/'COIN-FUTURES' puis anciens alias 'umcbl'/'dmcbl'.
-    - Autres exchanges: appel standard.
-    Retourne l'objet balance CCXT (dict normalisé).
-    """
     try:
         exchange.load_markets()
     except Exception:
@@ -828,7 +778,6 @@ def _fetch_balance_safe(exchange):
 
     try:
         if getattr(exchange, "id", "") == "bitget":
-            # Prépare options
             from os import getenv
             if not hasattr(exchange, "options") or not isinstance(exchange.options, dict):
                 exchange.options = {}
@@ -842,12 +791,9 @@ def _fetch_balance_safe(exchange):
             except Exception:
                 pass
             exchange.options["defaultSettle"] = margin_coin
+            exchange.options["productType"] = "USDT-FUTURES" if margin_coin in ("USDT", "USDC") else "COIN-FUTURES"
 
-            # Détermine famille Futures (USDT vs COIN)
-            family_is_usdt = (margin_coin in ("USDT", "USDC"))
-
-            # Liste des candidats productType selon Bitget v2 (et anciens alias pour compat)
-            pt_candidates = (["USDT-FUTURES", "umcbl"] if family_is_usdt else ["COIN-FUTURES", "dmcbl"])
+            pt_candidates = ["USDT-FUTURES"] if margin_coin in ("USDT", "USDC") else ["COIN-FUTURES"]
 
             last_err = None
             for pt in pt_candidates:
@@ -859,14 +805,12 @@ def _fetch_balance_safe(exchange):
                     last_err = e
                     continue
 
-            # Si tout a échoué, notifie et renvoie dict vide
             try:
                 notifier.tg_send(f"❌ Erreur: Récupération du solde\nbitget {str(last_err)}")
             except Exception:
                 pass
             return {}
 
-        # Par défaut pour les autres exchanges
         bal = exchange.fetch_balance()
         return bal if bal else {}
     except Exception as e:
@@ -875,6 +819,7 @@ def _fetch_balance_safe(exchange):
         except Exception:
             pass
         return {}
+
 
 
 def get_portfolio_equity_usdt(exchange) -> float:
@@ -930,6 +875,7 @@ def get_portfolio_equity_usdt(exchange) -> float:
     return 0.0
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
+    _ensure_bitget_mix_options(ex)
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
@@ -1133,7 +1079,15 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     
     return True,"Position ouverte avec succès."
 
+def get_tp_offset_pct() -> float:
+    """Retourne le pourcentage d'offset (ex: 0.0015 = 0.15%) pour TP/SL depuis la DB."""
+    try:
+        return float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
+    except Exception:
+        return 0.0015
+
 def manage_open_positions(ex: ccxt.Exchange):
+    _ensure_bitget_mix_options(ex)
     """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/CT, trailing après BE.
        Tous les ordres sont MARKET reduceOnly (triggers) + precision quantité + sécurisation modes."""
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
@@ -1342,7 +1296,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 bb80_up  = float(last['bb80_up'])
                 bb80_lo  = float(last['bb80_lo'])
 
-                offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
+                offset_pct = get_tp_offset_pct()
                 if regime == 'Tendance':
                     target_tp = (bb80_up * (1.0 - offset_pct)) if is_long else (bb80_lo * (1.0 + offset_pct))
                 else:
@@ -1435,6 +1389,7 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
+    _ensure_bitget_mix_options(ex)
     """Clôture manuelle robuste : vérifie la position réelle, arrondit la quantité, et ferme en MARKET reduceOnly.
        Sécurise leverage/modes avant lecture des positions sur le symbole."""
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
