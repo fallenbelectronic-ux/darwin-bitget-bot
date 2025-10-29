@@ -501,7 +501,7 @@ def main():
     start_live_sync(ex)
     
     if not database.get_setting('STRATEGY_MODE'):
-        database.set_setting('STRATEGY_MODE', 'NORMAL')
+        database.set_setting('STRATEGY_MODE', 'SPLIT')
         
     # Restaure l'état Pause/Reprise depuis la DB
     global _paused
@@ -511,11 +511,10 @@ def main():
     # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
     paper_mode_setting = database.get_setting('PAPER_TRADING_MODE', None)
     if not paper_mode_setting:
-        database.set_setting('PAPER_TRADING_MODE', 'true')  # défaut = PAPIER
-        paper_mode_setting = 'true'
+        database.set_setting('PAPER_TRADING_MODE', 'false')  # défaut = PAPIER
+        paper_mode_setting = 'false'
 
     current_paper_mode = str(paper_mode_setting).lower() == 'true'
-    
     notifier.send_main_menu(_paused)
     
     universe = build_universe(ex)
