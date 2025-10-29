@@ -832,6 +832,121 @@ def _fetch_positions_safe(exchange, symbols=None):
             except Exception:
                 pass
             return []
+def _fetch_balance_safe(exchange):
+    """
+    Récupère le solde/équity de manière robuste.
+    - Bitget: force type swap + marginCoin et essaie les variantes de productType v2.
+      Essaie dans l'ordre: 'USDT-FUTURES'/'COIN-FUTURES' puis anciens alias 'umcbl'/'dmcbl'.
+    - Autres exchanges: appel standard.
+    Retourne l'objet balance CCXT (dict normalisé).
+    """
+    try:
+        exchange.load_markets()
+    except Exception:
+        pass
+
+    try:
+        if getattr(exchange, "id", "") == "bitget":
+            # Prépare options
+            from os import getenv
+            if not hasattr(exchange, "options") or not isinstance(exchange.options, dict):
+                exchange.options = {}
+            exchange.options["defaultType"] = "swap"
+
+            margin_coin = (getenv("MARGIN_COIN", "USDT") or "USDT").strip().upper()
+            try:
+                db_margin = str(database.get_setting("MARGIN_COIN", "")).strip().upper()
+                if db_margin:
+                    margin_coin = db_margin
+            except Exception:
+                pass
+            exchange.options["defaultSettle"] = margin_coin
+
+            # Détermine famille Futures (USDT vs COIN)
+            family_is_usdt = (margin_coin in ("USDT", "USDC"))
+
+            # Liste des candidats productType selon Bitget v2 (et anciens alias pour compat)
+            pt_candidates = (["USDT-FUTURES", "umcbl"] if family_is_usdt else ["COIN-FUTURES", "dmcbl"])
+
+            last_err = None
+            for pt in pt_candidates:
+                try:
+                    bal = exchange.fetch_balance({"type": "swap", "productType": pt, "marginCoin": margin_coin})
+                    if bal:
+                        return bal
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            # Si tout a échoué, notifie et renvoie dict vide
+            try:
+                notifier.tg_send(f"❌ Erreur: Récupération du solde\nbitget {str(last_err)}")
+            except Exception:
+                pass
+            return {}
+
+        # Par défaut pour les autres exchanges
+        bal = exchange.fetch_balance()
+        return bal if bal else {}
+    except Exception as e:
+        try:
+            notifier.tg_send(f"❌ Erreur: Récupération du solde\n{getattr(exchange,'id','')} {str(e)}")
+        except Exception:
+            pass
+        return {}
+
+
+def get_portfolio_equity_usdt(exchange) -> float:
+    """
+    Renvoie l'équity totale convertie en USDT pour l'affichage statistiques.
+    - Bitget: tente de lire 'usdtEquity' depuis 'info.data' (v2) ou somme des comptes.
+    - Fallback: lit la devise USDT normalisée de CCXT si dispo.
+    """
+    bal = _fetch_balance_safe(exchange)
+    if not bal:
+        return 0.0
+
+    # Cas Bitget: extraire usdtEquity depuis payload brut si présent
+    try:
+        if getattr(exchange, "id", "") == "bitget":
+            info = bal.get("info", {})
+            data = info.get("data", None)
+            total_usdt_equity = 0.0
+            if isinstance(data, list):
+                for acc in data:
+                    # 'usdtEquity' est une string numérique côté API v2
+                    v = acc.get("usdtEquity") or acc.get("equity") or "0"
+                    try:
+                        total_usdt_equity += float(v)
+                    except Exception:
+                        continue
+                if total_usdt_equity > 0:
+                    return float(total_usdt_equity)
+            elif isinstance(data, dict):
+                v = data.get("usdtEquity") or data.get("equity") or "0"
+                return float(v)
+    except Exception:
+        pass
+
+    # Fallback générique CCXT: lire USDT total si présent
+    try:
+        usdt = bal.get("USDT", None)
+        if isinstance(usdt, dict):
+            for key in ("total", "free", "used"):
+                if key in usdt and usdt[key] is not None:
+                    return float(usdt.get("total") or usdt.get("free") or 0.0)
+    except Exception:
+        pass
+
+    # Dernier recours: total 'total' s'il existe (certains exch renvoient un agrégat)
+    try:
+        total = bal.get("total", {})
+        if isinstance(total, dict) and "USDT" in total:
+            return float(total["USDT"])
+    except Exception:
+        pass
+
+    return 0.0
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
@@ -1285,19 +1400,48 @@ def manage_open_positions(ex: ccxt.Exchange):
             print(f"Erreur TP dynamique {symbol}: {e}")
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
-    """Récupère le solde USDT."""
+    """Solde USDT/équity robuste (Bitget v2 compatible, évite 'Parameter productType error')."""
     try:
-        ex_id = getattr(ex, "id", "")
-        if ex_id == "bitget":
-            _ensure_bitget_mix_options(ex)
-            bal = ex.fetch_balance(params=_bitget_positions_params())
-            total = bal.get("total") or {}
-            return float(total.get("USDT", 0.0))
-        if not hasattr(ex, "options") or ex.options is None:
-            ex.options = {}
-        ex.options["recvWindow"] = 10000
-        bal = ex.fetch_balance(params={"type": "swap", "code": "USDT"})
-        return float(bal["total"].get("USDT", 0.0))
+        bal = _fetch_balance_safe(ex)
+        if not bal:
+            return 0.0
+
+        # Bitget: prioriser l'équity USDT native renvoyée par l'API v2
+        if getattr(ex, "id", "") == "bitget":
+            try:
+                info = bal.get("info", {})
+                data = info.get("data", None)
+                total_usdt_equity = 0.0
+                if isinstance(data, list):
+                    for acc in data:
+                        v = acc.get("usdtEquity") or acc.get("equity") or "0"
+                        total_usdt_equity += float(v)
+                    if total_usdt_equity > 0:
+                        return float(total_usdt_equity)
+                elif isinstance(data, dict):
+                    v = data.get("usdtEquity") or data.get("equity") or "0"
+                    return float(v)
+            except Exception:
+                pass  # fallback générique juste dessous
+
+        # Fallback générique CCXT: lire USDT normalisé
+        try:
+            usdt = bal.get("USDT")
+            if isinstance(usdt, dict):
+                return float(usdt.get("total") or usdt.get("free") or 0.0)
+        except Exception:
+            pass
+
+        # Dernier recours: agrégat 'total'
+        try:
+            total = bal.get("total", {})
+            if isinstance(total, dict) and "USDT" in total:
+                return float(total["USDT"])
+        except Exception:
+            pass
+
+        return 0.0
+
     except Exception as e:
         notifier.tg_send_error("Récupération du solde", e)
         return None
