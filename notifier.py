@@ -619,9 +619,21 @@ def format_open_positions(positions: List[Dict[str, Any]]):
 
 def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
     """Formate et envoie un rapport complet des positions ouvertes, synchronisé avec l'exchange."""
-    open_exchange_symbols = {p['info']['symbol'] for p in exchange_positions if p.get('contracts') and float(p['contracts']) > 0}
-    open_db_symbols = {p['symbol'].replace('/', '') for p in db_positions}
-    
+    # Extraction robuste des symboles exchange
+    open_exchange_symbols = set()
+    for p in exchange_positions or []:
+        try:
+            contracts = float(p.get('contracts') or 0.0)
+        except Exception:
+            contracts = 0.0
+        if contracts > 0:
+            info = p.get('info') or {}
+            sym = info.get('symbol') or p.get('symbol') or ""
+            if sym:
+                open_exchange_symbols.add(sym)
+
+    open_db_symbols = { (p.get('symbol') or '').replace('/', '') for p in (db_positions or []) }
+
     synced_symbols = open_exchange_symbols.intersection(open_db_symbols)
     ghost_symbols = open_exchange_symbols - open_db_symbols
     zombie_symbols = open_db_symbols - open_exchange_symbols
@@ -630,19 +642,19 @@ def format_synced_open_positions(exchange_positions: List[Dict], db_positions: L
         return tg_send("✅ Aucune position ouverte (vérifié sur l'exchange et dans la DB).")
 
     lines = ["<b>📊 Positions Ouvertes (Synchronisé)</b>\n"]
-    
+
     if synced_symbols:
         lines.append("--- POSITIONS SYNCHRONISÉES ---")
-        synced_db_pos = [p for p in db_positions if p['symbol'].replace('/', '') in synced_symbols]
+        synced_db_pos = [p for p in db_positions if (p.get('symbol') or '').replace('/', '') in synced_symbols]
         for pos in synced_db_pos:
             side_icon = "📈" if pos.get('side') == 'buy' else "📉"
             lines.append(f"<b>{pos.get('id')}. {side_icon} {html.escape(pos.get('symbol', 'N/A'))}</b>")
-    
+
     if ghost_symbols:
         lines.append("\n⚠️ <b>Positions FANTÔMES</b> (sur l'exchange, pas dans la DB):")
         for symbol in ghost_symbols:
             lines.append(f"- <code>{symbol}</code>")
-    
+
     if zombie_symbols:
         lines.append("\n🔍 <b>Positions DÉSYNCHRONISÉES</b> (dans la DB, pas sur l'exchange):")
         for symbol in zombie_symbols:
@@ -650,10 +662,6 @@ def format_synced_open_positions(exchange_positions: List[Dict], db_positions: L
 
     tg_send("\n".join(lines), reply_markup=get_positions_keyboard(db_positions))
 
-def tg_send_error(title: str, error: Any):
-    """Envoie un message d'erreur formaté."""
-    error_text = str(error)
-    tg_send(f"❌ <b>Erreur: {html.escape(title)}</b>\n<code>{html.escape(error_text)}</code>")
 
 def format_trade_message(symbol: str, signal: Dict, quantity: float, mode: str, risk: float) -> str:
     """Construit le message pour un trade qui vient d'être ouvert."""
