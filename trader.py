@@ -708,121 +708,100 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
 
 def _resolve_bitget_route(exchange):
     """
-    Prépare l'exchange Bitget pour les perp.
-    Détermine marginCoin (USDT par défaut) et productType (umcbl/dmcbl).
+    Route Bitget USDT-M uniquement.
+    Priorité v2: productType 'USDT-FUTURES', fallback alias 'umcbl'.
     """
-    from os import getenv
-    # Options CCXT pour Bitget
     try:
         if not hasattr(exchange, "options") or not isinstance(exchange.options, dict):
             exchange.options = {}
         exchange.options["defaultType"] = "swap"
-        # marginCoin par défaut
-        margin_coin_env = (getenv("MARGIN_COIN", "USDT") or "USDT").strip().upper()
-        # Autoriser override DB s'il existe
-        try:
-            db_margin = str(database.get_setting("MARGIN_COIN", "")).strip().upper()
-            if db_margin:
-                margin_coin_env = db_margin
-        except Exception:
-            pass
-        exchange.options["defaultSettle"] = margin_coin_env
+        exchange.options["defaultSettle"] = "USDT"
     except Exception:
         pass
 
-    # productType
-    pt_env = (getenv("BITGET_PRODUCT_TYPE", "") or "").strip().lower()
-    try:
-        pt_db = str(database.get_setting("BITGET_PRODUCT_TYPE", "")).strip().lower()
-    except Exception:
-        pt_db = ""
-    product_type = pt_env or pt_db
-    if product_type not in ("umcbl", "dmcbl"):
-        product_type = "umcbl" if exchange.options.get("defaultSettle", "USDT").upper() == "USDT" else "dmcbl"
-
     return {
-        "marginCoin": exchange.options.get("defaultSettle", "USDT"),
-        "productType": product_type,
+        "marginCoin": "USDT",
+        "primary": "USDT-FUTURES",
+        "fallback": "umcbl",
     }
-
 
 def _fetch_positions_safe(exchange, symbols=None):
     """
-    Lecture robuste des positions.
-    - Bitget: ajoute productType + marginCoin, tente UMCBL puis DMCBL en fallback.
-    - Fallback par symbole si all-position échoue.
+    Lecture robuste des positions Bitget (USDT-M only):
+    - Tente d'abord productType='USDT-FUTURES' (v2) avec marginCoin='USDT'
+    - Fallback alias 'umcbl'
+    - Fallback par symbole (uniquement marchés swap en USDT)
     """
     try:
         exchange.load_markets()
     except Exception:
         pass
 
-    if getattr(exchange, "id", "") == "bitget":
+    ex_id = getattr(exchange, "id", "")
+    if ex_id == "bitget":
         route = _resolve_bitget_route(exchange)
+        mc = route["marginCoin"]
+        pt_primary = route["primary"]
+        pt_fallback = route["fallback"]
 
-        def _try_fetch_positions(params):
-            try:
-                res = exchange.fetch_positions(symbols, params)
-                return res if res is not None else []
-            except Exception:
-                raise
+        def _try(params):
+            res = exchange.fetch_positions(symbols, params)
+            return res if res is not None else []
 
-        # 1) tentative avec route déduite
+        last_err = None
+
+        # 1) Agrégé: USDT-FUTURES
         try:
-            return _try_fetch_positions({"productType": route["productType"], "marginCoin": route["marginCoin"]})
+            return _try({"type": "swap", "productType": pt_primary, "marginCoin": mc})
         except Exception as e1:
-            msg = str(e1)
-            # 2) si 40019 ou param manquant, tenter l'autre productType
-            other_pt = "dmcbl" if route["productType"] == "umcbl" else "umcbl"
-            if "40019" in msg or "productType" in msg.lower() or "cannot be empty" in msg.lower():
-                try:
-                    return _try_fetch_positions({"productType": other_pt, "marginCoin": route["marginCoin"]})
-                except Exception as e2:
-                    msg2 = str(e2)
+            last_err = e1
 
-                    # 3) Fallback par symbole: certaines versions CCXT Bitget n'agrègent pas
-                    positions = []
-                    if symbols is None:
-                        # Construire une petite liste de symbols swap à partir du marché
-                        try:
-                            swap_symbols = [m for m, info in exchange.markets.items() if info.get("swap")]
-                        except Exception:
-                            swap_symbols = []
-                    else:
-                        swap_symbols = list(symbols)
+        # 2) Agrégé: umcbl (alias)
+        try:
+            return _try({"type": "swap", "productType": pt_fallback, "marginCoin": mc})
+        except Exception as e2:
+            last_err = e2
 
-                    for sym in swap_symbols[:100]:
-                        try:
-                            p = exchange.fetch_position(sym, {"productType": route["productType"], "marginCoin": route["marginCoin"]})
-                            if p:
-                                positions.append(p)
-                        except Exception:
-                            # Essai avec l'autre productType pour ce symbole
-                            try:
-                                p = exchange.fetch_position(sym, {"productType": other_pt, "marginCoin": route["marginCoin"]})
-                                if p:
-                                    positions.append(p)
-                            except Exception:
-                                continue
-
-                    if positions:
-                        return positions
-
-                    try:
-                        notifier.tg_send(
-                            f"❌ Erreur: Lecture des positions exchange\nbitget {msg}\nbitget {msg2}"
-                        )
-                    except Exception:
-                        pass
-                    return []
+        # 3) Fallback par symbole (USDT swap uniquement)
+        positions = []
+        try:
+            if symbols is None:
+                swap_usdt = [
+                    m for m, info in (exchange.markets or {}).items()
+                    if info.get("swap") and str(info.get("settle", "")).upper() == "USDT"
+                ]
             else:
-                try:
-                    notifier.tg_send(f"❌ Erreur: Lecture des positions exchange\nbitget {msg}")
-                except Exception:
-                    pass
-                return []
+                swap_usdt = list(symbols)
+        except Exception:
+            swap_usdt = []
+
+        for sym in swap_usdt[:100]:
+            # v2 d'abord
+            try:
+                p = exchange.fetch_position(sym, {"type": "swap", "productType": pt_primary, "marginCoin": mc})
+                if p:
+                    positions.append(p)
+                    continue
+            except Exception:
+                pass
+            # alias ensuite
+            try:
+                p = exchange.fetch_position(sym, {"type": "swap", "productType": pt_fallback, "marginCoin": mc})
+                if p:
+                    positions.append(p)
+            except Exception:
+                continue
+
+        if positions:
+            return positions
+
+        try:
+            notifier.tg_send(f"❌ Erreur: Lecture des positions exchange\nbitget {str(last_err)}")
+        except Exception:
+            pass
+        return []
     else:
-        # Exchanges non-Bitget: comportement standard
+        # Exchanges non-Bitget: standard
         try:
             res = exchange.fetch_positions(symbols)
             return res if res is not None else []
@@ -832,6 +811,8 @@ def _fetch_positions_safe(exchange, symbols=None):
             except Exception:
                 pass
             return []
+
+            
 def _fetch_balance_safe(exchange):
     """
     Récupère le solde/équity de manière robuste.
