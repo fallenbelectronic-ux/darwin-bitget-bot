@@ -544,6 +544,20 @@ def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
         tg_send_error("Callback routing", e)
         return False
 
+def send_commands_help(chat_id: Optional[str] = None):
+    """
+    Affiche le bloc 'Commandes' dans Telegram, même format/emoji que setuniverse & setmaxpos,
+    avec ajout de /offset pour ouvrir le panneau TP/SL.
+    """
+    lines = [
+        "🛠️ <b>Commandes</b>",
+        "",
+        "/setuniverse &lt;nombre&gt;  — 🌐 Taille du scan",
+        "/setmaxpos &lt;nombre&gt;    — 🧮 Nb max de trades",
+        "/offset                     — ⚙️ Offset TP/SL (panneau)"
+    ]
+    tg_send("\n".join(lines), chat_id=chat_id)
+
 
 # ==============================================================================
 # MESSAGES FORMATÉS
