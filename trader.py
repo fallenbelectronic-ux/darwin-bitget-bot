@@ -706,67 +706,132 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
     except Exception:
         pass
 
-def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
+def _resolve_bitget_route(exchange):
     """
-    Wrapper robuste pour Bitget : tente d'abord fetch_positions() avec params Bitget,
-    puis fallback direct sur l'endpoint v2 /mix/position/all-position via fetch2 en cas d'échec.
-    Normalise la sortie pour correspondre au format attendu par le reste du code.
+    Prépare l'exchange Bitget pour les perp.
+    Détermine marginCoin (USDT par défaut) et productType (umcbl/dmcbl).
+    """
+    from os import getenv
+    # Options CCXT pour Bitget
+    try:
+        if not hasattr(exchange, "options") or not isinstance(exchange.options, dict):
+            exchange.options = {}
+        exchange.options["defaultType"] = "swap"
+        # marginCoin par défaut
+        margin_coin_env = (getenv("MARGIN_COIN", "USDT") or "USDT").strip().upper()
+        # Autoriser override DB s'il existe
+        try:
+            db_margin = str(database.get_setting("MARGIN_COIN", "")).strip().upper()
+            if db_margin:
+                margin_coin_env = db_margin
+        except Exception:
+            pass
+        exchange.options["defaultSettle"] = margin_coin_env
+    except Exception:
+        pass
+
+    # productType
+    pt_env = (getenv("BITGET_PRODUCT_TYPE", "") or "").strip().lower()
+    try:
+        pt_db = str(database.get_setting("BITGET_PRODUCT_TYPE", "")).strip().lower()
+    except Exception:
+        pt_db = ""
+    product_type = pt_env or pt_db
+    if product_type not in ("umcbl", "dmcbl"):
+        product_type = "umcbl" if exchange.options.get("defaultSettle", "USDT").upper() == "USDT" else "dmcbl"
+
+    return {
+        "marginCoin": exchange.options.get("defaultSettle", "USDT"),
+        "productType": product_type,
+    }
+
+
+def _fetch_positions_safe(exchange, symbols=None):
+    """
+    Lecture robuste des positions.
+    - Bitget: ajoute productType + marginCoin, tente UMCBL puis DMCBL en fallback.
+    - Fallback par symbole si all-position échoue.
     """
     try:
-        if getattr(ex, "id", "") == "bitget":
-            _ensure_bitget_mix_options(ex)
-            params = _bitget_positions_params()
+        exchange.load_markets()
+    except Exception:
+        pass
 
-            # 1) Tentative standard CCXT avec params requis
+    if getattr(exchange, "id", "") == "bitget":
+        route = _resolve_bitget_route(exchange)
+
+        def _try_fetch_positions(params):
             try:
-                return ex.fetch_positions(symbols if symbols else None, params=params) or []
-            except Exception as e:
-                # 2) Fallback : appel direct à l’endpoint v2
+                res = exchange.fetch_positions(symbols, params)
+                return res if res is not None else []
+            except Exception:
+                raise
+
+        # 1) tentative avec route déduite
+        try:
+            return _try_fetch_positions({"productType": route["productType"], "marginCoin": route["marginCoin"]})
+        except Exception as e1:
+            msg = str(e1)
+            # 2) si 40019 ou param manquant, tenter l'autre productType
+            other_pt = "dmcbl" if route["productType"] == "umcbl" else "umcbl"
+            if "40019" in msg or "productType" in msg.lower() or "cannot be empty" in msg.lower():
                 try:
-                    raw = ex.fetch2("position/all-position", "mixPrivate", "GET", params)
-                    data = (raw or {}).get("data") or (raw or {}).get("result") or []
-                    results = []
-                    # Normalisation minimale -> clés utilisées ailleurs dans le code:
-                    # 'symbol', 'contracts' (alias 'positionAmt'), 'side', 'entryPrice', 'info'
-                    markets_by_id = getattr(ex, "markets_by_id", {}) or {}
-                    for p in data:
-                        symbol_id = str(p.get("symbol", "") or p.get("instId", "") or "")
-                        mkt = markets_by_id.get(symbol_id) if symbol_id in markets_by_id else None
-                        unified_symbol = (mkt.get("symbol") if isinstance(mkt, dict) else None) or symbol_id
-
-                        contracts = p.get("total") or p.get("totalSize") or p.get("pos") or p.get("holdVol") or 0
-                        try:
-                            contracts = float(contracts)
-                        except Exception:
-                            contracts = 0.0
-
-                        entry = p.get("avgOpenPrice") or p.get("openPrice") or p.get("entryPrice") or 0
-                        try:
-                            entry = float(entry)
-                        except Exception:
-                            entry = 0.0
-
-                        side = str(p.get("holdSide") or p.get("side") or "").lower()  # 'long' / 'short' attendu
-
-                        results.append({
-                            "symbol": unified_symbol,
-                            "contracts": contracts,
-                            "positionAmt": contracts,
-                            "side": side,
-                            "entryPrice": entry,
-                            "info": p,
-                        })
-                    return results
+                    return _try_fetch_positions({"productType": other_pt, "marginCoin": route["marginCoin"]})
                 except Exception as e2:
-                    notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e2}")
+                    msg2 = str(e2)
+
+                    # 3) Fallback par symbole: certaines versions CCXT Bitget n'agrègent pas
+                    positions = []
+                    if symbols is None:
+                        # Construire une petite liste de symbols swap à partir du marché
+                        try:
+                            swap_symbols = [m for m, info in exchange.markets.items() if info.get("swap")]
+                        except Exception:
+                            swap_symbols = []
+                    else:
+                        swap_symbols = list(symbols)
+
+                    for sym in swap_symbols[:100]:
+                        try:
+                            p = exchange.fetch_position(sym, {"productType": route["productType"], "marginCoin": route["marginCoin"]})
+                            if p:
+                                positions.append(p)
+                        except Exception:
+                            # Essai avec l'autre productType pour ce symbole
+                            try:
+                                p = exchange.fetch_position(sym, {"productType": other_pt, "marginCoin": route["marginCoin"]})
+                                if p:
+                                    positions.append(p)
+                            except Exception:
+                                continue
+
+                    if positions:
+                        return positions
+
+                    try:
+                        notifier.tg_send(
+                            f"❌ Erreur: Lecture des positions exchange\nbitget {msg}\nbitget {msg2}"
+                        )
+                    except Exception:
+                        pass
                     return []
-        else:
-            return ex.fetch_positions(symbols if symbols else None) or []
-    except Exception as e:
-        notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
-        return []
-
-
+            else:
+                try:
+                    notifier.tg_send(f"❌ Erreur: Lecture des positions exchange\nbitget {msg}")
+                except Exception:
+                    pass
+                return []
+    else:
+        # Exchanges non-Bitget: comportement standard
+        try:
+            res = exchange.fetch_positions(symbols)
+            return res if res is not None else []
+        except Exception as e:
+            try:
+                notifier.tg_send(f"❌ Erreur: Lecture des positions exchange\n{getattr(exchange,'id','')} {str(e)}")
+            except Exception:
+                pass
+            return []
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
