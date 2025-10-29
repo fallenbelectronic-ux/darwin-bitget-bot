@@ -22,7 +22,7 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
         if not getattr(ex, "markets", None):
             ex.load_markets()
 
-        # Récupération OHLCV avec retries robustes (5xx/timeouts) — ajouté sans rien supprimer
+        # Récupération OHLCV avec retries robustes (5xx/timeouts)
         ohlcv = _safe_fetch_ohlcv_with_retries(ex, symbol, timeframe, limit=limit, params={})
         if not ohlcv or len(ohlcv) < _MIN_ROWS:
             return None
@@ -70,11 +70,7 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
         print(f"fetch_and_prepare_df error on {symbol} {timeframe}: {e}")
         return None
 
-        return df
-
-    except Exception as e:
-        print(f"fetch_and_prepare_df error on {symbol} {timeframe}: {e}")
-        return None
+        
 def _safe_fetch_ohlcv_with_retries(ex, symbol: str, timeframe: str, limit: int = 200, params: Optional[dict] = None):
     """
     Wrapper robuste autour ex.fetch_ohlcv avec retries exponentiels + jitter.
