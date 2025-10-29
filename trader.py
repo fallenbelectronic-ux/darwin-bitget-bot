@@ -706,9 +706,7 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
     except Exception:
         pass
 
-
-
-ddef _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
+def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
     """
     Wrapper robuste pour Bitget: injecte toujours productType/marginCoin.
     Utilise symbols si fourni, sinon None (toutes positions).
