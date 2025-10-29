@@ -14,6 +14,8 @@ import trader
 import notifier
 import utils
 import reporting
+import asyncio
+import ccxt.pro as ccxtpro
 
 # --- PARAMÈTRES GLOBAUX ---
 BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
@@ -108,6 +110,82 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
         return sorted_symbols[:size]
     except Exception as e:
         print(f"Erreur univers: {e}"); return []
+
+def start_live_sync(ex):
+    t = threading.Thread(target=_live_sync_worker, args=(ex,), daemon=True)
+    t.start()
+
+def _live_sync_worker(ex):
+    try:
+        import asyncio
+        asyncio.run(_ws_sync_loop(ex))
+        return
+    except Exception as e:
+        try:
+            notifier.tg_send_error("Live sync WS indisponible — fallback polling", e)
+        except Exception:
+            pass
+    try:
+        interval = int(database.get_setting('LIVE_POLL_SECONDS', 2))
+    except Exception:
+        interval = 2
+    interval = max(1, interval)
+    while True:
+        try:
+            trader.sync_positions_with_exchange(ex)
+        except Exception as e:
+            try:
+                notifier.tg_send_error("Live sync polling", e)
+            except Exception:
+                pass
+        time.sleep(interval)
+
+async def _ws_sync_loop(ex_rest):
+    import os
+    import asyncio
+    import ccxt.pro as ccxtpro
+
+    BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1","true","yes")
+    API_KEY          = os.getenv("BITGET_API_KEY", "")
+    API_SECRET       = os.getenv("BITGET_API_SECRET", "")
+    PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
+
+    ex_ws = ccxtpro.bitget({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "password": PASSPHRASSE,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+            "testnet": BITGET_TESTNET,
+        },
+    })
+
+    async def watch_positions():
+        while True:
+            try:
+                await ex_ws.watch_positions()
+                trader.sync_positions_with_exchange(ex_rest)
+            except Exception as e:
+                try:
+                    notifier.tg_send_error("WS positions", e)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+    async def watch_orders():
+        while True:
+            try:
+                await ex_ws.watch_orders()
+                trader.sync_positions_with_exchange(ex_rest)
+            except Exception as e:
+                try:
+                    notifier.tg_send_error("WS orders", e)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+    await asyncio.gather(watch_positions(), watch_orders())
 
 def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     """Sélectionne le meilleur signal en attente et l'exécute."""
@@ -323,7 +401,8 @@ def check_scheduled_reports():
             trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)  # 7 jours
             balance = trader.get_usdt_balance(create_exchange())
             notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
-        
+
+
 # ==============================================================================
 # BOUCLES ET MAIN
 # ==============================================================================
@@ -419,6 +498,7 @@ def main():
     database.setup_database()
     startup_checks()
     ex = create_exchange()
+    start_live_sync(ex)
     
     if not database.get_setting('STRATEGY_MODE'):
         database.set_setting('STRATEGY_MODE', 'NORMAL')
