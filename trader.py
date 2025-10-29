@@ -712,113 +712,100 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
 
 def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
     """
-    Wrapper robuste Bitget:
-      - Injecte systématiquement productType=umcbl & marginCoin=USDT
-      - Tente d'abord l'API unifiée ccxt (fetch_positions)
-      - En cas d'erreur 40019, essaie plusieurs méthodes privées Bitget (réflection)
-      - Si absent dans ta version ccxt, tente fetch2(...) sur le groupe v2PrivateMix
-      - Mappe le résultat au format ccxt-like: [{'symbol','side','contracts','entryPrice','info'}, ...]
+    Bitget-safe fetch positions:
+      1) Tente l'API unifiée ccxt: fetch_positions(..., params={'productType':'umcbl','marginCoin':'USDT'})
+      2) Si erreur/40019, essaie plusieurs routes HTTP via fetch2 compatibles avec différentes versions CCXT :
+         - v2PrivateMix  : position/all-position
+         - v2Private     : mix/position/all-position
+         - mixPrivate v2 : position/all-position
+         - mixPrivate v1 : position/allPosition
+      3) Mappe le résultat vers une liste ccxt-like : [{'symbol','side','contracts','entryPrice','info'}, ...]
     """
+    def _map_positions(raw, markets_by_id):
+        data = (raw or {}).get("data") or raw or []
+        out = []
+        for it in (data if isinstance(data, list) else []):
+            try:
+                sym_id = it.get("symbol") or it.get("instId") or ""
+                hold_side = (it.get("holdSide") or it.get("side") or "").lower()
+                qty = float(it.get("total") or it.get("totalSize") or it.get("holdAmount") or 0)
+                entry_px = float(it.get("avgOpenPrice") or it.get("avgPrice") or 0)
+                unified_symbol = sym_id
+                try:
+                    mkt = markets_by_id.get(sym_id) if markets_by_id else None
+                    if mkt and mkt.get("symbol"):
+                        unified_symbol = mkt["symbol"]
+                except Exception:
+                    pass
+                side = "buy" if hold_side in ("long", "buy") else ("sell" if hold_side in ("short", "sell") else "buy")
+                if qty > 0:
+                    out.append({
+                        "symbol": unified_symbol,
+                        "side": side,
+                        "contracts": qty,
+                        "entryPrice": entry_px,
+                        "info": it,
+                    })
+            except Exception:
+                continue
+        return out
+
     try:
         ex_id = getattr(ex, "id", "")
-        if ex_id == "bitget":
-            _ensure_bitget_mix_options(ex)
-            params = _bitget_positions_params()  # {'productType':'umcbl','marginCoin':'USDT'}
+        if ex_id != "bitget":
+            return ex.fetch_positions(symbols if symbols else None) or []
 
-            # Tentative 1 : unifiée
-            try:
-                return ex.fetch_positions(symbols if symbols else None, params=params) or []
-            except Exception as ee:
-                msg = str(ee)
-                if "40019" not in msg:
-                    # Autre erreur → relayer
-                    raise
+        _ensure_bitget_mix_options(ex)
+        params = _bitget_positions_params()  # {'productType': 'umcbl', 'marginCoin': 'USDT'}
 
-            # Tentative 2 : méthodes privées connues selon versions ccxt
-            method_names = [
-                "v2PrivateMixGetPositionAllPosition",
-                "mixPrivateGetPositionAllPosition",
-                "privateMixGetPositionAllPosition",
-                "v2PrivateMixGetAllPosition",
-                "mixPrivateGetAllPosition",
-                "privateMixGetAllPosition",
-            ]
-            for m in method_names:
-                if hasattr(ex, m):
-                    try:
-                        raw = getattr(ex, m)(params)
-                        data = (raw or {}).get("data") or []
-                        out = []
-                        for it in data:
-                            try:
-                                sym_id = it.get("symbol") or it.get("instId") or ""
-                                hold_side = (it.get("holdSide") or it.get("side") or "").lower()
-                                qty = float(it.get("total", it.get("totalSize", 0)) or 0)
-                                entry_px = float(it.get("avgOpenPrice") or it.get("avgPrice") or 0)
-                                # map id -> unified symbol
-                                try:
-                                    mkt = ex.markets_by_id.get(sym_id) if hasattr(ex, "markets_by_id") else None
-                                    unified_symbol = mkt["symbol"] if mkt else sym_id
-                                except Exception:
-                                    unified_symbol = sym_id
-                                side = "buy" if hold_side in ("long", "buy") else ("sell" if hold_side in ("short", "sell") else "buy")
-                                if qty > 0:
-                                    out.append({
-                                        "symbol": unified_symbol,
-                                        "side": side,
-                                        "contracts": qty,
-                                        "entryPrice": entry_px,
-                                        "info": it,
-                                    })
-                            except Exception:
-                                continue
-                        return out
-                    except Exception as e2:
-                        # Essayer le prochain nom, continuer la boucle
-                        last_err = e2
-
-            # Tentative 3 : fetch2 direct sur le groupe v2PrivateMix (si défini)
-            try:
-                if hasattr(ex, "fetch2"):
-                    raw = ex.fetch2("position/all-position", "v2PrivateMix", "GET", params)
-                    data = (raw or {}).get("data") or []
-                    out = []
-                    for it in data:
-                        try:
-                            sym_id = it.get("symbol") or it.get("instId") or ""
-                            hold_side = (it.get("holdSide") or it.get("side") or "").lower()
-                            qty = float(it.get("total", it.get("totalSize", 0)) or 0)
-                            entry_px = float(it.get("avgOpenPrice") or it.get("avgPrice") or 0)
-                            try:
-                                mkt = ex.markets_by_id.get(sym_id) if hasattr(ex, "markets_by_id") else None
-                                unified_symbol = mkt["symbol"] if mkt else sym_id
-                            except Exception:
-                                unified_symbol = sym_id
-                            side = "buy" if hold_side in ("long", "buy") else ("sell" if hold_side in ("short", "sell") else "buy")
-                            if qty > 0:
-                                out.append({
-                                    "symbol": unified_symbol,
-                                    "side": side,
-                                    "contracts": qty,
-                                    "entryPrice": entry_px,
-                                    "info": it,
-                                })
-                        except Exception:
-                            continue
-                    return out
-            except Exception as e3:
-                notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} {e3}")
+        # Tentative 1 : unifiée ccxt
+        try:
+            return ex.fetch_positions(symbols if symbols else None, params=params) or []
+        except Exception as e1:
+            msg = str(e1)
+            # on continue en fallback seulement si 40019 (paramètre ignoré par la version ccxt)
+            if "40019" not in msg:
+                notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} {msg}")
                 return []
 
-            # Si toutes les tentatives privées échouent, retourner liste vide (grâce au guard)
-            notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} 40019 (toutes méthodes privées indisponibles)")
-            return []
+        # Tentatives 2..n : fetch2 sur différentes familles d'API
+        raw = None
+        try:
+            # v2PrivateMix
+            if hasattr(ex, "fetch2"):
+                raw = ex.fetch2("position/all-position", "v2PrivateMix", "GET", params)
+        except Exception:
+            raw = None
+        if not raw:
+            try:
+                # v2Private (avec préfixe mix/)
+                if hasattr(ex, "fetch2"):
+                    raw = ex.fetch2("mix/position/all-position", "v2Private", "GET", params)
+            except Exception:
+                raw = None
+        if not raw:
+            try:
+                # mixPrivate (v2)
+                if hasattr(ex, "fetch2"):
+                    raw = ex.fetch2("position/all-position", "mixPrivate", "GET", params)
+            except Exception:
+                raw = None
+        if not raw:
+            try:
+                # mixPrivate (v1)
+                if hasattr(ex, "fetch2"):
+                    raw = ex.fetch2("position/allPosition", "mixPrivate", "GET", params)
+            except Exception as e_last:
+                notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} {str(e_last)}")
+                return []
 
-        # Autres exchanges : chemin standard
-        return ex.fetch_positions(symbols if symbols else None) or []
+        markets_by_id = getattr(ex, "markets_by_id", None)
+        return _map_positions(raw, markets_by_id)
+
     except Exception as e:
-        notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
+        notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {str(e)}")
         return []
+
 
 
 
