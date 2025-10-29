@@ -550,14 +550,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
     et les trades 'OPEN' en base. Ne supprime rien côté exchange. Peut, en option,
     fermer en DB les orphelins (présents en DB mais absents sur l'exchange) selon
     le paramètre AUTO_CLOSE_DB_ORPHANS (DB, défaut false).
-
-    Retourne un dict récapitulatif:
-      {
-        "only_on_exchange": [(symbol, side, qty_ex, entry_ex), ...],
-        "only_in_db": [(id, symbol, side, qty_db), ...],
-        "qty_mismatch": [((id, symbol, side), qty_db, qty_ex), ...],
-        "matched": [(id, symbol, side, qty), ...]
-      }
     """
     report = {
         "only_on_exchange": [],
@@ -567,14 +559,8 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
     }
 
     try:
-        # --- Récup Exchange ---
-        ex_positions_raw = []
-        try:
-            params = _bitget_positions_params() if getattr(ex, "id", "") == "bitget" else {}
-            ex_positions_raw = ex.fetch_positions(params=params)
-        except Exception as e:
-            notifier.tg_send_error("Lecture des positions exchange", e)
-            ex_positions_raw = []
+        # --- Récup Exchange (corrigé: wrapper qui force productType/marginCoin sur Bitget) ---
+        ex_positions_raw = _fetch_positions_safe(ex)
 
         # Filtrer les positions réellement ouvertes (> 0)
         ex_open = []
@@ -668,7 +654,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                     notifier.tg_send_error(f"Sync — fermeture orphelin {symbol}", e)
 
         # --- Notification (désactivable) ---
-        # Par défaut: OFF. Mettre SYNC_NOTIFY=true dans la DB si tu veux l'activer.
         try:
             want_notify = str(database.get_setting('SYNC_NOTIFY', 'false')).lower() == 'true'
         except Exception:
@@ -697,10 +682,50 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
     return report
 
+
 def _bitget_positions_params() -> Dict[str, str]:
-    # USDT-margined contracts
+    """
+    Paramètres requis par Bitget pour fetch_positions.
+    umcbl = USDT-margined perpetual (mix/usdt).
+    """
     return {"productType": "umcbl", "marginCoin": "USDT"}
 
+
+def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
+    """
+    Sécurise la configuration Bitget pour les contrats UM (USDT Perp).
+    Certains ccxt exigent aussi options.defaultType / productType.
+    """
+    try:
+        if getattr(ex, "id", "") != "bitget":
+            return
+        # options dict toujours présent
+        if not hasattr(ex, "options") or ex.options is None:
+            ex.options = {}
+        ex.options.setdefault("defaultType", "swap")
+        # Ces clés ne nuisent pas aux autres endpoints si déjà passées via params
+        ex.options.setdefault("productType", "umcbl")
+        ex.options.setdefault("marginCoin", "USDT")
+    except Exception:
+        pass
+
+
+def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
+    """
+    Wrapper robuste pour Bitget: injecte toujours productType/marginCoin.
+    Utilise symbols si fourni, sinon None (toutes positions).
+    """
+    try:
+        if getattr(ex, "id", "") == "bitget":
+            _ensure_bitget_mix_options(ex)
+            params = _bitget_positions_params()
+            # Signature ccxt: fetch_positions(symbols=None, params={})
+            return ex.fetch_positions(symbols if symbols else None, params=params) or []
+        # Autres exchanges
+        return ex.fetch_positions(symbols if symbols else None) or []
+    except Exception as e:
+        notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
+        return []
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
@@ -722,8 +747,8 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             market = ex.market(symbol)
         except Exception:
             pass
-        params = _bitget_positions_params() if getattr(ex, "id", "") == "bitget" else {}
-        ex_positions = ex.fetch_positions([symbol], params=params)
+
+        ex_positions = _fetch_positions_safe(ex, [symbol])
         already_open = False
         for p in ex_positions or []:
             same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
@@ -768,7 +793,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
                             side=side_import,
                             regime="Importé",
                             entry_price=entry_px,
-                            sl_price=entry_px,  # placeholders neutres (à gérer ensuite par manage_open_positions)
+                            sl_price=entry_px,
                             tp_price=entry_px,
                             quantity=contracts,
                             risk_percent=RISK_PER_TRADE_PERCENT,
@@ -786,6 +811,9 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     except Exception:
         # En cas d'échec de lecture des positions, on continue normalement
         pass
+
+    # ... (reste de la fonction inchangé)
+
 
     if len(database.get_open_positions()) >= max_pos:
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
@@ -905,9 +933,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
     
     return True,"Position ouverte avec succès."
-
-
-
 
 def manage_open_positions(ex: ccxt.Exchange):
     """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/CT, trailing après BE.
@@ -1156,14 +1181,22 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception as e:
             print(f"Erreur TP dynamique {symbol}: {e}")
 
-
-
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Récupère le solde USDT."""
     try:
-        ex.options['recvWindow'] = 10000
-        balance = ex.fetch_balance(params={'type': 'swap', 'code': 'USDT'})
-        return float(balance['total'].get('USDT', 0.0))
+        ex_id = getattr(ex, "id", "")
+        if ex_id == "bitget":
+            # Bitget nécessite productType/marginCoin
+            _ensure_bitget_mix_options(ex)
+            bal = ex.fetch_balance(params=_bitget_positions_params())
+            total = bal.get("total") or {}
+            return float(total.get("USDT", 0.0))
+        # Par défaut (ex. binance)
+        if not hasattr(ex, "options") or ex.options is None:
+            ex.options = {}
+        ex.options["recvWindow"] = 10000
+        bal = ex.fetch_balance(params={"type": "swap", "code": "USDT"})
+        return float(bal["total"].get("USDT", 0.0))
     except Exception as e:
         notifier.tg_send_error("Récupération du solde", e)
         return None
@@ -1207,8 +1240,7 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             pass
 
         try:
-            params = _bitget_positions_params() if getattr(ex, "id", "") == "bitget" else {}
-            positions = ex.fetch_positions([symbol], params=params)
+            positions = _fetch_positions_safe(ex, [symbol])
             for p in positions:
                 same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
                 if same:
@@ -1240,6 +1272,4 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
 
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
-
-
 
