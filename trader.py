@@ -712,20 +712,66 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
 
 def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
     """
-    Wrapper robuste pour Bitget: injecte toujours productType/marginCoin.
-    Utilise symbols si fourni, sinon None (toutes positions).
+    Wrapper robuste Bitget:
+      1) injecte systématiquement productType=umcbl & marginCoin=USDT
+      2) si '40019' persiste, fallback sur l’endpoint brut V2:
+         v2PrivateMixGetPositionAllPosition, puis mapping -> format ccxt-like.
     """
     try:
-        if getattr(ex, "id", "") == "bitget":
+        ex_id = getattr(ex, "id", "")
+        if ex_id == "bitget":
             _ensure_bitget_mix_options(ex)
-            params = _bitget_positions_params()
-            # Signature ccxt: fetch_positions(symbols=None, params={})
-            return ex.fetch_positions(symbols if symbols else None, params=params) or []
+            params = _bitget_positions_params()  # {'productType':'umcbl','marginCoin':'USDT'}
+
+            # Tentative 1 : unified ccxt
+            try:
+                return ex.fetch_positions(symbols if symbols else None, params=params) or []
+            except Exception as ee:
+                msg = str(ee)
+                # Si le backend renvoie encore '40019', on force un fallback brut V2
+                if "40019" not in msg:
+                    raise
+
+                # Tentative 2 : endpoint brut V2 (toutes positions)
+                try:
+                    raw = ex.v2PrivateMixGetPositionAllPosition(params)
+                    data = (raw or {}).get("data") or []
+                    out = []
+                    for it in data:
+                        try:
+                            sym_id = it.get("symbol") or it.get("instId") or ""
+                            hold_side = (it.get("holdSide") or it.get("side") or "").lower()
+                            # quantité: 'total' ou 'totalSize' selon versions
+                            qty = float(it.get("total", it.get("totalSize", 0)) or 0)
+                            entry_px = float(it.get("avgOpenPrice") or it.get("avgPrice") or 0)
+                            # mapping symbol id -> unified
+                            try:
+                                m = ex.markets_by_id.get(sym_id) if hasattr(ex, "markets_by_id") else None
+                                unified_symbol = m["symbol"] if m else sym_id
+                            except Exception:
+                                unified_symbol = sym_id
+                            side = "buy" if hold_side in ("long", "buy") else ("sell" if hold_side in ("short", "sell") else "buy")
+                            if qty and qty > 0:
+                                out.append({
+                                    "symbol": unified_symbol,
+                                    "side": side,
+                                    "contracts": qty,
+                                    "entryPrice": entry_px,
+                                    "info": it,
+                                })
+                        except Exception:
+                            continue
+                    return out
+                except Exception as e2:
+                    # On relaie l’erreur lisible sur Telegram
+                    notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} {e2}")
+                    return []
         # Autres exchanges
         return ex.fetch_positions(symbols if symbols else None) or []
     except Exception as e:
         notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
         return []
+
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
