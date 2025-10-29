@@ -405,8 +405,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         sl = float(_anchor_sl_from_extreme(df, 'buy'))
 
         bb_up = float(last['bb80_up'])
-        tp = bb_up  # tendance: on peut garder la logique existante (si besoin d’un offset %, le remettre ici)
-        if tp <= entry: return None
+        tp = bb_up  # tendance: TP direct sur BB80 haute (offset au besoin)
+        if tp <= entry:
+            return None
 
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
@@ -419,12 +420,23 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         entry = float(last['close'])
         sl = float(_anchor_sl_from_extreme(df, 'sell'))
 
+        bb_lo = float(last['bb80_lo'])
+        tp = bb_lo  # tendance short : TP sur BB80 basse (offset au besoin)
+        if tp >= entry:
+            return None
 
+        if (sl - entry) > 0:
+            rr = (entry - tp) / (sl - entry)
+            rr_final = rr
+            if rr_final >= MIN_RR:
+                signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
+    return signal
 
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
+
 def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
     """
     Vérifie la cohérence entre les positions ouvertes sur l'exchange (Bitget via CCXT)
@@ -451,7 +463,8 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
         # --- Récup Exchange ---
         ex_positions_raw = []
         try:
-            ex_positions_raw = ex.fetch_positions()
+            params = _bitget_positions_params() if getattr(ex, "id", "") == "bitget" else {}
+            ex_positions_raw = ex.fetch_positions(params=params)
         except Exception as e:
             notifier.tg_send_error("Lecture des positions exchange", e)
             ex_positions_raw = []
@@ -577,6 +590,10 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
     return report
 
+def _bitget_positions_params() -> Dict[str, str]:
+    # USDT-margined contracts
+    return {"productType": "umcbl", "marginCoin": "USDT"}
+
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
@@ -598,7 +615,8 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             market = ex.market(symbol)
         except Exception:
             pass
-        ex_positions = ex.fetch_positions([symbol])
+        params = _bitget_positions_params() if getattr(ex, "id", "") == "bitget" else {}
+        ex_positions = ex.fetch_positions([symbol], params=params)
         already_open = False
         for p in ex_positions or []:
             same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
@@ -1082,7 +1100,8 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             pass
 
         try:
-            positions = ex.fetch_positions([symbol])
+            params = _bitget_positions_params() if getattr(ex, "id", "") == "bitget" else {}
+            positions = ex.fetch_positions([symbol], params=params)
             for p in positions:
                 same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
                 if same:
