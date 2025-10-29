@@ -708,23 +708,36 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
 
 def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
     """
-    Wrapper robuste pour Bitget: injecte toujours productType/marginCoin.
-    - Bitget: NE PAS passer 'symbols' (sinon productType est ignoré par l'endpoint).
+    Wrapper robuste pour Bitget: force productType/marginCoin à la fois dans ex.options et dans params.
+    - Bitget: ne jamais passer 'symbols' (None en positionnel) sinon productType peut être ignoré.
     - Autres exchanges: passer symbols si fourni.
     """
     try:
         if getattr(ex, "id", "") == "bitget":
-            _ensure_bitget_mix_options(ex)
-            params = _bitget_positions_params()  # {"productType":"umcbl","marginCoin":"USDT"}
-            # IMPORTANT: ne PAS fournir 'symbols' à Bitget
-            return ex.fetch_positions(params=params) or []
+            # Sécurise les options (au cas où ccxt lise d’abord ex.options)
+            try:
+                if not hasattr(ex, "options") or ex.options is None:
+                    ex.options = {}
+                ex.options.setdefault("defaultType", "swap")
+                ex.options.setdefault("defaultSubType", "linear")  # UM perp
+                ex.options.setdefault("productType", "umcbl")
+                ex.options.setdefault("marginCoin", "USDT")
+            except Exception:
+                pass
+
+            params = {"productType": "umcbl", "marginCoin": "USDT"}
+            # IMPORTANT: passer None en positionnel pour 'symbols' et params en 2e arg
+            return ex.fetch_positions(None, params) or []
+
         # Exchanges non-Bitget
         if symbols:
-            return ex.fetch_positions(symbols, params={}) or []
-        return ex.fetch_positions(params={}) or []
+            return ex.fetch_positions(symbols, {}) or []
+        return ex.fetch_positions(None, {}) or []
+
     except Exception as e:
         notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
         return []
+
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
