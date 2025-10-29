@@ -874,6 +874,50 @@ def get_portfolio_equity_usdt(exchange) -> float:
 
     return 0.0
 
+def adjust_tp_for_bb_offset(raw_tp: float, side: str) -> float:
+    """
+    Applique l’offset TP (Bollinger) pour placer le TP un peu avant la borne.
+    - side 'buy'/'long'  : TP (borne haute) reculé de l’offset -> prix diminué
+    - side 'sell'/'short': TP (borne basse) avancé de l’offset -> prix augmenté
+    Clamp de l’offset: [0,05% ; 1%].
+    """
+    try:
+        v = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0015'))
+    except Exception:
+        v = 0.0015
+    if v < 0.0005: v = 0.0005
+    if v > 0.01:   v = 0.01
+
+    s = (side or "").lower()
+    if s in ("buy", "long"):
+        return float(raw_tp) * (1.0 - v)
+    if s in ("sell", "short"):
+        return float(raw_tp) * (1.0 + v)
+    return float(raw_tp)
+
+def adjust_sl_for_offset(raw_sl: float, side: str) -> float:
+    """
+    Applique l’offset SL (padding additionnel) autour de l'ancre.
+    Objectif : éviter les mèches qui effleurent le SL en ajoutant un % de marge.
+    - Long : SL est sous le prix -> on l’éloigne vers le bas  (prix diminué)
+    - Short: SL est au-dessus   -> on l’éloigne vers le haut (prix augmenté)
+    Clamp de l’offset: [0,05% ; 1%].
+    """
+    try:
+        v = float(database.get_setting('SL_OFFSET_PCT', '0.0015'))
+    except Exception:
+        v = 0.0015
+    if v < 0.0005: v = 0.0005
+    if v > 0.01:   v = 0.01
+
+    s = (side or "").lower()
+    if s in ("buy", "long"):
+        return float(raw_sl) * (1.0 - v)
+    if s in ("sell", "short"):
+        return float(raw_sl) * (1.0 + v)
+    return float(raw_sl)
+
+
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     _ensure_bitget_mix_options(ex)
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
