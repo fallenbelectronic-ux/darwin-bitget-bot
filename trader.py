@@ -709,14 +709,19 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
 def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
     """
     Wrapper robuste pour Bitget: injecte toujours productType/marginCoin.
-    Utilise symbols si fourni, sinon None (toutes positions).
+    - Bitget: NE PAS passer 'symbols' (sinon productType est ignoré par l'endpoint).
+    - Autres exchanges: passer symbols si fourni.
     """
     try:
         if getattr(ex, "id", "") == "bitget":
             _ensure_bitget_mix_options(ex)
-            params = _bitget_positions_params()
-            return ex.fetch_positions(symbols if symbols else None, params=params) or []
-        return ex.fetch_positions(symbols if symbols else None) or []
+            params = _bitget_positions_params()  # {"productType":"umcbl","marginCoin":"USDT"}
+            # IMPORTANT: ne PAS fournir 'symbols' à Bitget
+            return ex.fetch_positions(params=params) or []
+        # Exchanges non-Bitget
+        if symbols:
+            return ex.fetch_positions(symbols, params={}) or []
+        return ex.fetch_positions(params={}) or []
     except Exception as e:
         notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
         return []
