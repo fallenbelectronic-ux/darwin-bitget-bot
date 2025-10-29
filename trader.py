@@ -685,8 +685,8 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
 def _bitget_positions_params() -> Dict[str, str]:
     """
-    Paramètres requis par Bitget pour fetch_positions.
-    umcbl = USDT-margined perpetual (mix/usdt).
+    Paramètres requis par Bitget pour les endpoints 'mix' USDT Perp.
+    umcbl = USDT-margined perpetual.
     """
     return {"productType": "umcbl", "marginCoin": "USDT"}
 
@@ -694,120 +694,34 @@ def _bitget_positions_params() -> Dict[str, str]:
 def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
     """
     Sécurise la configuration Bitget pour les contrats UM (USDT Perp).
-    Certains ccxt exigent aussi options.defaultType / productType.
     """
     try:
         if getattr(ex, "id", "") != "bitget":
             return
-        # options dict toujours présent
         if not hasattr(ex, "options") or ex.options is None:
             ex.options = {}
         ex.options.setdefault("defaultType", "swap")
-        # Ces clés ne nuisent pas aux autres endpoints si déjà passées via params
         ex.options.setdefault("productType", "umcbl")
         ex.options.setdefault("marginCoin", "USDT")
     except Exception:
         pass
 
 
-def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
-    """
-    Bitget-safe fetch positions:
-      1) Tente l'API unifiée ccxt: fetch_positions(..., params={'productType':'umcbl','marginCoin':'USDT'})
-      2) Si erreur/40019, essaie plusieurs routes HTTP via fetch2 compatibles avec différentes versions CCXT :
-         - v2PrivateMix  : position/all-position
-         - v2Private     : mix/position/all-position
-         - mixPrivate v2 : position/all-position
-         - mixPrivate v1 : position/allPosition
-      3) Mappe le résultat vers une liste ccxt-like : [{'symbol','side','contracts','entryPrice','info'}, ...]
-    """
-    def _map_positions(raw, markets_by_id):
-        data = (raw or {}).get("data") or raw or []
-        out = []
-        for it in (data if isinstance(data, list) else []):
-            try:
-                sym_id = it.get("symbol") or it.get("instId") or ""
-                hold_side = (it.get("holdSide") or it.get("side") or "").lower()
-                qty = float(it.get("total") or it.get("totalSize") or it.get("holdAmount") or 0)
-                entry_px = float(it.get("avgOpenPrice") or it.get("avgPrice") or 0)
-                unified_symbol = sym_id
-                try:
-                    mkt = markets_by_id.get(sym_id) if markets_by_id else None
-                    if mkt and mkt.get("symbol"):
-                        unified_symbol = mkt["symbol"]
-                except Exception:
-                    pass
-                side = "buy" if hold_side in ("long", "buy") else ("sell" if hold_side in ("short", "sell") else "buy")
-                if qty > 0:
-                    out.append({
-                        "symbol": unified_symbol,
-                        "side": side,
-                        "contracts": qty,
-                        "entryPrice": entry_px,
-                        "info": it,
-                    })
-            except Exception:
-                continue
-        return out
 
+ddef _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[list] = None) -> list:
+    """
+    Wrapper robuste pour Bitget: injecte toujours productType/marginCoin.
+    Utilise symbols si fourni, sinon None (toutes positions).
+    """
     try:
-        ex_id = getattr(ex, "id", "")
-        if ex_id != "bitget":
-            return ex.fetch_positions(symbols if symbols else None) or []
-
-        _ensure_bitget_mix_options(ex)
-        params = _bitget_positions_params()  # {'productType': 'umcbl', 'marginCoin': 'USDT'}
-
-        # Tentative 1 : unifiée ccxt
-        try:
+        if getattr(ex, "id", "") == "bitget":
+            _ensure_bitget_mix_options(ex)
+            params = _bitget_positions_params()
             return ex.fetch_positions(symbols if symbols else None, params=params) or []
-        except Exception as e1:
-            msg = str(e1)
-            # on continue en fallback seulement si 40019 (paramètre ignoré par la version ccxt)
-            if "40019" not in msg:
-                notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} {msg}")
-                return []
-
-        # Tentatives 2..n : fetch2 sur différentes familles d'API
-        raw = None
-        try:
-            # v2PrivateMix
-            if hasattr(ex, "fetch2"):
-                raw = ex.fetch2("position/all-position", "v2PrivateMix", "GET", params)
-        except Exception:
-            raw = None
-        if not raw:
-            try:
-                # v2Private (avec préfixe mix/)
-                if hasattr(ex, "fetch2"):
-                    raw = ex.fetch2("mix/position/all-position", "v2Private", "GET", params)
-            except Exception:
-                raw = None
-        if not raw:
-            try:
-                # mixPrivate (v2)
-                if hasattr(ex, "fetch2"):
-                    raw = ex.fetch2("position/all-position", "mixPrivate", "GET", params)
-            except Exception:
-                raw = None
-        if not raw:
-            try:
-                # mixPrivate (v1)
-                if hasattr(ex, "fetch2"):
-                    raw = ex.fetch2("position/allPosition", "mixPrivate", "GET", params)
-            except Exception as e_last:
-                notifier.tg_send_error("Lecture des positions exchange", f"{ex_id} {str(e_last)}")
-                return []
-
-        markets_by_id = getattr(ex, "markets_by_id", None)
-        return _map_positions(raw, markets_by_id)
-
+        return ex.fetch_positions(symbols if symbols else None) or []
     except Exception as e:
-        notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {str(e)}")
+        notifier.tg_send_error("Lecture des positions exchange", f"{getattr(ex, 'id', '')} {e}")
         return []
-
-
-
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
     """Tente d'exécuter un trade avec toutes les vérifications de sécurité."""
@@ -893,9 +807,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     except Exception:
         # En cas d'échec de lecture des positions, on continue normalement
         pass
-
-    # ... (reste de la fonction inchangé)
-
 
     if len(database.get_open_positions()) >= max_pos:
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
@@ -1268,12 +1179,10 @@ def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     try:
         ex_id = getattr(ex, "id", "")
         if ex_id == "bitget":
-            # Bitget nécessite productType/marginCoin
             _ensure_bitget_mix_options(ex)
             bal = ex.fetch_balance(params=_bitget_positions_params())
             total = bal.get("total") or {}
             return float(total.get("USDT", 0.0))
-        # Par défaut (ex. binance)
         if not hasattr(ex, "options") or ex.options is None:
             ex.options = {}
         ex.options["recvWindow"] = 10000
