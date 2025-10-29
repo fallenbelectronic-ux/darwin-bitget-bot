@@ -187,6 +187,19 @@ async def _ws_sync_loop(ex_rest):
 
     await asyncio.gather(watch_positions(), watch_orders())
 
+def _telegram_command_handlers() -> Dict[str, Any]:
+    """
+    Retourne la table des commandes Telegram -> handlers.
+    Ajout de /offset pour ouvrir le panneau Offset TP/SL.
+    """
+    return {
+        "setuniverse": notifier.set_universe_command,   # existant
+        "setmaxpos":  notifier.set_maxpos_command,      # existant
+        "offset":     notifier.offset_command,          # ✅ nouveau
+        "help":       notifier.send_commands_help,      # (si utilisé)
+    }
+
+
 def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     """Sélectionne le meilleur signal en attente et l'exécute."""
     global _pending_signals
