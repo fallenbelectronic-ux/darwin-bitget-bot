@@ -306,8 +306,9 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
 
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Détection avec: contact→réaction, CT = réintégration stricte BB20 & BB80, 
-    tolérance % + coussin ATR UNIQUEMENT sur le contact BB80, neutralité MM80 et anti-excès."""
+    """Détection avec: contact→réaction (≤N), Option E = entrée sur la bougie suivante (configurable),
+    CT = réintégration stricte (configurable) BB20 &/ou BB80, tolérance % + coussin ATR
+    UNIQUEMENT sur le contact BB80, neutralité MM80 et anti-excès."""
     if df is None or len(df) < 81:
         return None
 
@@ -325,18 +326,31 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         enforce_next_bar = True
     try:
-        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))  # coussin ATR pour CONTACT BB80
+        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))
     except Exception:
         atr_tol_k = 0.125
     try:
-        ct_tp_atr_k = float(database.get_setting('CT_TP_ATR_K', 1.0))     # coussin ATR pour TP en CT
+        ct_tp_atr_k = float(database.get_setting('CT_TP_ATR_K', 1.0))
     except Exception:
         ct_tp_atr_k = 1.0
-
-    ct_reintegrate_both = True  # CT: clôture OBLIGATOIRE à l’intérieur de BB20 et BB80
+    try:
+        tp_atr_k = float(database.get_setting('TP_ATR_K', 1.0))
+    except Exception:
+        tp_atr_k = 1.0
+    try:
+        ct_reintegrate_both = str(database.get_setting('CT_REINTEGRATE_BOTH_BB', 'true')).lower() == 'true'
+    except Exception:
+        ct_reintegrate_both = True
+    try:
+        cut_wick_enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    except Exception:
+        cut_wick_enabled = False
 
     # --- Anti-excès BB80 ---
-    skip_threshold = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
+    try:
+        skip_threshold = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
+    except Exception:
+        skip_threshold = 5
     lookback = max(skip_threshold, 8)
     allow_countertrend = True
     if len(df) >= lookback:
@@ -344,17 +358,21 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         streak_up = 0
         for i in range(len(recent)):
             row = recent.iloc[-1 - i]
-            if float(row['close']) >= float(row['bb80_up']): streak_up += 1
-            else: break
+            if float(row['close']) >= float(row['bb80_up']):
+                streak_up += 1
+            else:
+                break
         streak_down = 0
         for i in range(len(recent)):
             row = recent.iloc[-1 - i]
-            if float(row['close']) <= float(row['bb80_lo']): streak_down += 1
-            else: break
+            if float(row['close']) <= float(row['bb80_lo']):
+                streak_down += 1
+            else:
+                break
         if streak_up >= skip_threshold or streak_down >= skip_threshold:
             allow_countertrend = False
 
-    # --- Réaction = dernière FERMÉE si enforce_next_bar ---
+    # --- Réaction = dernière FERMÉE si Option E active ---
     last_idx = -2 if (enforce_next_bar and len(df) >= 2) else -1
     last = df.iloc[last_idx]
     base_idx = len(df) + last_idx
@@ -363,6 +381,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     contact, contact_idx = None, None
     for back in range(1, reaction_max_bars + 1):
         idx = base_idx - back
+        if idx < 0:
+            break
         cand = df.iloc[idx]
         touched_lo = utils.touched_or_crossed(cand['low'], cand['high'], cand['bb20_lo'], "buy")
         touched_up = utils.touched_or_crossed(cand['low'], cand['high'], cand['bb20_up'], "sell")
@@ -383,7 +403,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # --- Réintégration par CLÔTURE à la réaction ---
     inside_bb20 = _inside(float(last['close']), float(last['bb20_lo']), float(last['bb20_up']))
     inside_bb80 = _inside(float(last['close']), float(last['bb80_lo']), float(last['bb80_up']))
-    ct_reintegration_ok = inside_bb20 and inside_bb80  # CT = les 2 bandes
+    ct_reintegration_ok = inside_bb20 and (inside_bb80 if ct_reintegrate_both else True)
 
     # --- Réaction du prix: pattern valide requis ---
     if not is_valid_reaction_candle(last, side_guess, prev=contact):
@@ -392,9 +412,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     signal = None
 
     # --- Indicateurs pour TP ---
-    atr_ref = float(contact.get('atr', last.get('atr', 0.0)))  # ATR de référence
+    atr_ref = float(contact.get('atr', last.get('atr', 0.0)))
+    tp_offset_trend = atr_ref * tp_atr_k
+    tp_offset_ct    = atr_ref * ct_tp_atr_k
 
-    # --- Pattern TENDANCE (contact BB20 côté tendance + inside BB20 sur réaction) ---
+    # --- Pattern TENDANCE ---
     is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
     touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_up'], "sell")
@@ -403,15 +425,22 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         regime = "Tendance"
         entry = float(last['close'])
         sl = float(_anchor_sl_from_extreme(df, 'buy'))
+        prev = contact
 
-        bb_up = float(last['bb80_up'])
-        tp = bb_up  # tendance: TP direct sur BB80 haute (offset au besoin)
+        # TP long: un peu sous BB80_up
+        target_band = float(last['bb80_up'])
+        tp = target_band - tp_offset_trend
+        if tp <= entry:
+            tp = target_band
         if tp <= entry:
             return None
 
         if (entry - sl) > 0:
             rr = (tp - entry) / (entry - sl)
             rr_final = rr
+            if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                rr_final = max(rr, rr_alt)
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
@@ -419,19 +448,97 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         regime = "Tendance"
         entry = float(last['close'])
         sl = float(_anchor_sl_from_extreme(df, 'sell'))
+        prev = contact
 
-        bb_lo = float(last['bb80_lo'])
-        tp = bb_lo  # tendance short : TP sur BB80 basse (offset au besoin)
+        # TP short: un peu au-dessus de BB80_lo (⚠️ correction: + offset)
+        target_band = float(last['bb80_lo'])
+        tp = target_band + tp_offset_trend
+        if tp >= entry:
+            tp = target_band
         if tp >= entry:
             return None
 
         if (sl - entry) > 0:
             rr = (entry - tp) / (sl - entry)
             rr_final = rr
+            if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                rr_final = max(rr, rr_alt)
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    return signal
+    # --- Garde-fou contre-tendance après excès prolongé ---
+    if not allow_countertrend:
+        if signal:
+            signal['bb20_mid'] = last['bb20_mid']
+            signal['entry_atr'] = contact.get('atr', 0.0)
+            signal['entry_rsi'] = 0.0
+            return signal
+        return None
+
+    # --- CONTRE-TENDANCE (double extrême + réintégration stricte) ---
+    if not signal:
+        prev = contact
+        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))
+
+        touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
+            float(prev['low'])  <= float(prev['bb80_lo']) or _near_bb80_with_tolerance(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow, atr_contact, atr_tol_k)
+        )
+        touched_ct_high = (float(prev['high']) >= float(prev['bb20_up'])) and (
+            float(prev['high']) >= float(prev['bb80_up']) or _near_bb80_with_tolerance(float(prev['high']), float(prev['bb80_up']), 'sell', tol_yellow, atr_contact, atr_tol_k)
+        )
+
+        if touched_ct_low and ct_reintegration_ok:
+            regime = "Contre-tendance"
+            entry = float(last['close'])
+            sl = float(_anchor_sl_from_extreme(df, 'buy'))
+
+            # TP long CT: un peu sous BB20_mid
+            target_band = float(last['bb20_mid'])
+            tp = target_band - tp_offset_ct
+            if tp <= entry:
+                tp = target_band
+            if tp <= entry:
+                return None
+
+            if (entry - sl) > 0:
+                rr = (tp - entry) / (entry - sl)
+                rr_final = rr
+                if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
+                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
+                    rr_final = max(rr, rr_alt)
+                if rr_final >= MIN_RR:
+                    signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
+        elif touched_ct_high and ct_reintegration_ok:
+            regime = "Contre-tendance"
+            entry = float(last['close'])
+            sl = float(_anchor_sl_from_extreme(df, 'sell'))
+
+            # TP short CT: un peu au-dessus de BB20_mid (⚠️ correction: + offset)
+            target_band = float(last['bb20_mid'])
+            tp = target_band + tp_offset_ct
+            if tp >= entry:
+                tp = target_band
+            if tp >= entry:
+                return None
+
+            if (sl - entry) > 0:
+                rr = (entry - tp) / (sl - entry)
+                rr_final = rr
+                if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
+                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
+                    rr_final = max(rr, rr_alt)
+                if rr_final >= MIN_RR:
+                    signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
+
+    if signal:
+        signal['bb20_mid'] = last['bb20_mid']
+        signal['entry_atr'] = contact.get('atr', 0.0)
+        signal['entry_rsi'] = 0.0
+        return signal
+
+    return None
 
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
