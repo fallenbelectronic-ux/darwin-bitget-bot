@@ -291,21 +291,9 @@ def process_callback_query(callback_query: Dict):
 
         elif data == 'menu_signals':
             notifier.send_signals_menu()
-
-        elif data == 'signals_pending':
-            txt = get_pending_signals_message()
-            kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
-            notifier.edit_main(txt, kb)  # <-- édite le message principal, ne crée pas de nouveau message
-
-        elif data == 'signals_1h':
-            txt = get_recent_signals_message(1)
-            kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
-            notifier.edit_main(txt, kb)
             
         elif data == 'signals_6h':
-            txt = get_recent_signals_message(6)
-            kb = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "menu_signals"}]]}
-            notifier.edit_main(txt, kb)
+            notifier.tg_show_signals_6h()
             
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
