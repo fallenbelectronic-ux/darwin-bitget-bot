@@ -408,8 +408,7 @@ def get_signals_menu_keyboard() -> Dict:
     return {
         "inline_keyboard": [
             [{"text": "⏱️ Signal(s) en attente", "callback_data": "signals_pending"}],
-            [{"text": "🚀 Signaux (Dernière Heure)", "callback_data": "signals_1h"}],
-            [{"text": "⏱️ Signaux (6 Dernières Heures)", "callback_data": "signals_6h"}],
+            [{"text": "🚀 Signaux valides (6 Dernières Heures)", "callback_data": "signals_6h"}],
             [{"text": "↩️ Retour", "callback_data": "main_menu"}]
         ]
     }
@@ -578,7 +577,7 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
 
 def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
     """
-    Route Offset: transmet message_id + callback_query_id pour l’édition en place.
+    Route Offset/Signaux/Restart : transmet message_id + callback_query_id pour l’édition en place.
     """
     try:
         if not data: return False
@@ -592,6 +591,18 @@ def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
             message_id = msg.get("message_id")
             cq_id = data.get("id")
             handle_offset_callback(cmd, chat_id=chat_id, message_id=message_id, callback_query_id=cq_id)
+            return True
+
+        if cmd == "menu_signals":
+            send_signals_menu()
+            return True
+
+        if cmd == "signals_pending":
+            tg_show_signals_pending()
+            return True
+
+        if cmd == "signals_6h":
+            tg_show_signals_6h()
             return True
 
         if cmd == "restart_bot": handle_restart_callback(data); return True
@@ -616,6 +627,90 @@ def send_commands_help(chat_id: Optional[str] = None):
     ]
     tg_send("\n".join(lines), chat_id=chat_id)
 
+def _format_signal_row(sig: dict) -> str:
+    """Format compact d'un signal (sans la raison), horodaté Europe/Lisbon.
+    Gère automatiquement ts en secondes ou millisecondes.
+    """
+    from datetime import datetime
+    import pytz
+
+    tz = pytz.timezone("Europe/Lisbon")
+    try:
+        ts_raw = float(sig.get("ts", 0)) or 0.0
+    except Exception:
+        ts_raw = 0.0
+    # Milliseconds -> seconds si nécessaire
+    ts = ts_raw / 1000.0 if ts_raw > 10_000_000_000 else ts_raw
+    dt = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+
+    symbol = str(sig.get("symbol", "?"))
+    tf = str(sig.get("timeframe", "?"))
+    side = str(sig.get("side", "?")).upper()
+
+    def _fmt(x, n=5):
+        try:
+            return f"{float(x):.{n}f}"
+        except Exception:
+            return str(x)
+
+    entry = sig.get("entry", None)
+    sl = sig.get("sl", None)
+    tp = sig.get("tp", None)
+    rr = sig.get("rr", None)
+
+    parts = [f"• {dt} — <b>{_escape(symbol)}</b> ({_escape(tf)}) <code>{_escape(side)}</code>"]
+    if entry is not None: parts.append(f"Entry: <code>{_fmt(entry, 5)}</code>")
+    if sl is not None:    parts.append(f"SL: <code>{_fmt(sl, 5)}</code>")
+    if tp is not None:    parts.append(f"TP: <code>{_fmt(tp, 5)}</code>")
+    if rr is not None:
+        try:
+            parts.append(f"RR: <b>x{float(rr):.2f}</b>")
+        except Exception:
+            parts.append(f"RR: <b>x{_escape(rr)}</b>")
+    return "  ".join(parts)
+
+
+def tg_show_signals_pending(limit: int = 50):
+    """
+    Affiche 'Signaux en attente' : state=PENDING, sans fenêtre de temps.
+    Tri décroissant par ts (les plus récents en premier).
+    """
+    try:
+        signals = database.get_signals(state="PENDING", since_minutes=None, limit=limit)
+    except Exception as e:
+        tg_send(f"⚠️ Erreur lecture signaux en attente : <code>{_escape(e)}</code>")
+        return
+
+    signals = sorted(signals or [], key=lambda s: int(s.get("ts", 0)), reverse=True)
+
+    if not signals:
+        tg_send("Aucun signal en attente pour le moment.")
+        return
+
+    lines = ["<b>📟 Signaux en attente</b>", ""]
+    lines.extend(_format_signal_row(s) for s in signals)
+    tg_send("\n".join(lines))
+
+def tg_show_signals_6h(limit: int = 50):
+    """
+    Affiche 'Signaux des 6 dernières heures' : state=VALID_SKIPPED, fenêtre = 360 min.
+    Tri décroissant par ts (les plus récents en premier).
+    """
+    try:
+        signals = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit)
+    except Exception as e:
+        tg_send(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>")
+        return
+
+    signals = sorted(signals or [], key=lambda s: int(s.get("ts", 0)), reverse=True)
+
+    if not signals:
+        tg_send("Aucun signal valide non exécuté sur les 6 dernières heures.")
+        return
+
+    lines = ["<b>⏱️ Signaux valides non exécutés (6h)</b>", ""]
+    lines.extend(_format_signal_row(s) for s in signals)
+    tg_send("\n".join(lines))
 
 # ==============================================================================
 # MESSAGES FORMATÉS
