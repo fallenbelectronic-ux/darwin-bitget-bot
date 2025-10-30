@@ -876,9 +876,9 @@ def get_portfolio_equity_usdt(exchange) -> float:
 
 def adjust_tp_for_bb_offset(raw_tp: float, side: str) -> float:
     """
-    Applique l’offset TP (Bollinger) pour placer le TP un peu avant la borne.
-    - side 'buy'/'long'  : TP (borne haute) reculé de l’offset -> prix diminué
-    - side 'sell'/'short': TP (borne basse) avancé de l’offset -> prix augmenté
+    Applique l’offset TP pour placer la cible :
+    - Long  : plus bas que la référence (borne haute / mèche haute) -> prix diminué
+    - Short : plus bas que la mèche/référence -> prix diminué (⚠️ correction ici)
     Clamp de l’offset: [0,05% ; 1%].
     """
     try:
@@ -889,10 +889,9 @@ def adjust_tp_for_bb_offset(raw_tp: float, side: str) -> float:
     if v > 0.01:   v = 0.01
 
     s = (side or "").lower()
-    if s in ("buy", "long"):
+    if s in ("buy", "long", "sell", "short"):
         return float(raw_tp) * (1.0 - v)
-    if s in ("sell", "short"):
-        return float(raw_tp) * (1.0 + v)
+
     return float(raw_tp)
 
 def adjust_sl_for_offset(raw_sl: float, side: str) -> float:
