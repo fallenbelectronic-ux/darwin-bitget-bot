@@ -30,6 +30,23 @@ def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[st
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
+
+def tg_edit_message_text(text: str, chat_id: str, message_id: int, reply_markup: Optional[Dict] = None):
+    if not TG_TOKEN or not chat_id or not message_id:
+        return
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erreur editMessageText: {e}")
         
 def tg_answer_callback_query(callback_query_id: str, text: str = ""):
     """Accuse réception d'un clic sur un bouton inline Telegram (évite l'impression que rien ne se passe)."""
@@ -121,136 +138,100 @@ def open_offset_root_panel(chat_id: Optional[str] = None):
     }
     tg_send("Choisis le paramètre à ajuster :", reply_markup=kb, chat_id=chat_id)
 
-def open_offset_tp_panel(chat_id: Optional[str] = None):
-    """Ouvre le panneau d’offset TP (Bollinger) avec boutons inline."""
+def open_offset_tp_panel(chat_id: Optional[str] = None, message_id: Optional[int] = None):
+    """Rafraîchit le panneau d’offset TP (Bollinger) EN PLACE (aucun nouvel envoi)."""
+    if not chat_id or not message_id:
+        return
     try:
         cur = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0015'))
     except Exception:
-        cur = 0.0015
+        cur = 0.01
     txt = (
-        f"⚙️ Offset TP (Bollinger)\n\n"
-        f"Valeur actuelle : {cur*100:.2f} %\n\n"
-        f"• Plage autorisée : 0,05 % ↔ 1,00 %\n"
+        f"⚙️ <b>Offset TP (Bollinger)</b>\n\n"
+        f"<b>Valeur actuelle : {cur*100:.2f} %</b>\n\n"
+        f"• Plage autorisée : 0,05 % ↔ 10,00 %\n"
         f"• Pas via ± : 0,01 %\n"
         f"• Presets rapides : 0,10 % / 0,15 % / 0,20 %"
     )
     kb = {
         "inline_keyboard": [
-            [
-                {"text": "−", "callback_data": "OFS:TP:INC:-"},
-                {"text": "+", "callback_data": "OFS:TP:INC:+"}
-            ],
-            [
-                {"text": "0,10 %", "callback_data": "OFS:TP:SET:0.0010"},
-                {"text": "0,15 %", "callback_data": "OFS:TP:SET:0.0015"},
-                {"text": "0,20 %", "callback_data": "OFS:TP:SET:0.0020"}
-            ],
-            [
-                {"text": "⟲ Défaut (0,15 %)", "callback_data": "OFS:TP:DEF"},
-                {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}
-            ]
+            [{"text": "−", "callback_data": "OFS:TP:INC:-"},
+             {"text": "+", "callback_data": "OFS:TP:INC:+"}],
+            [{"text": "0,10 %", "callback_data": "OFS:TP:SET:0.0010"},
+             {"text": "0,15 %", "callback_data": "OFS:TP:SET:0.0015"},
+             {"text": "0,20 %", "callback_data": "OFS:TP:SET:0.0020"}],
+            [{"text": "⟲ Défaut (0,15 %)", "callback_data": "OFS:TP:DEF"},
+             {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}]
         ]
     }
-    tg_send(txt, reply_markup=kb, chat_id=chat_id)
+    tg_edit_message_text(txt, str(chat_id), int(message_id), kb)
 
-def open_offset_sl_panel(chat_id: Optional[str] = None):
-    """Ouvre le panneau d’offset SL (padding additionnel sur le SL) avec boutons inline."""
+    
+def open_offset_sl_panel(chat_id: Optional[str] = None, message_id: Optional[int] = None):
+    """Rafraîchit le panneau d’offset SL EN PLACE (aucun nouvel envoi)."""
+    if not chat_id or not message_id:
+        return
     try:
         cur = float(database.get_setting('SL_OFFSET_PCT', '0.0015'))
     except Exception:
-        cur = 0.0015
+        cur = 0.01
     txt = (
-        f"🛡️ Offset SL (padding)\n\n"
-        f"Valeur actuelle : {cur*100:.2f} %\n\n"
-        f"• Plage autorisée : 0,05 % ↔ 1,00 %\n"
+        f"🛡️ <b>Offset SL (padding)</b>\n\n"
+        f"<b>Valeur actuelle : {cur*100:.2f} %</b>\n\n"
+        f"• Plage autorisée : 0,05 % ↔ 10,00 %\n"
         f"• Pas via ± : 0,01 %\n"
         f"• Presets rapides : 0,10 % / 0,15 % / 0,20 %"
     )
     kb = {
         "inline_keyboard": [
-            [
-                {"text": "−", "callback_data": "OFS:SL:INC:-"},
-                {"text": "+", "callback_data": "OFS:SL:INC:+"}
-            ],
-            [
-                {"text": "0,10 %", "callback_data": "OFS:SL:SET:0.0010"},
-                {"text": "0,15 %", "callback_data": "OFS:SL:SET:0.0015"},
-                {"text": "0,20 %", "callback_data": "OFS:SL:SET:0.0020"}
-            ],
-            [
-                {"text": "⟲ Défaut (0,15 %)", "callback_data": "OFS:SL:DEF"},
-                {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}
-            ]
+            [{"text": "−", "callback_data": "OFS:SL:INC:-"},
+             {"text": "+", "callback_data": "OFS:SL:INC:+"}],
+            [{"text": "0,10 %", "callback_data": "OFS:SL:SET:0.0010"},
+             {"text": "0,15 %", "callback_data": "OFS:SL:SET:0.0015"},
+             {"text": "0,20 %", "callback_data": "OFS:SL:SET:0.0020"}],
+            [{"text": "⟲ Défaut (0,15 %)", "callback_data": "OFS:SL:DEF"},
+             {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}]
         ]
     }
-    tg_send(txt, reply_markup=kb, chat_id=chat_id)
+    tg_edit_message_text(txt, str(chat_id), int(message_id), kb)
 
-def handle_offset_callback(cb_data: str, chat_id: Optional[str] = None):
+
+def handle_offset_callback(cb_data: str, chat_id: Optional[str] = None, message_id: Optional[int] = None, callback_query_id: Optional[str] = None):
     """
-    Gère les callbacks inline des panneaux Offset.
-    Attendu:
-      - OFS:ROOT                -> ouvre menu racine
-      - OFS:ROOT:TP | :SL       -> ouvre panneau dédié
-      - OFS:<TP|SL>:INC:+|-
-      - OFS:<TP|SL>:SET:<float>
-      - OFS:<TP|SL>:DEF
-      - OFS:BACK                -> retour menu principal
+    Callbacks Offset: on édite le message existant (pas de tg_send).
     """
     if not cb_data or not cb_data.startswith("OFS:"):
         return
 
-    MIN_V, MAX_V, STEP = 0.0005, 0.01, 0.0001
-
-    def _clamp(v: float) -> float:
-        return max(MIN_V, min(MAX_V, v))
+    MIN_V, MAX_V, STEP = 0.0005, 0.1, 0.0001
+    def _clamp(v: float) -> float: return max(MIN_V, min(MAX_V, v))
 
     parts = cb_data.split(":")
-    # cas menu racine/direct
     if cb_data == "OFS:ROOT":
-        open_offset_root_panel(chat_id=chat_id)
+        # Le menu racine peut rester envoyé ailleurs; ici on n’émet rien.
+        if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
-    if cb_data == "OFS:BACK":
-        try:
-            # open_main_menu(chat_id=chat_id)
-            tg_send("⬅️ Retour au menu principal.", chat_id=chat_id)
-        except Exception:
-            tg_send("⬅️ Retour.", chat_id=chat_id)
-        return
-    if len(parts) >= 3 and parts[1] == "ROOT":
-        target = parts[2]
-        if target == "TP":
-            open_offset_tp_panel(chat_id=chat_id)
-            return
-        if target == "SL":
-            open_offset_sl_panel(chat_id=chat_id)
-            return
 
-    # gestion TP ou SL
     if len(parts) < 3:
-        open_offset_root_panel(chat_id=chat_id)
+        if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
 
-    scope = parts[1]  # "TP" ou "SL"
+    scope = parts[1]                  # "TP" ou "SL"
     action = parts[2]
     key = 'TP_BB_OFFSET_PCT' if scope == "TP" else 'SL_OFFSET_PCT'
-    default_val = 0.0015
+    default_val = 0.01
 
     try:
         cur = float(database.get_setting(key, f"{default_val}"))
     except Exception:
         cur = default_val
-    prev = cur
 
     if action == "INC" and len(parts) == 4:
         sign = parts[3]
-        if sign == "+":
-            cur = _clamp(cur + STEP)
-        elif sign == "-":
-            cur = _clamp(cur - STEP)
+        cur = _clamp(cur + STEP) if sign == "+" else _clamp(cur - STEP)
         database.set_setting(key, f"{cur:.6f}")
-        label = "TP (BB)" if scope == "TP" else "SL"
-        tg_send(f"✅ Offset {label} mis à jour : {cur*100:.2f} % (avant : {prev*100:.2f} %).", chat_id=chat_id)
-        (open_offset_tp_panel if scope == "TP" else open_offset_sl_panel)(chat_id=chat_id)
+        (open_offset_tp_panel if scope == "TP" else open_offset_sl_panel)(chat_id=chat_id, message_id=message_id)
+        if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
 
     if action == "SET" and len(parts) == 4:
@@ -259,20 +240,24 @@ def handle_offset_callback(cb_data: str, chat_id: Optional[str] = None):
         except Exception:
             val = cur
         database.set_setting(key, f"{val:.6f}")
-        label = "TP (BB)" if scope == "TP" else "SL"
-        tg_send(f"✅ Offset {label} mis à jour : {val*100:.2f} % (avant : {prev*100:.2f} %).", chat_id=chat_id)
-        (open_offset_tp_panel if scope == "TP" else open_offset_sl_panel)(chat_id=chat_id)
+        (open_offset_tp_panel if scope == "TP" else open_offset_sl_panel)(chat_id=chat_id, message_id=message_id)
+        if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
 
     if action == "DEF":
         val = default_val
         database.set_setting(key, f"{val:.6f}")
-        label = "TP (BB)" if scope == "TP" else "SL"
-        tg_send(f"✅ Offset {label} réinitialisé : {val*100:.2f} % (avant : {prev*100:.2f} %).", chat_id=chat_id)
-        (open_offset_tp_panel if scope == "TP" else open_offset_sl_panel)(chat_id=chat_id)
+        (open_offset_tp_panel if scope == "TP" else open_offset_sl_panel)(chat_id=chat_id, message_id=message_id)
+        if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
 
-    open_offset_root_panel(chat_id=chat_id)
+    if parts[1] == "ROOT" and len(parts) >= 3:
+        if parts[2] == "TP":
+            open_offset_tp_panel(chat_id=chat_id, message_id=message_id)
+        elif parts[2] == "SL":
+            open_offset_sl_panel(chat_id=chat_id, message_id=message_id)
+        if callback_query_id: tg_answer_callback_query(callback_query_id)
+        return
 
 def offset_command(chat_id: Optional[str] = None):
     """Commande /offset : ouvre le menu racine (choix TP/SL)."""
@@ -524,31 +509,25 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
 
 def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
     """
-    Routeur minimal à appeler depuis la boucle d'updates.
-    Retourne True si géré ici (restart / offsets), sinon False.
+    Route Offset: transmet message_id + callback_query_id pour l’édition en place.
     """
     try:
-        if not data:
-            return False
+        if not data: return False
         cmd = data.get("data")
-        if not cmd:
-            return False
+        if not cmd: return False
 
-        # ✅ Délègue les callbacks Offset (menu + ajustements)
         if cmd.startswith("OFS:"):
-            chat_id = (((data.get("message") or {}).get("chat") or {}).get("id"))
-            handle_offset_callback(cmd, chat_id=chat_id)
+            msg = data.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = chat.get("id")
+            message_id = msg.get("message_id")
+            cq_id = data.get("id")
+            handle_offset_callback(cmd, chat_id=chat_id, message_id=message_id, callback_query_id=cq_id)
             return True
 
-        if cmd == "restart_bot":
-            handle_restart_callback(data)
-            return True
-        if cmd == "confirm_restart_bot":
-            handle_restart_confirm(data)
-            return True
-        if cmd == "cancel_restart_bot":
-            handle_restart_cancel(data)
-            return True
+        if cmd == "restart_bot": handle_restart_callback(data); return True
+        if cmd == "confirm_restart_bot": handle_restart_confirm(data); return True
+        if cmd == "cancel_restart_bot": handle_restart_cancel(data); return True
         return False
     except Exception as e:
         tg_send_error("Callback routing", e)
