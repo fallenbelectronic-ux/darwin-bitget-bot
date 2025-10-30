@@ -178,6 +178,35 @@ def open_offset_tp_panel(chat_id: Optional[str] = None, message_id: Optional[int
     }
     tg_edit_message_text(txt, str(chat_id), int(message_id), kb)
 
+def add_main_menu_return_button(reply_markup: Optional[Dict]) -> Dict:
+    """
+    Ajoute un bouton '↩️ Retour au Menu Principal' (callback_data='main_menu')
+    en dernière ligne d'un inline keyboard Telegram.
+    """
+    try:
+        btn = {"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}
+        if not reply_markup or not isinstance(reply_markup, dict):
+            return {"inline_keyboard": [[btn]]}
+
+        inline_kb = reply_markup.get("inline_keyboard")
+        if not isinstance(inline_kb, list):
+            reply_markup["inline_keyboard"] = [[btn]]
+            return reply_markup
+
+        # Évite les doublons si déjà présent
+        for row in inline_kb:
+            if isinstance(row, list):
+                for b in row:
+                    if isinstance(b, dict) and b.get("callback_data") == "main_menu":
+                        return reply_markup
+
+        inline_kb.append([btn])
+        return reply_markup
+    except Exception:
+        # Fallback ultra-sûr
+        return {"inline_keyboard": [[{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]]}
+
+
 
 def open_offset_sl_panel(chat_id: Optional[str] = None, message_id: Optional[int] = None):
     """Rafraîchit le panneau d’offset SL EN PLACE (aucun nouvel envoi)."""
@@ -386,12 +415,16 @@ def get_signals_menu_keyboard() -> Dict:
     }
 
 def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
-    """Retourne le clavier pour la gestion des positions ouvertes."""
-    if not positions: return None
+    """Retourne le clavier pour la gestion des positions ouvertes + bouton retour menu principal."""
+    if not positions:
+        return {"inline_keyboard": [[{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]]}
     keyboard = []
     for pos in positions:
         keyboard.append([{"text": f"❌ Clôturer Trade #{pos.get('id', 0)}", "callback_data": f"close_trade_{pos.get('id', 0)}"}])
+    # Ligne retour (toujours visible)
+    keyboard.append([{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}])
     return {"inline_keyboard": keyboard}
+
     
 def get_strategy_menu_keyboard(current_strategy: str) -> Dict:
     """Retourne le clavier du menu de stratégie."""
