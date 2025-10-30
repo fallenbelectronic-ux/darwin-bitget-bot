@@ -254,7 +254,7 @@ def process_callback_query(callback_query: Dict):
             notifier.tg_answer_callback_query(callback_query.get('id'), "🛰️ Pong!")
             notifier.send_main_menu(_paused)
             
-               elif data == 'list_positions':
+        elif data == 'list_positions':
             try:
                 # 1) on force une vraie synchronisation DB <-> Exchange
                 ex = create_exchange()
