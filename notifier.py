@@ -978,7 +978,7 @@ def format_open_positions(positions: List[Dict[str, Any]]):
             sign = "+" if pnl_val >= 0 else "−"
             pnl_abs = abs(pnl_val)
             pct_abs = abs(pnl_pct)
-            pnl_str = f"PNL: <b>{sign}{pnl_abs:.2f} USDT</b> ({sign}{pct_abs:.2f}%)"
+            pnl_str = f"💰: <b>{sign}{pnl_abs:.2f} USDT</b> ({sign}{pct_abs:.2f}%)"
 
         # Affichages robustes (évite crash si None)
         def _fmt(x, d=0.0):
