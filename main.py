@@ -254,23 +254,15 @@ def process_callback_query(callback_query: Dict):
             notifier.tg_answer_callback_query(callback_query.get('id'), "🛰️ Pong!")
             notifier.send_main_menu(_paused)
             
-        elif data == 'list_positions':
-            # 🔄 Affichage synchronisé: on lit l’exchange + la DB (corrige le cas post-redéploiement)
+               elif data == 'list_positions':
             try:
+                # 1) on force une vraie synchronisation DB <-> Exchange
                 ex = create_exchange()
-                ex.load_markets()
-                exchange_positions = ex.fetch_positions([], {"productType": "USDT-FUTURES"})
+                trader.sync_positions_with_exchange(ex)
             except Exception as e:
-                try:
-                    notifier.tg_send_error("Fetch positions (exchange)", e)
-                except Exception:
-                    pass
-                exchange_positions = []
-            try:
-                db_positions = database.get_open_positions()
-            except Exception:
-                db_positions = []
-            notifier.format_synced_open_positions(exchange_positions, db_positions)
+                notifier.tg_send_error("Sync positions (manual view)", e)
+            # 2) puis on affiche la vue DB (les “fantômes” doivent disparaître si la sync a bien hydraté la DB)
+            notifier.format_open_positions(database.get_open_positions())
             
         elif data == 'get_stats':
             ex = create_exchange()
