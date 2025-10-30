@@ -132,7 +132,7 @@ def open_offset_root_panel(chat_id: Optional[str] = None, message_id: Optional[i
                 {"text": "🛡️ Offset SL", "callback_data": "OFS:ROOT:SL"},
             ],
             [
-                {"text": "↩︎ Menu principal", "callback_data": "OFS:BACK"},
+                {"text": "↩︎ Menu principal", "callback_data": "main_menu"},
             ],
         ]
     }
