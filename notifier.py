@@ -843,10 +843,14 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
         print(f"Erreur sendMessage (report): {e}")
 
 def format_open_positions(positions: List[Dict[str, Any]]):
-    """Affiche les positions ouvertes dans le message principal (pas de spam) avec PNL si prix courant dispo.
+    """Affiche les positions ouvertes dans le message principal (pas de spam) avec PNL si prix courant dispo
+    ou, à défaut, récupéré via API publique CCXT.
     PNL = (price - entry) * qty pour un LONG, (entry - price) * qty pour un SHORT.
-    Recherche du prix courant dans: current_price, last_price, mark_price, ticker_last, price, last. Sinon 'N/A'.
-    Recherche de la qty dans: quantity, qty, contracts, size, amount. Sinon 'N/A'."""
+
+    Recherche du prix courant dans: current_price, last_price, mark_price, ticker_last, price, last.
+    Si absent: tentative fetch_ticker(symbol) (Bybit puis Bitget, type=swap).
+    Recherche de la qty dans: quantity, qty, contracts, size, amount. Sinon 'N/A'.
+    """
     keyboard = get_positions_keyboard(positions) or {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
 
     if not positions:
@@ -854,9 +858,11 @@ def format_open_positions(positions: List[Dict[str, Any]]):
         edit_main(notifier_text, keyboard)
         return
 
+    # --- Helpers locaux (aucun impact global) ---
     def _to_float(x, default=None):
         try:
-            if x is None: return default
+            if x is None:
+                return default
             return float(x)
         except Exception:
             return default
@@ -867,16 +873,86 @@ def format_open_positions(positions: List[Dict[str, Any]]):
                 return pos[k]
         return default
 
-    # ⚠️ pas d'annotation Tuple ici pour éviter l'import manquant
+    _price_cache: Dict[str, Optional[float]] = {}
+
+    def _normalize_candidates(sym: str) -> List[str]:
+        """Génère plusieurs variantes de symbole compatibles CCXT."""
+        if not sym:
+            return []
+        sym = sym.strip()
+        cands = [sym]
+        # extraire 'BASE' si possible
+        base = ""
+        if "/" in sym:
+            base = sym.split("/")[0]
+        elif sym.endswith("USDT"):
+            base = sym[:-4]
+        base = base or sym
+
+        # Variantes futures/spot courantes
+        cands.append(f"{base}/USDT:USDT")
+        cands.append(f"{base}/USDT")
+        # dédoublonner en conservant l'ordre
+        seen, out = set(), []
+        for s in cands:
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def _fetch_public_price(sym: str) -> Optional[float]:
+        """Tentative de récupération d’un prix 'last' public (cache par appel)."""
+        try:
+            from importlib import import_module
+            if sym in _price_cache:
+                return _price_cache[sym]
+            # Import CCXT seulement si nécessaire
+            ccxt = import_module("ccxt")
+            exchs = []
+            # Instances publiques, rate-limit ON, type swap par défaut
+            try:
+                exchs.append(ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}}))
+            except Exception:
+                pass
+            try:
+                exchs.append(ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}}))
+            except Exception:
+                pass
+            if not exchs:
+                _price_cache[sym] = None
+                return None
+
+            for candidate in _normalize_candidates(sym):
+                for ex in exchs:
+                    try:
+                        t = ex.fetch_ticker(candidate)
+                        last = t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice")
+                        last_f = _to_float(last, None)
+                        if last_f is not None:
+                            _price_cache[sym] = last_f
+                            return last_f
+                    except Exception:
+                        continue
+            _price_cache[sym] = None
+            return None
+        except Exception:
+            _price_cache[sym] = None
+            return None
+
+    # ⚠️ pas d'annotation Tuple ici pour éviter des imports en plus
     def _pnl_tuple(pos: Dict[str, Any]):
         try:
             entry = _to_float(pos.get('entry_price'), 0.0)
             qty   = _to_float(_first(pos, ['quantity', 'qty', 'contracts', 'size', 'amount'], 0.0), 0.0)
             side  = (pos.get('side') or '').lower()
+            sym   = (pos.get('symbol') or '').strip()
 
-            # Prix courant: on tente plusieurs clés
+            # Prix courant: on tente plusieurs clés, sinon API publique
             cur_raw = _first(pos, ['current_price', 'last_price', 'mark_price', 'ticker_last', 'price', 'last'], None)
             cur     = _to_float(cur_raw, None)
+            if cur is None and sym:
+                cur = _fetch_public_price(sym)
+
             if cur is None or qty <= 0 or entry <= 0:
                 return None, None
 
@@ -890,6 +966,7 @@ def format_open_positions(positions: List[Dict[str, Any]]):
         except Exception:
             return None, None
 
+    # --- Construction du message ---
     lines = ["<b>📊 Positions Ouvertes (DB)</b>\n"]
     for pos in positions:
         side_icon = "📈" if (pos.get('side') or '').lower() == 'buy' else "📉"
@@ -901,10 +978,16 @@ def format_open_positions(positions: List[Dict[str, Any]]):
             pnl_abs = abs(pnl_val)
             pct_abs = abs(pnl_pct)
             pnl_str = f"PNL: <b>{sign}{pnl_abs:.2f} USDT</b> ({sign}{pct_abs:.2f}%)"
+
+        # Affichages robustes (évite crash si None)
+        def _fmt(x, d=0.0):
+            v = _to_float(x, d)
+            return f"{v:.4f}"
+
         lines.append(
             f"<b>{pos.get('id')}. {side_icon} {_escape(pos.get('symbol', 'N/A'))}</b>\n"
-            f"   Entrée: <code>{_to_float(pos.get('entry_price'), 0.0):.4f}</code>\n"
-            f"   SL: <code>{_to_float(pos.get('sl_price'), 0.0):.4f}</code> | TP: <code>{_to_float(pos.get('tp_price'), 0.0):.4f}</code>\n"
+            f"   Entrée: <code>{_fmt(pos.get('entry_price'), 0.0)}</code>\n"
+            f"   SL: <code>{_fmt(pos.get('sl_price'), 0.0)}</code> | TP: <code>{_fmt(pos.get('tp_price'), 0.0)}</code>\n"
             f"   {pnl_str}"
         )
 
