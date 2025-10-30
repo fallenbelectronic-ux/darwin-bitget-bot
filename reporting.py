@@ -46,6 +46,111 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "max_drawdown_percent": max_drawdown_percent
     }
 
+def _compute_upnl_rpnl(pos: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    """
+    Calcule l'UPnL (non réalisé) et l'RPnL (réalisé) en USDT pour une position.
+    - UPnL utilise le dernier prix si disponible dans la position:
+      keys possibles: 'last', 'lastPrice', 'mark_price', 'markPrice'
+      Sinon, retourne (None, rpnl) sans lever d'erreur.
+    - RPnL est cherché dans plusieurs clés usuelles.
+    Aucun frais inclus.
+    """
+    try:
+        entry = float(pos.get('entryPrice') or pos.get('entry_price') or pos.get('entry') or pos.get('avgEntryPrice') or 0.0)
+
+        # qty peut être négative (short) selon l'exchange → on prend la valeur absolue
+        raw_qty = (pos.get('contracts') or pos.get('amount') or pos.get('size') or pos.get('qty') or 0.0)
+        qty = abs(float(raw_qty))
+
+        side  = (pos.get('side') or pos.get('positionSide') or '').lower()  # 'long' | 'short'
+
+        # dernier prix
+        last = pos.get('last')
+        if last is None: last = pos.get('lastPrice')
+        if last is None: last = pos.get('mark_price')
+        if last is None: last = pos.get('markPrice')
+        last_price = float(last) if last is not None else None
+
+        # RPnL (réalisé)
+        rpnl = pos.get('realizedPnl')
+        if rpnl is None: rpnl = pos.get('realized_pnl')
+        if rpnl is None: rpnl = pos.get('rpnl')
+        realized = float(rpnl) if rpnl is not None else 0.0
+
+        if last_price is None or entry == 0.0 or qty == 0.0 or side not in ('long', 'short'):
+            return (None, realized)
+
+        if side == 'long':
+            upnl = (last_price - entry) * qty
+        else:
+            upnl = (entry - last_price) * qty
+
+        return (float(upnl), float(realized))
+    except Exception:
+        # sécurité: ne jamais casser l'affichage si une clé manque
+        return (None, 0.0)
+
+
+def _fmt_pnl_line(pos: Dict[str, Any]) -> str:
+    """
+    Retourne la ligne PnL sous la forme:
+    'PnL: +12.34 USDT (+3.21%) | RPnL: +5.67 USDT'
+    - UPnL en USDT et en %, 2 décimales.
+    - RPnL en USDT, 2 décimales.
+    - Si UPnL indisponible (pas de last price), affiche 'PnL: n/a | RPnL: …'
+    À afficher **sur la ligne en dessous** de 'SL | TP'.
+    """
+    upnl_usdt, rpnl_usdt = _compute_upnl_rpnl(pos)
+
+    # Pourcentage basé sur le prix d'entrée (sans levier, sans frais)
+    try:
+        entry = float(pos.get('entryPrice') or pos.get('entry_price') or pos.get('entry') or pos.get('avgEntryPrice') or 0.0)
+        side  = (pos.get('side') or pos.get('positionSide') or '').lower()
+        last  = pos.get('last') or pos.get('lastPrice') or pos.get('mark_price') or pos.get('markPrice')
+        last_price = float(last) if last is not None else None
+
+        if upnl_usdt is None or entry == 0.0 or last_price is None or side not in ('long', 'short'):
+            upnl_txt = "PnL: n/a"
+        else:
+            if side == 'long':
+                pct = (last_price / entry - 1.0) * 100.0
+            else:
+                pct = (entry / last_price - 1.0) * 100.0
+            upnl_txt = f"PnL: {upnl_usdt:+.2f} USDT ({pct:+.2f}%)"
+    except Exception:
+        upnl_txt = "PnL: n/a"
+
+    rpnl_txt = f"RPnL: {rpnl_usdt:+.2f} USDT"
+    return f"{upnl_txt} | {rpnl_txt}"
+
+def format_position_row(idx: int, pos: Dict[str, Any]) -> str:
+    """
+    (MODIFIÉ) Formate l’affichage d’une position pour le bloc 'Positions Ouvertes (DB)'.
+    Ajout: ligne PnL **juste en dessous** de la ligne 'SL | TP', mise à jour uniquement lors de l’envoi du message.
+    Hypothèse: cette fonction était déjà utilisée pour générer chaque entrée.
+    """
+    symbol = str(pos.get('symbol') or pos.get('market') or "").upper()
+    entry  = pos.get('entryPrice') or pos.get('entry_price') or pos.get('entry') or pos.get('avgEntryPrice')
+    sl     = pos.get('stopLoss') or pos.get('sl') or pos.get('stop_loss')
+    tp     = pos.get('takeProfit') or pos.get('tp') or pos.get('take_profit')
+
+    # Conversion sûre en str
+    entry_s = f"{float(entry):.4f}" if entry is not None else "n/a"
+    sl_s    = f"{float(sl):.4f}" if sl is not None else "n/a"
+    tp_s    = f"{float(tp):.4f}" if tp is not None else "n/a"
+
+    # Ligne(s) principales existantes
+    header = f"{idx}. {symbol}"
+    line1  = f"Entrée: <u>{entry_s}</u>"
+    line2  = f"SL: <u>{sl_s}</u> | TP: <u>{tp_s}</u>"
+
+    # Nouvelle ligne PnL (UPnL + RPnL) sous SL/TP
+    pnl    = _fmt_pnl_line(pos)
+
+    # Respecte le style déjà aperçu (HTML Telegram)
+    return f"{header}\n{line1}\n{line2}\n{pnl}"
+
+
 def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[float]) -> str:
     """Met en forme le message de rapport pour Telegram."""
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
