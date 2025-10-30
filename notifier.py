@@ -674,43 +674,49 @@ def tg_show_signals_pending(limit: int = 50):
     """
     Affiche 'Signaux en attente' : state=PENDING, sans fenêtre de temps.
     Tri décroissant par ts (les plus récents en premier).
+    Met à jour le message principal avec un bouton Retour.
     """
+    keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
     try:
         signals = database.get_signals(state="PENDING", since_minutes=None, limit=limit)
     except Exception as e:
-        tg_send(f"⚠️ Erreur lecture signaux en attente : <code>{_escape(e)}</code>")
+        edit_main(f"⚠️ Erreur lecture signaux en attente : <code>{_escape(e)}</code>", keyboard)
         return
 
     signals = sorted(signals or [], key=lambda s: int(s.get("ts", 0)), reverse=True)
 
     if not signals:
-        tg_send("Aucun signal en attente pour le moment.")
+        edit_main("<b>📟 Signaux en attente</b>\n\nAucun signal en attente pour le moment.", keyboard)
         return
 
     lines = ["<b>📟 Signaux en attente</b>", ""]
     lines.extend(_format_signal_row(s) for s in signals)
-    tg_send("\n".join(lines))
+    edit_main("\n".join(lines), keyboard)
+
 
 def tg_show_signals_6h(limit: int = 50):
     """
     Affiche 'Signaux des 6 dernières heures' : state=VALID_SKIPPED, fenêtre = 360 min.
     Tri décroissant par ts (les plus récents en premier).
+    Met à jour le message principal avec un bouton Retour.
     """
+    keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
     try:
         signals = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit)
     except Exception as e:
-        tg_send(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>")
+        edit_main(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
     signals = sorted(signals or [], key=lambda s: int(s.get("ts", 0)), reverse=True)
 
     if not signals:
-        tg_send("Aucun signal valide non exécuté sur les 6 dernières heures.")
+        edit_main("<b>⏱️ Signaux valides non exécutés (6h)</b>\n\nAucun signal valide non exécuté sur les 6 dernières heures.", keyboard)
         return
 
     lines = ["<b>⏱️ Signaux valides non exécutés (6h)</b>", ""]
     lines.extend(_format_signal_row(s) for s in signals)
-    tg_send("\n".join(lines))
+    edit_main("\n".join(lines), keyboard)
+
 
 # ==============================================================================
 # MESSAGES FORMATÉS
