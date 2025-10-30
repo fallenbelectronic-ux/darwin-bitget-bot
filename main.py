@@ -255,6 +255,11 @@ def process_callback_query(callback_query: Dict):
             notifier.send_main_menu(_paused)
             
         elif data == 'list_positions':
+            try:
+                ex = create_exchange()
+                trader.sync_positions_with_exchange(ex)
+            except Exception as e:
+                notifier.tg_send_error("Sync positions (manual view)", e)
             notifier.format_open_positions(database.get_open_positions())
             
         elif data == 'get_stats':
@@ -516,6 +521,12 @@ def main():
     database.setup_database()
     startup_checks()
     ex = create_exchange()
+
+    try:
+        trader.sync_positions_with_exchange(ex)
+    except Exception as e:
+        notifier.tg_send_error("Sync positions au démarrage", e)
+    
     start_live_sync(ex)
     
     if not database.get_setting('STRATEGY_MODE'):
