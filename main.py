@@ -193,10 +193,10 @@ def _telegram_command_handlers() -> Dict[str, Any]:
     Ajout de /offset pour ouvrir le panneau Offset TP/SL.
     """
     return {
-        "setuniverse": notifier.set_universe_command,   # existant
-        "setmaxpos":  notifier.set_maxpos_command,      # existant
-        "offset":     notifier.offset_command,          # ✅ nouveau
-        "help":       notifier.send_commands_help,      # (si utilisé)
+        "setuniverse": notifier.set_universe_command,   
+        "setmaxpos":  notifier.set_maxpos_command,      
+        "offset":     notifier.offset_command,          
+        "help":       notifier.send_commands_help,      
     }
 
 
@@ -358,7 +358,12 @@ def process_message(message: Dict):
         current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
         # Assurez-vous que cette fonction existe bien dans votre notifier.py
         notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
-        
+
+    elif command == "/offset":
+        # Ouvre directement le panneau Offset TP/SL (TP & SL séparés)
+        chat_id = (message.get("chat") or {}).get("id")
+        notifier.offset_command(chat_id=chat_id)
+
     elif command.startswith("/set"):
         # Garde les commandes /set en textuel car elles prennent un argument
         if command == "/setuniverse" and len(parts) > 1:
