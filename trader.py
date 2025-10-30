@@ -1395,6 +1395,24 @@ def manage_open_positions(ex: ccxt.Exchange):
                         if '22001' not in str(e): raise
                     sl_price = float(pos.get('sl_price') or pos['entry_price'])
 
+                    # --- Correctif SL vs prix courant (évite l'erreur 40836 Bitget) ---
+                    try:
+                        tkr = ex.fetch_ticker(symbol) or {}
+                        last_px = float(tkr.get('last') or tkr.get('close') or pos['entry_price'])
+                    except Exception:
+                        last_px = float(pos['entry_price'])
+                    try:
+                        gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
+                    except Exception:
+                        gap_pct = 0.0003
+
+                    if is_long:
+                        if sl_price >= last_px:
+                            sl_price = last_px * (1.0 - gap_pct)
+                    else:
+                        if sl_price <= last_px:
+                            sl_price = last_px * (1.0 + gap_pct)
+                    
                     qty = float(pos['quantity'])
                     try:
                         qty = float(ex.amount_to_precision(symbol, qty))
