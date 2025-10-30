@@ -971,8 +971,9 @@ def format_open_positions(positions: List[Dict[str, Any]]):
     for pos in positions:
         side_icon = "📈" if (pos.get('side') or '').lower() == 'buy' else "📉"
         pnl_val, pnl_pct = _pnl_tuple(pos)
+        emoji = "💰"
         if pnl_val is None or pnl_pct is None:
-            pnl_str = "PNL: <i>N/A</i>"
+            pnl_str = f"{emoji} PNL: <i>N/A</i>"
         else:
             sign = "+" if pnl_val >= 0 else "−"
             pnl_abs = abs(pnl_val)
