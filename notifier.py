@@ -143,7 +143,7 @@ def open_offset_tp_panel(chat_id: Optional[str] = None, message_id: Optional[int
     if not chat_id or not message_id:
         return
     try:
-        cur = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0015'))
+        cur = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0100'))
     except Exception:
         cur = 0.01
     txt = (
@@ -151,28 +151,35 @@ def open_offset_tp_panel(chat_id: Optional[str] = None, message_id: Optional[int
         f"<b>Valeur actuelle : {cur*100:.2f} %</b>\n\n"
         f"• Plage autorisée : 0,05 % ↔ 10,00 %\n"
         f"• Pas via ± : 0,01 %\n"
-        f"• Presets rapides : 0,10 % / 0,15 % / 0,20 %"
+        f"• Presets rapides :  0,50 % / 1,00 % / 2,00 % / 5,00 %"
     )
     kb = {
         "inline_keyboard": [
-            [{"text": "−", "callback_data": "OFS:TP:INC:-"},
-             {"text": "+", "callback_data": "OFS:TP:INC:+"}],
-            [{"text": "0,10 %", "callback_data": "OFS:TP:SET:0.0010"},
-             {"text": "0,15 %", "callback_data": "OFS:TP:SET:0.0015"},
-             {"text": "0,20 %", "callback_data": "OFS:TP:SET:0.0020"}],
-            [{"text": "⟲ Défaut (0,15 %)", "callback_data": "OFS:TP:DEF"},
-             {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}]
+            [
+                {"text": "−", "callback_data": "OFS:TP:INC:-"},
+                {"text": "+", "callback_data": "OFS:TP:INC:+"}
+            ],
+            [
+                {"text": "0,50 %", "callback_data": "OFS:TP:SET:0.0050"},
+                {"text": "1,00 %", "callback_data": "OFS:TP:SET:0.0100"},
+                {"text": "2,00 %", "callback_data": "OFS:TP:SET:0.0200"}
+            ],
+            [
+                {"text": "5,00 %", "callback_data": "OFS:TP:SET:0.0500"},
+                {"text": "⟲ Défaut (1,00 %)", "callback_data": "OFS:TP:DEF"},
+                {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}
+            ]
         ]
     }
     tg_edit_message_text(txt, str(chat_id), int(message_id), kb)
 
-    
+
 def open_offset_sl_panel(chat_id: Optional[str] = None, message_id: Optional[int] = None):
     """Rafraîchit le panneau d’offset SL EN PLACE (aucun nouvel envoi)."""
     if not chat_id or not message_id:
         return
     try:
-        cur = float(database.get_setting('SL_OFFSET_PCT', '0.0015'))
+        cur = float(database.get_setting('SL_OFFSET_PCT', '0.0100'))
     except Exception:
         cur = 0.01
     txt = (
@@ -180,20 +187,28 @@ def open_offset_sl_panel(chat_id: Optional[str] = None, message_id: Optional[int
         f"<b>Valeur actuelle : {cur*100:.2f} %</b>\n\n"
         f"• Plage autorisée : 0,05 % ↔ 10,00 %\n"
         f"• Pas via ± : 0,01 %\n"
-        f"• Presets rapides : 0,10 % / 0,15 % / 0,20 %"
+        f"• Presets rapides :  0,50 % / 1,00 % / 2,00 % / 5,00 %"
     )
     kb = {
         "inline_keyboard": [
-            [{"text": "−", "callback_data": "OFS:SL:INC:-"},
-             {"text": "+", "callback_data": "OFS:SL:INC:+"}],
-            [{"text": "0,10 %", "callback_data": "OFS:SL:SET:0.0010"},
-             {"text": "0,15 %", "callback_data": "OFS:SL:SET:0.0015"},
-             {"text": "0,20 %", "callback_data": "OFS:SL:SET:0.0020"}],
-            [{"text": "⟲ Défaut (0,15 %)", "callback_data": "OFS:SL:DEF"},
-             {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}]
+            [
+                {"text": "−", "callback_data": "OFS:SL:INC:-"},
+                {"text": "+", "callback_data": "OFS:SL:INC:+"}
+            ],
+            [
+                {"text": "0,50 %", "callback_data": "OFS:SL:SET:0.0050"},
+                {"text": "1,00 %", "callback_data": "OFS:SL:SET:0.0100"},
+                {"text": "2,00 %", "callback_data": "OFS:SL:SET:0.0200"}
+            ],
+            [
+                {"text": "5,00 %", "callback_data": "OFS:SL:SET:0.0500"},
+                {"text": "⟲ Défaut (1,00 %)", "callback_data": "OFS:SL:DEF"},
+                {"text": "⬅︎ Retour", "callback_data": "OFS:ROOT"}
+            ]
         ]
     }
     tg_edit_message_text(txt, str(chat_id), int(message_id), kb)
+
 
 
 def handle_offset_callback(cb_data: str, chat_id: Optional[str] = None, message_id: Optional[int] = None, callback_query_id: Optional[str] = None):
