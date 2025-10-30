@@ -74,7 +74,7 @@ def _maybe_improve_rr_with_cut_wick(prev: pd.Series, entry: float, sl: float, tp
         return rr_alt, sl
 
 def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Series] = None) -> bool:
-    """Validation stricte de la bougie de réaction (patterns + seuils).
+    """Validation stricte de la bougie de réaction (patterns + seuils) — agnostique à la couleur.
     Règles DB:
       - DOJI_BODY_MAX (def 0.10)
       - PINBAR_MAX_BODY (def 0.30)
@@ -108,7 +108,7 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
     w_up_r = w_up / rng
     w_dn_r = w_dn / rng
 
-    # 1) Rejet doji
+    # 1) Rejet doji (trop petit)
     if body_r < doji_max:
         return False
 
@@ -118,7 +118,7 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
     if side == 'sell' and w_up_r > wick_huge_max:
         return False
 
-    # 3) Pinbar (bicolore toléré) — seuils DB (par défaut 30 %)
+    # 3) Pinbar (bicolore) — seuils DB (agnostique à la couleur)
     if body_r <= pinbar_max_body:
         if side == 'buy':
             if w_dn_r >= simple_wick_min and w_up_r <= pinbar_opp_wick_max:
@@ -127,11 +127,11 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
             if w_up_r >= simple_wick_min and w_dn_r <= pinbar_opp_wick_max:
                 return True
 
-    # 4) Impulsion / marubozu relatif (grand corps de la bougie courante)
+    # 4) Impulsion / marubozu relatif (grand corps)
     if body_r >= marubozu_min_body:
         return True
 
-    # 5) Cas DOCS dépendant de prev: GAP+IMPULSION ou DOUBLE MARUBOZU 30 %
+    # 5) Cas DOCS dépendant de prev: GAP+IMPULSION ou DOUBLE MARUBOZU (sans contrainte de couleur)
     if prev is not None:
         if _is_gap_impulse(prev, candle, side):
             return True
@@ -139,7 +139,7 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
             return True
 
     return False
-    
+
 def _compute_body_wicks(candle: pd.Series) -> Tuple[float, float, float, float]:
     """
     Retourne (body_ratio, wick_up_ratio, wick_down_ratio, range) par rapport au range de la bougie.
@@ -154,8 +154,7 @@ def _compute_body_wicks(candle: pd.Series) -> Tuple[float, float, float, float]:
     
 def _is_gap_impulse(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     """
-    Détection 'Gap + Impulsion' entre prev et cur.
-    Lit les seuils en DB:
+    Détection 'Gap + Impulsion' entre prev et cur (agnostique à la couleur).
       - GAP_MIN_PCT (def 0.001 = 0.1%)
       - IMPULSE_MIN_BODY (def 0.30 = 30% du range)
     """
@@ -180,18 +179,14 @@ def _is_gap_impulse(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     if body_r < impulse_min_body:
         return False
 
-    is_green = float(cur['close']) > float(cur['open'])
-    is_red   = float(cur['close']) < float(cur['open'])
-    return (side == 'buy' and is_green) or (side == 'sell' and is_red)
-
+    return True
 
 def _is_double_marubozu(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     """
-    Détection 'Double marubozu 30%':
+    Détection 'Double marubozu 30%' (agnostique à la couleur) :
       - body_ratio(prev) ≥ DOUBLE_MARUBOZU_MIN (def 0.30)
       - body_ratio(cur)  ≥ DOUBLE_MARUBOZU_MIN (def 0.30)
       - mèches de chaque bougie ≤ DOUBLE_MARUBOZU_WICK_MAX (def 0.10)
-      - couleur de 'cur' dans le sens du trade
     """
     if prev is None or cur is None:
         return False
@@ -209,27 +204,29 @@ def _is_double_marubozu(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     if any(x > max_wick_ratio for x in (u1, d1, u2, d2)):
         return False
 
-    is_green = float(cur['close']) > float(cur['open'])
-    is_red   = float(cur['close']) < float(cur['open'])
-    return (side == 'buy' and is_green) or (side == 'sell' and is_red)
-
+    return True
 
 def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
     """
-    Calcule le SL depuis la bougie d’ancrage avec coussin en POURCENTAGE (TP_BB_OFFSET_PCT).
-      - Short : SL = HIGH_ancre * (1 + pct)
-      - Long  : SL = LOW_ancre  * (1 - pct)
-
-    Sélection de l’ancre:
-      - Fenêtre récente ANCHOR_WINDOW (def=3) en excluant la dernière bougie (réaction).
-      - Short : plus haut absolu (tie-break: mèche haute la plus longue).
-      - Long  : plus bas  absolu (tie-break: mèche basse la plus longue).
+    (MISE À JOUR) SL depuis l’ancre avec offset hybride = max(% , ATR*k).
+      - Short : SL = HIGH_ancre * (1 + eff_pct)
+      - Long  : SL = LOW_ancre  * (1 - eff_pct)
     """
     if df is None or len(df) < 3:
         return 0.0
 
-    pct = get_tp_offset_pct()
+    # % de base (historique)
+    try:
+        pct = float(database.get_setting('SL_OFFSET_PCT', 0.006))
+    except Exception:
+        pct = 0.006
+    # ATR*k pour SL
+    try:
+        atr_k = float(database.get_setting('SL_ATR_K', 1.00))
+    except Exception:
+        atr_k = 1.00
 
+    # fenêtre d’ancre
     try:
         window = int(database.get_setting('ANCHOR_WINDOW', 3))
     except Exception:
@@ -240,6 +237,12 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
         search = df.iloc[:-1]
         if len(search) == 0:
             return 0.0
+
+    # ATR courant pour convertir en %
+    try:
+        last_atr = float(df.iloc[-1].get('atr', 0.0))
+    except Exception:
+        last_atr = 0.0
 
     # Helpers mèche
     def wick_high(row):
@@ -263,7 +266,9 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
             anchor = candidate
 
         high_anchor = float(anchor['high'])
-        return high_anchor * (1.0 + pct)
+        # eff_pct hybride
+        eff_pct = max(pct, (atr_k * last_atr) / high_anchor if high_anchor > 0 else pct)
+        return high_anchor * (1.0 + eff_pct)
 
     else:  # side == 'buy'
         idx_min_low = search['low'].astype(float).idxmin()
@@ -276,8 +281,8 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
             anchor = candidate
 
         low_anchor = float(anchor['low'])
-        return low_anchor * (1.0 - pct)
-
+        eff_pct = max(pct, (atr_k * last_atr) / low_anchor if low_anchor > 0 else pct)
+        return low_anchor * (1.0 - eff_pct)
         
 def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
     """
@@ -309,10 +314,13 @@ def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lo
 
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Détection avec: contact→réaction (≤N), Option E = entrée sur la bougie suivante (configurable),
-    CT = réintégration stricte (configurable) BB20 &/ou BB80, tolérance % + coussin ATR
-    UNIQUEMENT sur le contact BB80, neutralité MM80 et anti-excès.
-    ⚠️ SL et TP utilisent désormais toujours TP_BB_OFFSET_PCT (pourcentage « un peu avant/après »)."""
+    """(FINAL) Détection avec offsets hybrides:
+       - Option E (entrée bougie suivante) via CT_ENTRY_ON_NEXT_BAR
+       - CT: réintégration stricte configurable (BB20 &/ou BB80)
+       - Anti-excès BB80
+       - Cut-wick seulement si CUT_WICK_FOR_RR = true
+       - TP: offset hybride = max(TP_BB_OFFSET_PCT, ATR * TP_ATR_K / ref_band)
+       - SL: via _anchor_sl_from_extreme() (déjà hybride)"""
     if df is None or len(df) < 81:
         return None
 
@@ -322,7 +330,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         reaction_max_bars = 2
     try:
-        tol_yellow = float(database.get_setting('YELLOW_BB_CONTACT_TOL_PCT', 0.001))  # 0.10%
+        tol_yellow = float(database.get_setting('YELLOW_BB_CONTACT_TOL_PCT', 0.001))
     except Exception:
         tol_yellow = 0.001
     try:
@@ -330,7 +338,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         enforce_next_bar = True
     try:
-        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))  # uniquement pour tolérance BB80 (contact)
+        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))  # tolérance BB80 contact ONLY
     except Exception:
         atr_tol_k = 0.125
     try:
@@ -342,8 +350,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         cut_wick_enabled = False
 
-    # ⚙️ Offset unique en POURCENTAGE pour TP/SL (toujours appliqué)
+    # Pourcentage de base (sert de borne basse à l’hybride)
     tp_pct = get_tp_offset_pct()
+    try:
+        tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
+    except Exception:
+        tp_atr_k = 0.50
 
     # --- Anti-excès BB80 ---
     try:
@@ -376,7 +388,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     last = df.iloc[last_idx]
     base_idx = len(df) + last_idx
 
-    # --- Cherche CONTACT (1..reaction_max_bars barres avant la réaction) ---
+    # --- Cherche la bougie CONTACT (≤ reaction_max_bars avant la réaction) ---
     contact, contact_idx = None, None
     for back in range(1, reaction_max_bars + 1):
         idx = base_idx - back
@@ -408,21 +420,23 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if not is_valid_reaction_candle(last, side_guess, prev=contact):
         return None
 
-    signal = None
+    # ATR courant (pour offset hybride TP)
+    last_atr = float(last.get('atr', contact.get('atr', 0.0)))
 
-    # --- Pattern TENDANCE ---
+    signal = None
     is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
     touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_up'], "sell")
 
+    # --- TENDANCE ---
     if is_above_mm80 and touched_bb20_low and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL = low_ancre * (1 - tp_pct)
+        sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
 
-        # TP long: un peu sous BB80_up (pourcentage)
         target_band = float(last['bb80_up'])
-        tp = target_band * (1.0 - tp_pct)
+        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
+        tp = target_band * (1.0 - eff_pct)
         if tp <= entry:
             return None
 
@@ -438,11 +452,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     elif (not is_above_mm80) and touched_bb20_high and inside_bb20:
         regime = "Tendance"
         entry = float(last['close'])
-        sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL = high_ancre * (1 + tp_pct)
+        sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
 
-        # TP short: un peu au-dessus de BB80_lo 
         target_band = float(last['bb80_lo'])
-        tp = target_band * (1.0 + tp_pct)
+        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
+        tp = target_band * (1.0 + eff_pct)
         if tp >= entry:
             return None
 
@@ -455,7 +469,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    # --- Garde-fou contre-tendance après excès prolongé ---
+    # --- Garde-fou CT après excès ---
     if not allow_countertrend:
         if signal:
             signal['bb20_mid'] = last['bb20_mid']
@@ -464,10 +478,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             return signal
         return None
 
-    # --- CONTRE-TENDANCE (double extrême + réintégration stricte) ---
+    # --- CONTRE-TENDANCE ---
     if not signal:
         prev = contact
-        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))  # tolérance contact BB80 uniquement
+        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))  # tolérance BB80 (contact) ONLY
 
         touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
             float(prev['low'])  <= float(prev['bb80_lo']) or _near_bb80_with_tolerance(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow, atr_contact, atr_tol_k)
@@ -479,11 +493,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if touched_ct_low and ct_reintegration_ok:
             regime = "Contre-tendance"
             entry = float(last['close'])
-            sl = float(_anchor_sl_from_extreme(df, 'buy'))
+            sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
 
-            # TP long CT: un peu sous BB20_mid (pourcentage)
             target_band = float(last['bb20_mid'])
-            tp = target_band * (1.0 - tp_pct)
+            eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
+            tp = target_band * (1.0 - eff_pct)
             if tp <= entry:
                 return None
 
@@ -499,11 +513,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         elif touched_ct_high and ct_reintegration_ok:
             regime = "Contre-tendance"
             entry = float(last['close'])
-            sl = float(_anchor_sl_from_extreme(df, 'sell'))
+            sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
 
-            # TP short CT: un peu au-dessus de BB20_mid (pourcentage)
             target_band = float(last['bb20_mid'])
-            tp = target_band * (1.0 + tp_pct)
+            eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
+            tp = target_band * (1.0 + eff_pct)
             if tp >= entry:
                 return None
 
@@ -523,6 +537,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return signal
 
     return None
+
 
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
@@ -1064,48 +1079,57 @@ def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, p
         raise
 
 
-def adjust_tp_for_bb_offset(raw_tp: float, side: str) -> float:
+def adjust_tp_for_bb_offset(raw_tp: float, side: str, atr: float = 0.0, ref_price: float | None = None) -> float:
     """
-    Applique l’offset TP pour placer la cible :
-    - Long  : plus bas que la référence (borne haute / mèche haute) -> prix diminué
-    - Short : plus bas que la mèche/référence -> prix diminué (⚠️ correction ici)
-    Clamp de l’offset: [0,05% ; 10%].
+    (MISE À JOUR) Offset hybride pour le TP : max(pourcentage, ATR*k).
+    - ref_price: la borne visée (BB80_up/lo ou BB20_mid) pour convertir ATR en %.
+    - Sans ref_price, on retombe sur l'ancien comportement (pourcentage seul).
     """
     try:
-        v = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0015'))
+        pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))  # 0.30%
     except Exception:
-        v = 0.0015
-    if v < 0.0005: v = 0.0005
-    if v > 0.1:   v = 0.1
+        pct = 0.003
+    try:
+        atr_k = float(database.get_setting('TP_ATR_K', '0.50'))
+    except Exception:
+        atr_k = 0.50
+
+    eff_pct = pct
+    if ref_price and ref_price > 0 and atr > 0:
+        eff_pct = max(pct, (atr_k * float(atr)) / float(ref_price))
 
     s = (side or "").lower()
     if s in ("buy", "long"):
-        return float(raw_tp) * (1.0 - v)
+        return float(raw_tp) * (1.0 - eff_pct)
     if s in ("sell", "short"):
-        return float(raw_tp) * (1.0 + v)
-
+        return float(raw_tp) * (1.0 + eff_pct)
     return float(raw_tp)
 
-def adjust_sl_for_offset(raw_sl: float, side: str) -> float:
+
+def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: float | None = None) -> float:
     """
-    Applique l’offset SL (padding additionnel) autour de l'ancre.
-    Objectif : éviter les mèches qui effleurent le SL en ajoutant un % de marge.
-    - Long : SL est sous le prix -> on l’éloigne vers le bas  (prix diminué)
-    - Short: SL est au-dessus   -> on l’éloigne vers le haut (prix augmenté)
-    Clamp de l’offset: [0,05% ; 10%].
+    (MISE À JOUR) Offset hybride pour le SL : max(pourcentage, ATR*k).
+    - ref_price: l’ancre (high/low de la bougie d’ancrage) pour convertir ATR en %.
+    - Sans ref_price, on retombe sur l'ancien comportement (pourcentage seul).
     """
     try:
-        v = float(database.get_setting('SL_OFFSET_PCT', '0.0015'))
+        pct = float(database.get_setting('SL_OFFSET_PCT', '0.006'))  # 0.60%
     except Exception:
-        v = 0.0015
-    if v < 0.0005: v = 0.0005
-    if v > 0.1:   v = 0.1
+        pct = 0.006
+    try:
+        atr_k = float(database.get_setting('SL_ATR_K', '1.00'))
+    except Exception:
+        atr_k = 1.00
+
+    eff_pct = pct
+    if ref_price and ref_price > 0 and atr > 0:
+        eff_pct = max(pct, (atr_k * float(atr)) / float(ref_price))
 
     s = (side or "").lower()
     if s in ("buy", "long"):
-        return float(raw_sl) * (1.0 - v)
+        return float(raw_sl) * (1.0 - eff_pct)
     if s in ("sell", "short"):
-        return float(raw_sl) * (1.0 + v)
+        return float(raw_sl) * (1.0 + eff_pct)
     return float(raw_sl)
 
 
@@ -1504,7 +1528,7 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur trailing {symbol}: {e}")
 
-        # --- TP dynamique (silencieux) ---
+        # --- TP dynamique (HYBRIDE) ---
         try:
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
             if df is not None and len(df) > 0:
@@ -1514,12 +1538,23 @@ def manage_open_positions(ex: ccxt.Exchange):
                 bb20_mid = float(last['bb20_mid'])
                 bb80_up  = float(last['bb80_up'])
                 bb80_lo  = float(last['bb80_lo'])
+                last_atr = float(last.get('atr', 0.0))
 
                 offset_pct = get_tp_offset_pct()
+                try:
+                    tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
+                except Exception:
+                    tp_atr_k = 0.50
+
+                # Référence selon le régime
                 if regime == 'Tendance':
-                    target_tp = (bb80_up * (1.0 - offset_pct)) if is_long else (bb80_lo * (1.0 + offset_pct))
+                    ref = bb80_up if is_long else bb80_lo
                 else:
-                    target_tp = (bb20_mid * (1.0 - offset_pct)) if is_long else (bb20_mid * (1.0 + offset_pct))
+                    ref = bb20_mid
+
+                # Offset hybride = max(pct, (ATR*K)/ref)
+                eff_pct = max(offset_pct, (tp_atr_k * last_atr) / ref if ref > 0 else offset_pct)
+                target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
                 current_tp = float(pos['tp_price'])
                 improve = (is_long and target_tp > current_tp * 1.0002) or ((not is_long) and target_tp < current_tp * 0.9998)
