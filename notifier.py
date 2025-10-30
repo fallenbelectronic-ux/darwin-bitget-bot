@@ -334,11 +334,12 @@ def get_config_menu_keyboard() -> Dict:
     cw_label = f"{'🟢' if cw else '⚪️'} Cut-wick RR≥2.8 : {'ON' if cw else 'OFF'}"
     return {
         "inline_keyboard": [
+            [{"text": "📝 Changer Mode (Papier/Réel)", "callback_data": "show_mode"}],
             [{"text": "🔩 Afficher Config Actuelle", "callback_data": "show_config"}],
             [{"text": cw_label, "callback_data": "toggle_cutwick"}],
-            [{"text": "🖥️ Changer Mode (Papier/Réel)", "callback_data": "show_mode"}],
+            [{"text": "💹 Offset TP/SL", "callback_data": "OFS:ROOT"}],
             [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
-            [{"text": "🔁 Redémarrer le bot", "callback_data": "restart_bot"}],
+            [{"text": "🛑 Redémarrer le bot", "callback_data": "restart_bot"}],
             [{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]
         ]
     }
@@ -524,12 +525,21 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
 def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
     """
     Routeur minimal à appeler depuis la boucle d'updates.
-    Retourne True si géré ici (restart), sinon False.
+    Retourne True si géré ici (restart / offsets), sinon False.
     """
     try:
         if not data:
             return False
         cmd = data.get("data")
+        if not cmd:
+            return False
+
+        # ✅ Délègue les callbacks Offset (menu + ajustements)
+        if cmd.startswith("OFS:"):
+            chat_id = (((data.get("message") or {}).get("chat") or {}).get("id"))
+            handle_offset_callback(cmd, chat_id=chat_id)
+            return True
+
         if cmd == "restart_bot":
             handle_restart_callback(data)
             return True
