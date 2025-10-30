@@ -123,8 +123,8 @@ def send_mode_message(is_testnet: bool, is_paper: bool):
     except Exception as e:
         print(f"Erreur sendMessage (mode): {e}")
 
-def open_offset_root_panel(chat_id: Optional[str] = None):
-    """Menu racine Offset : choix TP ou SL."""
+def open_offset_root_panel(chat_id: Optional[str] = None, message_id: Optional[int] = None):
+    """Menu racine Offset : choix TP ou SL. Édite en place si message_id fourni, sinon envoie un nouveau message."""
     kb = {
         "inline_keyboard": [
             [
@@ -136,7 +136,12 @@ def open_offset_root_panel(chat_id: Optional[str] = None):
             ],
         ]
     }
-    tg_send("Choisis le paramètre à ajuster :", reply_markup=kb, chat_id=chat_id)
+    txt = "Choisis le paramètre à ajuster :"
+    if chat_id and message_id:
+        tg_edit_message_text(txt, str(chat_id), int(message_id), kb)
+    else:
+        tg_send(txt, reply_markup=kb, chat_id=chat_id)
+
 
 def open_offset_tp_panel(chat_id: Optional[str] = None, message_id: Optional[int] = None):
     """Rafraîchit le panneau d’offset TP (Bollinger) EN PLACE (aucun nouvel envoi)."""
@@ -218,15 +223,29 @@ def handle_offset_callback(cb_data: str, chat_id: Optional[str] = None, message_
     if not cb_data or not cb_data.startswith("OFS:"):
         return
 
+    # NEW: afficher le menu racine quand on clique depuis la config (OFS:ROOT)
+    if cb_data == "OFS:ROOT":
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "⚙️ Offset TP (Bollinger)", "callback_data": "OFS:ROOT:TP"},
+                    {"text": "🛡️ Offset SL", "callback_data": "OFS:ROOT:SL"},
+                ],
+                [
+                    {"text": "↩︎ Menu principal", "callback_data": "main_menu"},
+                ],
+            ]
+        }
+        if chat_id and message_id:
+            tg_edit_message_text("Choisis le paramètre à ajuster :", str(chat_id), int(message_id), kb)
+        if callback_query_id:
+            tg_answer_callback_query(callback_query_id)
+        return
+
     MIN_V, MAX_V, STEP = 0.0005, 0.1, 0.0001
     def _clamp(v: float) -> float: return max(MIN_V, min(MAX_V, v))
 
     parts = cb_data.split(":")
-    if cb_data == "OFS:ROOT":
-        # Le menu racine peut rester envoyé ailleurs; ici on n’émet rien.
-        if callback_query_id: tg_answer_callback_query(callback_query_id)
-        return
-
     if len(parts) < 3:
         if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
@@ -273,6 +292,8 @@ def handle_offset_callback(cb_data: str, chat_id: Optional[str] = None, message_
             open_offset_sl_panel(chat_id=chat_id, message_id=message_id)
         if callback_query_id: tg_answer_callback_query(callback_query_id)
         return
+
+
 
 def offset_command(chat_id: Optional[str] = None):
     """Commande /offset : ouvre le menu racine (choix TP/SL)."""
