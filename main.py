@@ -234,51 +234,50 @@ def process_callback_query(callback_query: Dict):
     """Gère les clics sur les boutons interactifs de manière robuste et lisible."""
     global _paused
     data = callback_query.get('data', '')
-    
+
+    # Accusé de réception immédiat pour éviter les “spinners” Telegram
+    try:
+        notifier.tg_answer_callback_query(callback_query.get('id'), "")
+    except Exception:
+        pass
+
     try:
         if data == 'pause':
             with _lock: _paused = True
             notifier.tg_send("⏸️ Bot mis en pause.")
             database.set_setting('PAUSED', 'true')
-            notifier.tg_answer_callback_query(callback_query.get('id'), "⏸️ Pause")
             notifier.send_main_menu(_paused)
 
         elif data == 'resume':
             with _lock: _paused = False
             notifier.tg_send("▶️ Bot relancé.")
             database.set_setting('PAUSED', 'false')
-            notifier.tg_answer_callback_query(callback_query.get('id'), "▶️ Reprise")
             notifier.send_main_menu(_paused)
 
         elif data == 'ping':
-            notifier.tg_answer_callback_query(callback_query.get('id'), "🛰️ Pong!")
             notifier.send_main_menu(_paused)
-            
+
         elif data == 'list_positions':
             try:
-                # 1) on force une vraie synchronisation DB <-> Exchange
                 ex = create_exchange()
                 trader.sync_positions_with_exchange(ex)
             except Exception as e:
                 notifier.tg_send_error("Sync positions (manual view)", e)
-            # 2) puis on affiche la vue DB (les “fantômes” doivent disparaître si la sync a bien hydraté la DB)
             notifier.format_open_positions(database.get_open_positions())
-            
+
         elif data == 'get_stats':
             ex = create_exchange()
             balance = trader.get_usdt_balance(ex)
-            # Calcul sur les 7 derniers jours (en secondes)
             trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)
             notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
 
         elif data == 'toggle_cutwick':
             new_val = database.toggle_setting_bool('CUT_WICK_FOR_RR', default_true=False)
-            notifier.tg_answer_callback_query(callback_query.get('id'), f"Cut-wick: {'ON' if new_val else 'OFF'}")
             notifier.send_config_menu()
-        
+
         elif data == 'menu_config':
             notifier.send_config_menu()
-            
+
         elif data == 'show_config':
             max_pos = database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
             config = {
@@ -291,10 +290,10 @@ def process_callback_query(callback_query: Dict):
 
         elif data == 'menu_signals':
             notifier.send_signals_menu()
-            
-        elif data == 'signals_6h':
-            notifier.tg_show_signals_6h()
-            
+
+        # ⚠️ SUPPRIMÉ: le bloc 'signals_6h' ici (déjà géré par notifier.try_handle_inline_callback)
+        # Cela évite un double appel qui créait parfois un deuxième message.
+
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
 
@@ -306,18 +305,14 @@ def process_callback_query(callback_query: Dict):
             current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
 
-        # --- SWITCH MODE (placé avant le bloc startswith('switch_to_')) ---
         elif data == 'switch_to_REAL':
             database.set_setting('PAPER_TRADING_MODE', 'false')
-            notifier.tg_answer_callback_query(callback_query.get('id'), "🔁 Mode: RÉEL")
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=False)
 
         elif data == 'switch_to_PAPER':
             database.set_setting('PAPER_TRADING_MODE', 'true')
-            notifier.tg_answer_callback_query(callback_query.get('id'), "🔁 Mode: PAPIER")
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=True)
 
-        # --- STRATÉGIE (laisse tel quel) ---
         elif data.startswith('switch_to_'):
             new_strategy = data.replace('switch_to_', '')
             if new_strategy in ['NORMAL', 'SPLIT']:
@@ -325,18 +320,18 @@ def process_callback_query(callback_query: Dict):
                 notifier.tg_send(f"✅ Stratégie mise à jour en <b>{new_strategy}</b>.")
                 notifier.send_strategy_menu(new_strategy)
                 notifier.send_main_menu(_paused)
-                
+
         elif data.startswith('close_trade_'):
             try:
-                trade_id_str = data.replace('close_trade_', '')
-                trade_id = int(trade_id_str)
+                trade_id = int(data.replace('close_trade_', ''))
                 trader.close_position_manually(create_exchange(), trade_id)
             except (ValueError, IndexError):
                 notifier.tg_send("❌ Erreur : ID de trade invalide.")
-    
+
     except Exception as e:
         print(f"Erreur lors du traitement du callback '{data}': {e}")
         notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
+
         
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
@@ -435,19 +430,30 @@ def route_inline_restart_callback(update: Dict[str, Any]) -> bool:
 
 def poll_telegram_updates():
     """Récupère et distribue les mises à jour de Telegram. C'est le cœur de la réactivité."""
+    # Anti-doublon simple: on ignore un même callback_id reçu 2x (retries Telegram)
+    if not hasattr(poll_telegram_updates, "_last_cb_id"):
+        poll_telegram_updates._last_cb_id = None
+
     global _last_update_id
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
     for upd in updates:
         _last_update_id = upd.get("update_id", _last_update_id)
 
-        # --- Ajout: routage prioritaire des callbacks spéciaux (ex: restart) ---
+        # --- Routage prioritaire (OFS:, signaux, restart...) déjà géré côté notifier ---
         if route_inline_restart_callback(upd):
             continue
 
         if 'callback_query' in upd:
-            process_callback_query(upd['callback_query'])
+            cb = upd['callback_query']
+            cb_id = cb.get('id')
+            if cb_id and cb_id == poll_telegram_updates._last_cb_id:
+                continue  # ← ignore le doublon exact
+            poll_telegram_updates._last_cb_id = cb_id
+
+            process_callback_query(cb)
         elif 'message' in upd:
             process_message(upd['message'])
+
             
 def telegram_listener_loop():
     """Thread dédié qui exécute la boucle de polling Telegram."""
