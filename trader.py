@@ -424,8 +424,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         target_band = float(last['bb80_up'])
         tp = target_band * (1.0 - tp_pct)
         if tp <= entry:
-            tp = target_band
-        if tp <= entry:
             return None
 
         if (entry - sl) > 0:
@@ -442,11 +440,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         entry = float(last['close'])
         sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL = high_ancre * (1 + tp_pct)
 
-        # TP short: un peu au-dessus de BB80_lo (pourcentage)
+        # TP short: un peu au-dessus de BB80_lo 
         target_band = float(last['bb80_lo'])
         tp = target_band * (1.0 + tp_pct)
-        if tp >= entry:
-            tp = target_band
         if tp >= entry:
             return None
 
@@ -489,8 +485,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             target_band = float(last['bb20_mid'])
             tp = target_band * (1.0 - tp_pct)
             if tp <= entry:
-                tp = target_band
-            if tp <= entry:
                 return None
 
             if (entry - sl) > 0:
@@ -510,8 +504,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # TP short CT: un peu au-dessus de BB20_mid (pourcentage)
             target_band = float(last['bb20_mid'])
             tp = target_band * (1.0 + tp_pct)
-            if tp >= entry:
-                tp = target_band
             if tp >= entry:
                 return None
 
@@ -921,18 +913,20 @@ def adjust_tp_for_bb_offset(raw_tp: float, side: str) -> float:
     Applique l’offset TP pour placer la cible :
     - Long  : plus bas que la référence (borne haute / mèche haute) -> prix diminué
     - Short : plus bas que la mèche/référence -> prix diminué (⚠️ correction ici)
-    Clamp de l’offset: [0,05% ; 1%].
+    Clamp de l’offset: [0,05% ; 10%].
     """
     try:
         v = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0015'))
     except Exception:
         v = 0.0015
     if v < 0.0005: v = 0.0005
-    if v > 0.01:   v = 0.01
+    if v > 0.1:   v = 0.1
 
     s = (side or "").lower()
-    if s in ("buy", "long", "sell", "short"):
+    if s in ("buy", "long"):
         return float(raw_tp) * (1.0 - v)
+    if s in ("sell", "short"):
+        return float(raw_tp) * (1.0 + v)
 
     return float(raw_tp)
 
@@ -942,14 +936,14 @@ def adjust_sl_for_offset(raw_sl: float, side: str) -> float:
     Objectif : éviter les mèches qui effleurent le SL en ajoutant un % de marge.
     - Long : SL est sous le prix -> on l’éloigne vers le bas  (prix diminué)
     - Short: SL est au-dessus   -> on l’éloigne vers le haut (prix augmenté)
-    Clamp de l’offset: [0,05% ; 1%].
+    Clamp de l’offset: [0,05% ; 10%].
     """
     try:
         v = float(database.get_setting('SL_OFFSET_PCT', '0.0015'))
     except Exception:
         v = 0.0015
     if v < 0.0005: v = 0.0005
-    if v > 0.01:   v = 0.01
+    if v > 0.1:   v = 0.1
 
     s = (side or "").lower()
     if s in ("buy", "long"):
@@ -1165,11 +1159,16 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     return True,"Position ouverte avec succès."
 
 def get_tp_offset_pct() -> float:
-    """Retourne le pourcentage d'offset (ex: 0.0015 = 0.15%) pour TP/SL depuis la DB."""
+    """Retourne le pourcentage d'offset (ex: 0.0015 = 0.15%) pour TP/SL depuis la DB,
+    clampé pour garantir que le TP se place AVANT la borne (jamais 0)."""
     try:
-        return float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
+        v = float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
     except Exception:
-        return 0.0015
+        v = 0.0015
+    # Clamp : min 0.05% ; max 10%
+    if v < 0.0005: v = 0.0005
+    if v > 0.1:     v = 0.1
+    return v
 
 def manage_open_positions(ex: ccxt.Exchange):
     _ensure_bitget_mix_options(ex)
