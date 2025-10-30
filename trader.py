@@ -582,8 +582,7 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
     """
     Vérifie la cohérence entre les positions ouvertes sur l'exchange (Bitget via CCXT)
     et les trades 'OPEN' en base. Peut importer automatiquement les positions présentes
-    sur l'exchange mais absentes en DB (AUTO_IMPORT_EX_POS = true).
-    """
+    sur l'exchange mais absentes en DB (AUTO_IMPORT_EX_POS = true)."""
     _ensure_bitget_mix_options(ex)
     report = {
         "only_on_exchange": [],
@@ -662,7 +661,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
             "matched": matched,
         })
 
-        # 👉 Import auto des positions “fantômes” (présentes sur l’exchange mais pas en DB)
         try:
             do_import = str(database.get_setting('AUTO_IMPORT_EX_POS', 'true')).lower() == 'true'
         except Exception:
@@ -670,7 +668,6 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
         if do_import and only_on_exchange:
             for symbol, side, q, ep in only_on_exchange:
-                # si déjà marquée ouverte en DB, on saute (double sécurité)
                 try:
                     if database.is_position_open(symbol):
                         continue
@@ -678,25 +675,17 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                     pass
                 _import_exchange_position_to_db(ex, symbol, side, q, ep)
 
-            # Après import, on réévalue la vue DB -> Exchange
-            try:
-                db_open = database.get_open_positions() or []
-            except Exception:
-                db_open = []
-            # (pas de recomparaison détaillée ici, la prochaine sync fera foi)
-
-        # Fermeture optionnelle des orphelins DB
-        auto_close_orphans = str(database.get_setting('AUTO_CLOSE_DB_ORPHANS', 'false')).lower() == 'true'
+        # --- NEW: Fermeture auto des orphelins DB (positions disparues côté exchange) ---
+        auto_close_orphans = str(database.get_setting('AUTO_CLOSE_DB_ORPHANS', 'true')).lower() == 'true'
         if auto_close_orphans and only_in_db:
             for ids, symbol, side, qty in only_in_db:
                 try:
                     for tid in (ids if isinstance(ids, list) else [ids]):
-                        database.close_trade(tid, status='SYNC_CLOSED_ORPHAN', pnl=0.0)
-                    notifier.tg_send(f"🧹 Sync: trades DB orphelins fermés ({symbol} {side}, qty≈{qty}).")
+                        database.close_trade(tid, status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                    notifier.tg_send(f"🧹 Sync: fermeture auto — {symbol} {side} (qty≈{qty}) disparue côté exchange.")
                 except Exception as e:
                     notifier.tg_send_error(f"Sync — fermeture orphelin {symbol}", e)
 
-        # Notification optionnelle
         try:
             want_notify = str(database.get_setting('SYNC_NOTIFY', 'false')).lower() == 'true'
         except Exception:
@@ -723,6 +712,7 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
         notifier.tg_send_error("Sync positions — erreur inattendue", e)
 
     return report
+
 
 
 def _bitget_positions_params() -> Dict[str, str]:
@@ -1347,23 +1337,53 @@ def manage_open_positions(ex: ccxt.Exchange):
     if not open_positions:
         return
 
+    # --- NEW: auto-close si la position a disparu côté exchange (SL/TP exécuté) ---
+    try:
+        symbols = list({p['symbol'] for p in open_positions})
+        ex_pos_list = _fetch_positions_safe(ex, symbols)
+        live_map = {}
+        for p in (ex_pos_list or []):
+            try:
+                sym = p.get('symbol') or (p.get('info', {}) or {}).get('symbol')
+                contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+                if sym:
+                    live_map[sym] = live_map.get(sym, 0.0) + max(0.0, contracts)
+            except Exception:
+                continue
+    except Exception:
+        live_map = {}
+
     for pos in open_positions:
         symbol = pos['symbol']
+        try:
+            real_qty = float(live_map.get(symbol, 0.0))
+            if real_qty <= 0:
+                try:
+                    database.close_trade(pos['id'], status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                    notifier.tg_send(f"✅ Fermeture auto (exchange) détectée sur {symbol} — Trade #{pos['id']} clôturé en DB.")
+                except Exception:
+                    pass
+                continue
+        except Exception:
+            pass
+
         is_long = (pos['side'] == 'buy')
         close_side = 'sell' if is_long else 'buy'
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
-        # 2) Sécuriser les modes AVANT toute action marché sur ce symbole
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            try: ex.set_margin_mode('cross', symbol)
-            except Exception: pass
-            try: ex.set_position_mode(False, symbol)
-            except Exception: pass
+            try:
+                ex.set_margin_mode('cross', symbol)
+            except Exception:
+                pass
+            try:
+                ex.set_position_mode(False, symbol)
+            except Exception:
+                pass
         except Exception:
             pass
 
-        # --- SPLIT ---
         if pos['management_strategy'] == 'SPLIT' and pos['breakeven_status'] == 'PENDING':
             try:
                 current_price = ex.fetch_ticker(symbol)['last']
@@ -1375,27 +1395,29 @@ def manage_open_positions(ex: ccxt.Exchange):
 
                 if (is_long and current_price >= management_trigger_price) or (not is_long and current_price <= management_trigger_price):
                     qty_to_close = pos['quantity'] / 2
-                    try: qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
-                    except Exception: pass
+                    try:
+                        qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
+                    except Exception:
+                        pass
                     if qty_to_close <= 0:
                         continue
                     remaining_qty = max(0.0, pos['quantity'] - qty_to_close)
 
-                    # 1) Clôturer 50%
                     ex.create_market_order(symbol, close_side, qty_to_close, params=common_params)
 
-                    # 2) BE sur le restant
                     try:
                         ex.cancel_all_orders(symbol)
                     except Exception as e:
-                        if '22001' not in str(e): raise
+                        if '22001' not in str(e):
+                            raise
                     fees_bps = float(database.get_setting('FEES_BPS', 5))
                     fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                     new_sl_be = pos['entry_price'] * fee_factor
 
-                    # Arrondi quantité restante
-                    try: remaining_qty = float(ex.amount_to_precision(symbol, remaining_qty))
-                    except Exception: pass
+                    try:
+                        remaining_qty = float(ex.amount_to_precision(symbol, remaining_qty))
+                    except Exception:
+                        pass
                     if remaining_qty > 0:
                         ex.create_order(symbol, 'market', close_side, remaining_qty, price=None,
                                         params={**common_params, 'stopLossPrice': float(new_sl_be), 'triggerType': 'mark'})
@@ -1409,7 +1431,6 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur de gestion SPLIT pour {symbol}: {e}")
 
-        # --- BE NORMAL (CT) ---
         if pos['management_strategy'] == 'NORMAL' and pos.get('regime') == 'Contre-tendance' and pos.get('breakeven_status') == 'PENDING':
             try:
                 df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
@@ -1422,14 +1443,17 @@ def manage_open_positions(ex: ccxt.Exchange):
                         try:
                             ex.cancel_all_orders(symbol)
                         except Exception as e:
-                            if '22001' not in str(e): raise
+                            if '22001' not in str(e):
+                                raise
                         fees_bps = float(database.get_setting('FEES_BPS', 5))
                         fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                         new_sl_be = float(pos['entry_price']) * fee_factor
 
                         qty = float(pos['quantity'])
-                        try: qty = float(ex.amount_to_precision(symbol, qty))
-                        except Exception: pass
+                        try:
+                            qty = float(ex.amount_to_precision(symbol, qty))
+                        except Exception:
+                            pass
                         if qty <= 0:
                             continue
 
@@ -1444,20 +1468,17 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur BE NORMAL contre-tendance {symbol}: {e}")
 
-        # --- Trailing après BE (LIVE, 'pro', silencieux) ---
         if pos.get('breakeven_status') in ('ACTIVE', 'DONE', 'BE'):
             try:
-                # Paramètres 'pro'
                 try:
-                    move_min_pct = float(database.get_setting('TRAIL_MOVE_MIN_PCT', 0.0002))  # 0.02%
+                    move_min_pct = float(database.get_setting('TRAIL_MOVE_MIN_PCT', 0.0002))
                 except Exception:
                     move_min_pct = 0.0002
                 try:
-                    atr_k = float(database.get_setting('TRAIL_ATR_K', 1.3))  # un peu large
+                    atr_k = float(database.get_setting('TRAIL_ATR_K', 1.3))
                 except Exception:
                     atr_k = 1.3
 
-                # Données LIVE
                 ticker = ex.fetch_ticker(symbol) or {}
                 last_price = float(ticker.get('last') or ticker.get('close') or pos['entry_price'])
 
@@ -1468,13 +1489,9 @@ def manage_open_positions(ex: ccxt.Exchange):
                 bb20_mid = float(last_row['bb20_mid'])
                 atr_live = float(last_row.get('atr', 0.0))
 
-                # BE de référence (ne jamais repasser sous/sur BE)
                 be_price = float(pos.get('sl_price') or pos['entry_price'])
                 current_sl = float(pos.get('sl_price') or pos['entry_price'])
 
-                # Candidat SL :
-                # Long  -> max(BB20_mid, last - ATR*K, BE, current_sl)
-                # Short -> min(BB20_mid, last + ATR*K, BE, current_sl)
                 if is_long:
                     target_atr = last_price - atr_live * atr_k
                     candidate = max(bb20_mid, target_atr, be_price, current_sl)
@@ -1487,7 +1504,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if not moved:
                     continue
 
-                # Mise à jour côté exchange : on ne bouge QUE le SL (pas de notif)
                 try:
                     qty = float(pos['quantity'])
                     try:
@@ -1522,13 +1538,11 @@ def manage_open_positions(ex: ccxt.Exchange):
                         database.update_trade_to_breakeven(pos['id'], qty, candidate)
 
                 except Exception as e:
-                    # Silencieux
                     print(f"Erreur trailing {symbol}: {e}")
 
             except Exception as e:
                 print(f"Erreur trailing {symbol}: {e}")
 
-        # --- TP dynamique (HYBRIDE) ---
         try:
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
             if df is not None and len(df) > 0:
@@ -1536,8 +1550,8 @@ def manage_open_positions(ex: ccxt.Exchange):
                 regime = pos.get('regime', 'Tendance')
 
                 bb20_mid = float(last['bb20_mid'])
-                bb80_up  = float(last['bb80_up'])
-                bb80_lo  = float(last['bb80_lo'])
+                bb80_up = float(last['bb80_up'])
+                bb80_lo = float(last['bb80_lo'])
                 last_atr = float(last.get('atr', 0.0))
 
                 offset_pct = get_tp_offset_pct()
@@ -1546,13 +1560,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     tp_atr_k = 0.50
 
-                # Référence selon le régime
-                if regime == 'Tendance':
-                    ref = bb80_up if is_long else bb80_lo
-                else:
-                    ref = bb20_mid
-
-                # Offset hybride = max(pct, (ATR*K)/ref)
+                ref = bb80_up if (regime == 'Tendance' and is_long) else (bb80_lo if regime == 'Tendance' else bb20_mid)
                 eff_pct = max(offset_pct, (tp_atr_k * last_atr) / ref if ref > 0 else offset_pct)
                 target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
@@ -1562,10 +1570,10 @@ def manage_open_positions(ex: ccxt.Exchange):
                     try:
                         ex.cancel_all_orders(symbol)
                     except Exception as e:
-                        if '22001' not in str(e): raise
+                        if '22001' not in str(e):
+                            raise
                     sl_price = float(pos.get('sl_price') or pos['entry_price'])
 
-                    # --- Correctif SL vs prix courant (évite l'erreur 40836 Bitget) ---
                     try:
                         tkr = ex.fetch_ticker(symbol) or {}
                         last_px = float(tkr.get('last') or tkr.get('close') or pos['entry_price'])
@@ -1582,7 +1590,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     else:
                         if sl_price <= last_px:
                             sl_price = last_px * (1.0 + gap_pct)
-                    
+
                     qty = float(pos['quantity'])
                     try:
                         qty = float(ex.amount_to_precision(symbol, qty))
@@ -1602,9 +1610,9 @@ def manage_open_positions(ex: ccxt.Exchange):
                         database.update_trade_tp(pos['id'], float(target_tp))
                     except Exception:
                         pass
-                    # Aucune notification ici (mouvements visibles via l'écran Positions)
         except Exception as e:
             print(f"Erreur TP dynamique {symbol}: {e}")
+
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Solde USDT/équity robuste (Bitget v2 compatible, évite 'Parameter productType error')."""
