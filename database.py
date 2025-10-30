@@ -42,6 +42,20 @@ def setup_database():
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            /* NEW: table des signaux utilisée par notifier.tg_show_signals_* */
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT CHECK(side IN ('buy','sell')) NOT NULL,
+                timeframe TEXT,
+                regime TEXT,
+                entry REAL,
+                sl REAL,
+                tp REAL,
+                rr REAL,
+                ts INTEGER NOT NULL,          -- epoch en secondes ou millisecondes
+                state TEXT                    -- ex: 'PENDING', 'VALID_SKIPPED', ...
+            );
         """)
         # Migrations idempotentes (ignore si déjà présentes)
         _ensure_column(conn, "trades", "pnl_percent", "REAL", "0")
@@ -54,7 +68,60 @@ def setup_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_status ON trades(symbol, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_close_ts ON trades(close_timestamp)")
+        # Index signaux
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
         conn.commit()
+
+def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Retourne une liste de signaux (dict) depuis la table 'signals'.
+    - state: filtre optionnel (ex: 'PENDING', 'VALID_SKIPPED')
+    - since_minutes: fenêtre glissante en minutes, basée sur 'ts' (accepte ts en sec ou ms)
+    - limit: max éléments retournés après filtres (ordre anté-chronologique)
+    Champs utilisés par notifier: symbol, timeframe, side, entry, sl, tp, rr, ts.
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        # On charge un tampon large, puis on filtre côté Python pour gérer ts sec/ms en sûreté
+        try:
+            rows = cur.execute("SELECT * FROM signals ORDER BY ts DESC LIMIT 1000").fetchall()
+        except sqlite3.OperationalError:
+            # table absente: renvoyer liste vide pour éviter le crash côté notifier
+            return []
+
+    import time as _t
+    now_sec = _t.time()
+    min_ts_sec = None
+    if since_minutes is not None:
+        try:
+            min_ts_sec = now_sec - (int(since_minutes) * 60)
+        except Exception:
+            min_ts_sec = None
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        # Filtre state
+        if state is not None and str(d.get("state", "")).upper() != str(state).upper():
+            continue
+
+        # Filtre fenêtre temporelle (support ts en sec ou ms)
+        if min_ts_sec is not None:
+            try:
+                ts_raw = float(d.get("ts", 0))
+            except Exception:
+                ts_raw = 0.0
+            ts_sec = ts_raw / 1000.0 if ts_raw > 10_000_000_000 else ts_raw
+            if ts_sec < min_ts_sec:
+                continue
+
+        out.append(d)
+
+        if len(out) >= int(limit):
+            break
+
+    return out
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, coltype: str, default_sql_literal: str):
     cur = conn.cursor()
