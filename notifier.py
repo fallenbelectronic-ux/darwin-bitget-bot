@@ -843,7 +843,10 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
         print(f"Erreur sendMessage (report): {e}")
 
 def format_open_positions(positions: List[Dict[str, Any]]):
-    """Affiche les positions ouvertes dans le message principal (pas de spam)."""
+    """Affiche les positions ouvertes dans le message principal (pas de spam) avec PNL si prix courant dispo.
+    PNL = (price - entry) * qty pour un LONG, (entry - price) * qty pour un SHORT.
+    Recherche du prix courant dans: current_price, last_price, mark_price, ticker_last, price, last. Sinon 'N/A'.
+    Recherche de la qty dans: quantity, qty, contracts, size, amount. Sinon 'N/A'."""
     keyboard = get_positions_keyboard(positions) or {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
 
     if not positions:
@@ -851,16 +854,63 @@ def format_open_positions(positions: List[Dict[str, Any]]):
         edit_main(notifier_text, keyboard)
         return
 
+    def _to_float(x, default=None):
+        try:
+            if x is None: return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _first(pos: Dict[str, Any], keys: List[str], default=None):
+        for k in keys:
+            if k in pos and pos[k] is not None:
+                return pos[k]
+        return default
+
+    # ⚠️ pas d'annotation Tuple ici pour éviter l'import manquant
+    def _pnl_tuple(pos: Dict[str, Any]):
+        try:
+            entry = _to_float(pos.get('entry_price'), 0.0)
+            qty   = _to_float(_first(pos, ['quantity', 'qty', 'contracts', 'size', 'amount'], 0.0), 0.0)
+            side  = (pos.get('side') or '').lower()
+
+            # Prix courant: on tente plusieurs clés
+            cur_raw = _first(pos, ['current_price', 'last_price', 'mark_price', 'ticker_last', 'price', 'last'], None)
+            cur     = _to_float(cur_raw, None)
+            if cur is None or qty <= 0 or entry <= 0:
+                return None, None
+
+            if side == 'buy':
+                pnl = (cur - entry) * qty
+                pnl_pct = (cur - entry) / entry * 100.0
+            else:
+                pnl = (entry - cur) * qty
+                pnl_pct = (entry - cur) / entry * 100.0
+            return pnl, pnl_pct
+        except Exception:
+            return None, None
+
     lines = ["<b>📊 Positions Ouvertes (DB)</b>\n"]
     for pos in positions:
-        side_icon = "📈" if pos.get('side') == 'buy' else "📉"
+        side_icon = "📈" if (pos.get('side') or '').lower() == 'buy' else "📉"
+        pnl_val, pnl_pct = _pnl_tuple(pos)
+        if pnl_val is None or pnl_pct is None:
+            pnl_str = "PNL: <i>N/A</i>"
+        else:
+            sign = "+" if pnl_val >= 0 else "−"
+            pnl_abs = abs(pnl_val)
+            pct_abs = abs(pnl_pct)
+            pnl_str = f"PNL: <b>{sign}{pnl_abs:.2f} USDT</b> ({sign}{pct_abs:.2f}%)"
         lines.append(
             f"<b>{pos.get('id')}. {side_icon} {_escape(pos.get('symbol', 'N/A'))}</b>\n"
-            f"   Entrée: <code>{pos.get('entry_price', 0.0):.4f}</code>\n"
-            f"   SL: <code>{pos.get('sl_price', 0.0):.4f}</code> | TP: <code>{pos.get('tp_price', 0.0):.4f}</code>"
+            f"   Entrée: <code>{_to_float(pos.get('entry_price'), 0.0):.4f}</code>\n"
+            f"   SL: <code>{_to_float(pos.get('sl_price'), 0.0):.4f}</code> | TP: <code>{_to_float(pos.get('tp_price'), 0.0):.4f}</code>\n"
+            f"   {pnl_str}"
         )
+
     message = "\n\n".join(lines)
     edit_main(message, keyboard)
+
 
 def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
     """Formate et envoie un rapport complet des positions ouvertes, synchronisé avec l'exchange."""
