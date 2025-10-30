@@ -536,13 +536,47 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
 
+def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, quantity: float, entry_px: float) -> None:
+    """
+    Crée/insère en DB une position détectée sur l'exchange mais absente de la DB.
+    Regime = 'Importé', TP/SL init = entry_px (seront gérés ensuite par manage_open_positions).
+    """
+    try:
+        management_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
+        entry_atr = 0.0
+        try:
+            df_tmp = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+            if df_tmp is not None and len(df_tmp) > 0:
+                entry_atr = float(df_tmp.iloc[-1].get('atr', 0.0))
+        except Exception:
+            pass
+
+        database.create_trade(
+            symbol=symbol,
+            side=side,
+            regime="Importé",
+            entry_price=float(entry_px),
+            sl_price=float(entry_px),
+            tp_price=float(entry_px),
+            quantity=float(quantity),
+            risk_percent=RISK_PER_TRADE_PERCENT,
+            management_strategy=("SPLIT" if management_strategy == "SPLIT" else "NORMAL"),
+            entry_atr=entry_atr,
+            entry_rsi=0.0,
+        )
+        try:
+            notifier.tg_send(f"♻️ Import DB: {symbol} {side} qty≈{quantity}, entry≈{entry_px}")
+        except Exception:
+            pass
+    except Exception as e:
+        notifier.tg_send_error(f"Import position {symbol} -> DB", e)
+
 def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
     _ensure_bitget_mix_options(ex)
     """
     Vérifie la cohérence entre les positions ouvertes sur l'exchange (Bitget via CCXT)
-    et les trades 'OPEN' en base. Ne supprime rien côté exchange. Peut, en option,
-    fermer en DB les orphelins (présents en DB mais absents sur l'exchange) selon
-    le paramètre AUTO_CLOSE_DB_ORPHANS (DB, défaut false).
+    et les trades 'OPEN' en base. Peut importer automatiquement les positions présentes
+    sur l'exchange mais absentes en DB (AUTO_IMPORT_EX_POS = true).
     """
     report = {
         "only_on_exchange": [],
@@ -552,10 +586,8 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
     }
 
     try:
-        # --- Récup Exchange (corrigé: wrapper qui force productType/marginCoin sur Bitget) ---
         ex_positions_raw = _fetch_positions_safe(ex)
 
-        # Filtrer les positions réellement ouvertes (> 0)
         ex_open = []
         for p in (ex_positions_raw or []):
             try:
@@ -573,40 +605,26 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                 else:
                     side = 'buy'
                 entry = float(p.get('entryPrice') or 0.0)
-                ex_open.append({
-                    'symbol': symbol,
-                    'side': side,
-                    'quantity': contracts,
-                    'entry_price': entry,
-                })
+                ex_open.append({'symbol': symbol, 'side': side, 'quantity': contracts, 'entry_price': entry})
             except Exception:
                 continue
 
-        # Indexation exchange par (symbol, side)
-        ex_map = {}
-        for r in ex_open:
-            ex_map[(r['symbol'], r['side'])] = r
+        ex_map = {(r['symbol'], r['side']): r for r in ex_open}
 
-        # --- Récup DB ---
         db_open = database.get_open_positions() or []
-        db_map = {}
+        db_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for d in db_open:
             try:
                 key = (d['symbol'], d['side'])
                 if key not in db_map:
-                    db_map[key] = {
-                        'ids': [d['id']],
-                        'quantity': float(d['quantity']),
-                        'entry_price': float(d.get('entry_price') or 0.0)
-                    }
+                    db_map[key] = {'ids': [d['id']], 'quantity': float(d['quantity']), 'entry_price': float(d.get('entry_price') or 0.0)}
                 else:
                     db_map[key]['ids'].append(d['id'])
                     db_map[key]['quantity'] += float(d['quantity'])
             except Exception:
                 continue
 
-        # --- Comparaison ---
-        tol_qty_pct = float(database.get_setting('SYNC_QTY_TOL_PCT', 0.01))  # 1% par défaut
+        tol_qty_pct = float(database.get_setting('SYNC_QTY_TOL_PCT', 0.01))
         only_on_exchange, only_in_db, qty_mismatch, matched = [], [], [], []
 
         for key, ex_pos in ex_map.items():
@@ -630,12 +648,37 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                 symbol, side = key
                 only_in_db.append((d['ids'], symbol, side, float(d['quantity'])))
 
-        report["only_on_exchange"] = only_on_exchange
-        report["only_in_db"] = only_in_db
-        report["qty_mismatch"] = qty_mismatch
-        report["matched"] = matched
+        report.update({
+            "only_on_exchange": only_on_exchange,
+            "only_in_db": only_in_db,
+            "qty_mismatch": qty_mismatch,
+            "matched": matched,
+        })
 
-        # --- Actions automatiques limitées (sûres) ---
+        # 👉 Import auto des positions “fantômes” (présentes sur l’exchange mais pas en DB)
+        try:
+            do_import = str(database.get_setting('AUTO_IMPORT_EX_POS', 'true')).lower() == 'true'
+        except Exception:
+            do_import = True
+
+        if do_import and only_on_exchange:
+            for symbol, side, q, ep in only_on_exchange:
+                # si déjà marquée ouverte en DB, on saute (double sécurité)
+                try:
+                    if database.is_position_open(symbol):
+                        continue
+                except Exception:
+                    pass
+                _import_exchange_position_to_db(ex, symbol, side, q, ep)
+
+            # Après import, on réévalue la vue DB -> Exchange
+            try:
+                db_open = database.get_open_positions() or []
+            except Exception:
+                db_open = []
+            # (pas de recomparaison détaillée ici, la prochaine sync fera foi)
+
+        # Fermeture optionnelle des orphelins DB
         auto_close_orphans = str(database.get_setting('AUTO_CLOSE_DB_ORPHANS', 'false')).lower() == 'true'
         if auto_close_orphans and only_in_db:
             for ids, symbol, side, qty in only_in_db:
@@ -646,12 +689,11 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                 except Exception as e:
                     notifier.tg_send_error(f"Sync — fermeture orphelin {symbol}", e)
 
-        # --- Notification (désactivable) ---
+        # Notification optionnelle
         try:
             want_notify = str(database.get_setting('SYNC_NOTIFY', 'false')).lower() == 'true'
         except Exception:
             want_notify = False
-
         if want_notify:
             lines = ["🧭 Vérification positions (Exchange vs DB)"]
             if only_on_exchange:
@@ -659,7 +701,7 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
                 for symbol, side, q, ep in only_on_exchange:
                     lines.append(f"   - {symbol} {side} qty={q} entry≈{ep}")
             if only_in_db:
-                lines.append("• Uniquement en DB (status OPEN, pas de position réelle):")
+                lines.append("• Uniquement en DB:")
                 for ids, symbol, side, q in only_in_db:
                     lines.append(f"   - {symbol} {side} qtyDB={q} (ids={ids})")
             if qty_mismatch:
