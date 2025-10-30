@@ -713,6 +713,64 @@ def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
 
     return report
 
+def _validate_tp_for_side(side: str, tp_price: float, current_price: float, tick_size: float) -> float:
+    """
+    Garantit la règle Bitget :
+      - short  (sell) : TP < current_price
+      - long   (buy)  : TP > current_price
+    Corrige automatiquement de 1 tick si la condition est violée.
+    """
+    if tick_size <= 0:
+        return tp_price
+
+    def _round_to_tick(px: float) -> float:
+        # Arrondi au tick vers la grille la plus proche
+        ticks = round(px / tick_size)
+        return float(ticks) * float(tick_size)
+
+    if str(side).lower() in ("sell", "short"):
+        # si TP >= prix courant, pousse-le sous le marché d'un tick
+        if tp_price >= current_price:
+            tp_price = _round_to_tick(current_price - tick_size)
+    else:
+        # buy/long : si TP <= prix courant, pousse-le au-dessus d'un tick
+        if tp_price <= current_price:
+            tp_price = _round_to_tick(current_price + tick_size)
+
+    return tp_price
+
+def _bitget_tick_size(market: dict) -> float:
+    """
+    Retourne le tick_size Bitget à partir du market ccxt.
+    Essaie d'abord market['limits']['price']['min'] si présent, sinon precision->price.
+    """
+    try:
+        lim = market.get("limits", {}).get("price", {})
+        if isinstance(lim.get("min"), (int, float)) and lim["min"] > 0:
+            return float(lim["min"])
+    except Exception:
+        pass
+    # fallback via precision décimale
+    prec = None
+    try:
+        prec = market.get("precision", {}).get("price", None)
+    except Exception:
+        prec = None
+    if isinstance(prec, int) and prec >= 0:
+        return 10 ** (-prec) if prec > 0 else 1.0
+    # dernier recours : 1e-4
+    return 0.0001
+
+def _prepare_validated_tp(exchange, symbol: str, side: str, raw_tp: float) -> float:
+    """
+    Utilitaire à appeler AVANT la création de l'ordre TP.
+    Récupère le prix courant + tick_size, puis applique _validate_tp_for_side.
+    """
+    ticker = exchange.fetch_ticker(symbol)
+    current_price = float(ticker.get("last") or ticker.get("close") or ticker["info"].get("last", 0))
+    market = exchange.market(symbol)
+    tick_size = _bitget_tick_size(market)
+    return _validate_tp_for_side(side, float(raw_tp), current_price, tick_size)
 
 
 def _bitget_positions_params() -> Dict[str, str]:
