@@ -143,49 +143,150 @@ def _live_sync_worker(ex):
 async def _ws_sync_loop(ex_rest):
     import os
     import asyncio
+    import random
+    import ccxt
     import ccxt.pro as ccxtpro
 
-    BITGET_TESTNET   = os.getenv("BITGET_TESTNET", "true").lower() in ("1","true","yes")
-    API_KEY          = os.getenv("BITGET_API_KEY", "")
-    API_SECRET       = os.getenv("BITGET_API_SECRET", "")
-    PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
+    # ------------ Config & helpers ------------
+    BITGET_TESTNET = os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes")
+    API_KEY        = os.getenv("BITGET_API_KEY", "")
+    API_SECRET     = os.getenv("BITGET_API_SECRET", "")
+    PASSPHRASSE    = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
 
-    ex_ws = ccxtpro.bitget({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "password": PASSPHRASSE,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-            "testnet": BITGET_TESTNET,
-        },
-    })
+    def _make_ex_ws():
+        # Exchange dédié WS (privé), options robustes
+        return ccxtpro.bitget({
+            "apiKey": API_KEY,
+            "secret": API_SECRET,
+            "password": PASSPHRASSE,
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {
+                "defaultType": "swap",
+                "testnet": BITGET_TESTNET,
+                "ws": {"gunzip": True},
+            },
+        })
 
+    async def _backoff_sleep(attempt: int, base: float = 1.6, cap: float = 30.0):
+        # Backoff exponentiel + jitter
+        delay = min(cap, base ** attempt) + random.uniform(0.0, 0.75)
+        await asyncio.sleep(delay)
+
+    async def _recreate_exchange_safe(old_ex=None):
+        try:
+            if old_ex is not None:
+                await old_ex.close()
+        except Exception:
+            pass
+        return _make_ex_ws()
+
+    ex_ws = _make_ex_ws()
+
+    # Charger les marchés et choisir un symbole "léger" pour le keepalive
+    try:
+        await ex_ws.load_markets()
+    except Exception:
+        pass
+
+    if hasattr(ex_ws, "symbols") and ex_ws.symbols:
+        if "BTC/USDT:USDT" in ex_ws.symbols:
+            _KEEPALIVE_SYMBOL = "BTC/USDT:USDT"
+        elif "BTC/USDT" in ex_ws.symbols:
+            _KEEPALIVE_SYMBOL = "BTC/USDT"
+        else:
+            _KEEPALIVE_SYMBOL = next(iter(ex_ws.symbols))
+    else:
+        _KEEPALIVE_SYMBOL = "BTC/USDT:USDT"
+
+    # ------------ Loops robustes ------------
     async def watch_positions():
+        nonlocal ex_ws
+        attempt = 0
         while True:
             try:
                 await ex_ws.watch_positions()
+                attempt = 0  # reset backoff si ça vit
                 trader.sync_positions_with_exchange(ex_rest)
-            except Exception as e:
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                msg = str(e)
+                if any(k in msg for k in ("1006", "1001", "Connection closed", "abnormal closure")):
+                    try:
+                        notifier.tg_send("⚠️ WS positions fermé (1006/1001). Reconnexion…")
+                    except Exception:
+                        pass
+                    ex_ws = await _recreate_exchange_safe(ex_ws)
+                    attempt += 1
+                    await _backoff_sleep(attempt)
+                    continue
                 try:
-                    notifier.tg_send_error("WS positions", e)
+                    notifier.tg_send(f"⚠️ WS positions erreur réseau: {e}. Retry…")
                 except Exception:
                     pass
-                await asyncio.sleep(1)
+                attempt += 1
+                await _backoff_sleep(attempt)
+            except Exception as e:
+                try:
+                    notifier.tg_send(f"❌ WS positions exception: {e}. Restart loop…")
+                except Exception:
+                    pass
+                ex_ws = await _recreate_exchange_safe(ex_ws)
+                attempt = 0
+                await asyncio.sleep(1.0)
 
     async def watch_orders():
+        nonlocal ex_ws
+        attempt = 0
         while True:
             try:
                 await ex_ws.watch_orders()
+                attempt = 0
                 trader.sync_positions_with_exchange(ex_rest)
-            except Exception as e:
+            except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+                msg = str(e)
+                if any(k in msg for k in ("1006", "1001", "Connection closed", "abnormal closure")):
+                    try:
+                        notifier.tg_send("⚠️ WS orders fermé (1006/1001). Reconnexion…")
+                    except Exception:
+                        pass
+                    ex_ws = await _recreate_exchange_safe(ex_ws)
+                    attempt += 1
+                    await _backoff_sleep(attempt)
+                    continue
                 try:
-                    notifier.tg_send_error("WS orders", e)
+                    notifier.tg_send(f"⚠️ WS orders erreur réseau: {e}. Retry…")
                 except Exception:
                     pass
-                await asyncio.sleep(1)
+                attempt += 1
+                await _backoff_sleep(attempt)
+            except Exception as e:
+                try:
+                    notifier.tg_send(f"❌ WS orders exception: {e}. Restart loop…")
+                except Exception:
+                    pass
+                ex_ws = await _recreate_exchange_safe(ex_ws)
+                attempt = 0
+                await asyncio.sleep(1.0)
 
-    await asyncio.gather(watch_positions(), watch_orders())
+    # Keepalive public pour éviter certains NAT timeouts
+    async def watch_keepalive():
+        nonlocal ex_ws
+        attempt = 0
+        while True:
+            try:
+                await ex_ws.watch_ticker(_KEEPALIVE_SYMBOL)
+                attempt = 0
+            except Exception:
+                attempt += 1
+                await _backoff_sleep(attempt)
+
+    # Lancer les 3 boucles en parallèle
+    await asyncio.gather(
+        watch_positions(),
+        watch_orders(),
+        watch_keepalive(),
+    )
+
 
 def _telegram_command_handlers() -> Dict[str, Any]:
     """
@@ -536,7 +637,7 @@ def main():
     # Initialisation du mode de trading (PAPIER/RÉEL) — source de vérité : DB
     paper_mode_setting = database.get_setting('PAPER_TRADING_MODE', None)
     if not paper_mode_setting:
-        database.set_setting('PAPER_TRADING_MODE', 'false')  # défaut = PAPIER
+        database.set_setting('PAPER_TRADING_MODE', 'false')  # défaut = RÉEL
         paper_mode_setting = 'false'
 
     current_paper_mode = str(paper_mode_setting).lower() == 'true'
