@@ -389,6 +389,15 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     last = df.iloc[last_idx]
     base_idx = len(df) + last_idx
 
+    # Prix d'entrée utilisé pour le sizing/RR :
+    # - si enforce_next_bar: on entre à l'OPEN de la bougie courante (df.iloc[-1])
+    # - sinon: on entre à la CLOSE de la bougie "last" (réaction)
+    if enforce_next_bar and len(df) >= 1:
+        next_open = float(df.iloc[-1]['open'])
+        entry_px_for_rr = next_open
+    else:
+        entry_px_for_rr = float(last['close'])
+
     # --- Cherche la bougie CONTACT (≤ reaction_max_bars avant la réaction) ---
     contact, contact_idx = None, None
     for back in range(1, reaction_max_bars + 1):
@@ -432,7 +441,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # --- TENDANCE ---
     if is_above_mm80 and touched_bb20_low and inside_bb20:
         regime = "Tendance"
-        entry = float(last['close'])
+        entry = entry_px_for_rr
         sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
 
         target_band = float(last['bb80_up'])
@@ -452,7 +461,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     elif (not is_above_mm80) and touched_bb20_high and inside_bb20:
         regime = "Tendance"
-        entry = float(last['close'])
+        entry = entry_px_for_rr
         sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
 
         target_band = float(last['bb80_lo'])
@@ -493,7 +502,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
         if touched_ct_low and ct_reintegration_ok:
             regime = "Contre-tendance"
-            entry = float(last['close'])
+            entry = entry_px_for_rr
             sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
 
             target_band = float(last['bb20_mid'])
@@ -513,7 +522,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
         elif touched_ct_high and ct_reintegration_ok:
             regime = "Contre-tendance"
-            entry = float(last['close'])
+            entry = entry_px_for_rr
             sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
 
             target_band = float(last['bb20_mid'])
