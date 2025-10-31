@@ -108,17 +108,13 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
     w_up_r = w_up / rng
     w_dn_r = w_dn / rng
 
-    # 1) Rejet doji (trop petit)
-    if body_r < doji_max:
-        return False
-
-    # 2) Mèche côté signal « énorme » -> rejet
+    # (A) Rejet sécurité : mèche “énorme” du côté signal
     if side == 'buy' and w_dn_r > wick_huge_max:
         return False
     if side == 'sell' and w_up_r > wick_huge_max:
         return False
 
-    # 3) Pinbar (bicolore) — seuils DB (agnostique à la couleur)
+    # (B) Pinbar en priorité (avant test doji)
     if body_r <= pinbar_max_body:
         if side == 'buy':
             if w_dn_r >= simple_wick_min and w_up_r <= pinbar_opp_wick_max:
@@ -127,11 +123,15 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
             if w_up_r >= simple_wick_min and w_dn_r <= pinbar_opp_wick_max:
                 return True
 
-    # 4) Impulsion / marubozu relatif (grand corps)
+    # (C) Si pas pinbar, on peut éliminer les dojis trop faibles
+    if body_r < doji_max:
+        return False
+
+    # (D) Impulsion / marubozu relatif (grand corps)
     if body_r >= marubozu_min_body:
         return True
 
-    # 5) Cas DOCS dépendant de prev: GAP+IMPULSION ou DOUBLE MARUBOZU (sans contrainte de couleur)
+    # (E) Cas DOCS dépendant de prev: GAP+IMPULSION ou DOUBLE MARUBOZU
     if prev is not None:
         if _is_gap_impulse(prev, candle, side):
             return True
@@ -139,6 +139,7 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
             return True
 
     return False
+
 
 def _compute_body_wicks(candle: pd.Series) -> Tuple[float, float, float, float]:
     """
@@ -326,9 +327,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # --- Paramètres ---
     try:
-        reaction_max_bars = int(database.get_setting('REACTION_MAX_BARS', 2))
+        reaction_max_bars = int(database.get_setting('REACTION_MAX_BARS', 3))
     except Exception:
-        reaction_max_bars = 2
+        reaction_max_bars = 3
     try:
         tol_yellow = float(database.get_setting('YELLOW_BB_CONTACT_TOL_PCT', 0.001))
     except Exception:
