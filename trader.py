@@ -17,6 +17,12 @@ MIN_RR = float(os.getenv("MIN_RR", "3.0"))
 MM_DEAD_ZONE_PERCENT = float(os.getenv("MM_DEAD_ZONE_PERCENT", "0.1"))
 MIN_NOTIONAL_VALUE = float(os.getenv("MIN_NOTIONAL_VALUE", "5"))
 
+# --- Filtres de réaction (paternes) ---
+REACTION_WINDOW_BARS = 3
+PINBAR_MAX_BODY = 0.30      # ≤ 30% du range
+IMPULSE_MIN_BODY = 0.30     # ≥ 30% du range
+SIMPLE_WICK_MIN = 0.30      # ≥ 30% du range
+
 # ==============================================================================
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
 # ==============================================================================
@@ -152,7 +158,14 @@ def _compute_body_wicks(candle: pd.Series) -> Tuple[float, float, float, float]:
     w_up = max(0.0, h - max(o, c))
     w_dn = max(0.0, min(o, c) - l)
     return body / rng, w_up / rng, w_dn / rng, rng
-    
+
+def _body_ratio(candle: pd.Series) -> float:
+    o, c = float(candle['open']), float(candle['close'])
+    h, l = float(candle['high']), float(candle['low'])
+    rng = max(1e-12, h - l)
+    return abs(c - o) / rng
+
+
 def _is_gap_impulse(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     """
     Détection 'Gap + Impulsion' entre prev et cur (agnostique à la couleur).
@@ -313,6 +326,26 @@ def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lo
             return idx
     return None
 
+def _previous_wave_by_bb80(df: pd.DataFrame, idx: int, dead_zone_pct: float) -> Optional[str]:
+    """
+    Détermine le sens de la VAGUE PRÉCÉDENTE uniquement via CLOSE vs bb80_mid,
+    en sortant de la dead-zone autour de bb80_mid.
+    Retourne 'up' | 'down' | None.
+    """
+    if df is None or len(df) == 0:
+        return None
+    i = max(0, min(idx, len(df) - 1))
+    for k in range(i - 1, -1, -1):
+        try:
+            close_k = float(df.iloc[k]['close'])
+            mid_k   = float(df.iloc[k]['bb80_mid'])
+            dz_k    = mid_k * (dead_zone_pct / 100.0)
+        except Exception:
+            continue
+        if abs(close_k - mid_k) >= dz_k:
+            return 'up' if close_k > mid_k else 'down'
+    return None
+
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """(FINAL) Détection avec offsets hybrides:
@@ -416,30 +449,92 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # --- Sens via la bougie de réaction ---
     side_guess = 'buy' if float(last['close']) > float(last['open']) else 'sell'
 
-    # --- Filtre neutralité MM80 ---
-    dead_zone = float(last['bb80_mid']) * (MM_DEAD_ZONE_PERCENT / 100.0)
-    if abs(float(last['close']) - float(last['bb80_mid'])) < dead_zone:
-        return None
+    # --- Gestion neutralité MM80 avec vague précédente (BB80 only) ---
+    bb80_mid_last = float(last['bb80_mid'])
+    dead_zone = bb80_mid_last * (MM_DEAD_ZONE_PERCENT / 100.0)
+    in_dead_zone = abs(float(last['close']) - bb80_mid_last) < dead_zone
 
-    # --- Réintégration par CLÔTURE à la réaction ---
-    inside_bb20 = _inside(float(last['close']), float(last['bb20_lo']), float(last['bb20_up']))
-    inside_bb80 = _inside(float(last['close']), float(last['bb80_lo']), float(last['bb80_up']))
-    ct_reintegration_ok = inside_bb20 and (inside_bb80 if ct_reintegrate_both else True)
+    prev_wave = None
+    if in_dead_zone:
+        prev_wave = _previous_wave_by_bb80(df, base_idx, MM_DEAD_ZONE_PERCENT)
 
-    # --- Réaction du prix: pattern valide requis ---
-    if not is_valid_reaction_candle(last, side_guess, prev=contact):
+
+    # --- Fenêtre 3 barres incluant la bougie de CONTACT ---
+    # contact = c1, puis réactions possibles: c2, c3 (si dispo)
+    c1 = contact
+    c2 = df.iloc[contact_idx + 1] if (contact_idx + 1) < len(df) else None
+    c3 = df.iloc[contact_idx + 2] if (contact_idx + 2) < len(df) else None
+
+    # Détermination finale du sens MM80 (après pat_ok / avant tests Tendance/CT)
+    if in_dead_zone and prev_wave in ('up', 'down'):
+        # en hésitation, on tranche par la vague précédente
+        is_above_mm80 = (prev_wave == 'up')
+    else:
+        is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
+    
+    def _inside_both(candle):
+        return _inside(float(candle['close']), float(candle['bb80_lo']), float(candle['bb80_up'])) and \
+               _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
+
+    def _inside_bb20_only(candle):
+        return _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
+
+    # (1) PINBAR sur la bougie de contact (corps ≤ 30%) + CLÔTURE à l’intérieur de BB80 ET BB20
+    pinbar_contact_ok = False
+    try:
+        if _body_ratio(c1) <= PINBAR_MAX_BODY and _inside_both(c1):
+            pinbar_contact_ok = True
+    except Exception:
+        pinbar_contact_ok = False
+
+    # (2) Réintégration dans la FENÊTRE (barres 2–3) selon le régime
+    #     - CT  : inside BB80 ET BB20 (sur c2 OU c3) si ct_reintegrate_both=True
+    #             sinon inside BB20 suffit
+    #     - Tend: inside BB20 (sur c2 OU c3)
+    inside_both_seen = False
+    inside_bb20_seen = False
+
+    for cx in (c2, c3):
+        if cx is None:
+            continue
+        if _inside_both(cx):
+            inside_both_seen = True
+            inside_bb20_seen = True  # inside_both ⇒ inside_bb20
+        elif _inside_bb20_only(cx):
+            inside_bb20_seen = True
+
+    # Tendance : réintégration BB20 suffit
+    trend_reintegration_ok = inside_bb20_seen
+
+    # CT : selon le toggle
+    ct_reintegration_ok = inside_both_seen if ct_reintegrate_both else inside_bb20_seen
+
+
+    # (3) Pattern valide (1→4) dans la fenêtre
+    pat_ok = False
+    for cx, pv in ((c2, c1), (c3, c2)):
+        if cx is None:
+            continue
+        if is_valid_reaction_candle(cx, side_guess, prev=pv):
+            pat_ok = True
+            break
+    if pinbar_contact_ok:
+        pat_ok = True
+
+    # (4) Disqualifiants : pas de pattern validé après 3 barres ⇒ on annule
+    if not pat_ok:
         return None
 
     # ATR courant (pour offset hybride TP)
     last_atr = float(last.get('atr', contact.get('atr', 0.0)))
 
     signal = None
-    is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
+
     touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_up'], "sell")
 
     # --- TENDANCE ---
-    if is_above_mm80 and touched_bb20_low and inside_bb20:
+    if is_above_mm80 and touched_bb20_low and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
         sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
@@ -459,7 +554,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    elif (not is_above_mm80) and touched_bb20_high and inside_bb20:
+    elif (not is_above_mm80) and touched_bb20_high and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
         sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
@@ -772,13 +867,14 @@ def _bitget_tick_size(market: dict) -> float:
     return 0.0001
 
 def _prepare_validated_tp(exchange, symbol: str, side: str, raw_tp: float) -> float:
-    """
-    Utilitaire à appeler AVANT la création de l'ordre TP.
-    Récupère le prix courant + tick_size, puis applique _validate_tp_for_side.
-    """
-    ticker = exchange.fetch_ticker(symbol)
-    current_price = float(ticker.get("last") or ticker.get("close") or ticker["info"].get("last", 0))
-    market = exchange.market(symbol)
+    ticker = exchange.fetch_ticker(symbol) or {}
+    current_price = float(
+        ticker.get("last") or
+        ticker.get("close") or
+        (ticker.get("info") or {}).get("last", 0) or
+        0
+    )
+    market = exchange.market(symbol) or {}
     tick_size = _bitget_tick_size(market)
     return _validate_tp_for_side(side, float(raw_tp), current_price, tick_size)
 
@@ -1478,7 +1574,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     except Exception as e:
                         if '22001' not in str(e):
                             raise
-                    fees_bps = float(database.get_setting('FEES_BPS', 5))
+                    fees_bps = float(database.get_setting('FEES_BPS', 100))
                     fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                     new_sl_be = pos['entry_price'] * fee_factor
 
@@ -1513,7 +1609,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                         except Exception as e:
                             if '22001' not in str(e):
                                 raise
-                        fees_bps = float(database.get_setting('FEES_BPS', 5))
+                        fees_bps = float(database.get_setting('FEES_BPS', 100))
                         fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
                         new_sl_be = float(pos['entry_price']) * fee_factor
 
