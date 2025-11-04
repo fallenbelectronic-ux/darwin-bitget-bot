@@ -2,48 +2,77 @@
 from typing import List, Dict, Any, Optional
 from tabulate import tabulate
 import numpy as np
+import math 
 
 def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Calcule les statistiques de performance avancées à partir d'une liste de trades."""
+    """Calcule les statistiques de performance à partir d'une liste de trades."""
     total_trades = len(trades)
     if total_trades < 1:
         return {"total_trades": 0}
 
-    pnls = np.array([t['pnl'] for t in trades if t['pnl'] is not None])
-    pnl_percents = np.array([t['pnl_percent'] for t in trades if t['pnl_percent'] is not None])
-    
-    if len(pnls) == 0:
+    # Récupération des séries (inclut les 0 pour bien traiter les BE)
+    pnls = np.array([float(t.get('pnl', 0.0)) for t in trades if t.get('pnl') is not None], dtype=float)
+    pnl_percents = np.array([float(t.get('pnl_percent', 0.0)) for t in trades if t.get('pnl_percent') is not None], dtype=float)
+
+    if pnls.size == 0:
         return {"total_trades": 0, "nb_wins": 0, "nb_losses": 0}
 
-    wins = pnls[pnls > 0]
-    losses = pnls[pnls < 0]
-    
-    nb_wins = len(wins)
-    nb_losses = len(losses)
-    
-    total_pnl = np.sum(pnls)
-    gross_profit = np.sum(wins)
-    gross_loss = abs(np.sum(losses))
-    
-    win_rate = (nb_wins / total_trades) * 100
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-    avg_trade_pnl_percent = np.mean(pnl_percents) if len(pnl_percents) > 0 else 0
-    sharpe_ratio = 0.0 
-    if np.std(pnl_percents) > 0:
-        sharpe_ratio = (np.mean(pnl_percents) / np.std(pnl_percents)) * np.sqrt(365*24)
+    effective_trades = int(pnls.size)
 
-    equity_curve = np.cumsum(pnls)
-    peak = np.maximum.accumulate(equity_curve)
-    drawdowns = peak - equity_curve
-    max_drawdown_value = np.max(drawdowns) if len(drawdowns) > 0 else 0
-    total_peak = np.max(peak) if len(peak) > 0 else 0
-    max_drawdown_percent = (max_drawdown_value / total_peak) * 100 if total_peak > 0 else 0
+    wins = pnls[pnls > 0.0]
+    losses = pnls[pnls < 0.0]
+    # breakeven = pnls[pnls == 0.0]
+
+    nb_wins = int(wins.size)
+    nb_losses = int(losses.size)
+
+    total_pnl = float(np.sum(pnls))
+    gross_profit = float(np.sum(wins)) if wins.size else 0.0
+    gross_loss = abs(float(np.sum(losses))) if losses.size else 0.0  # positif
+
+    # Winrate (les BE restent dans le dénominateur des trades effectivement renseignés)
+    win_rate = (nb_wins / effective_trades) * 100.0 if effective_trades else 0.0
+
+    # Profit Factor robuste
+    if gross_profit == 0.0 and gross_loss == 0.0:
+        profit_factor = None                 # indéfini (0/0) => affichage "—"
+    elif gross_loss == 0.0 and gross_profit > 0.0:
+        profit_factor = math.inf             # aucune perte mais du profit => ∞
+    else:
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0.0 else 0.0
+
+    # Gain moyen par trade (%)
+    avg_trade_pnl_percent = float(np.mean(pnl_percents)) if pnl_percents.size > 0 else 0.0
+
+    # Sharpe approx par trade: mean/std * sqrt(n). Protège variance nulle et n<2.
+    if pnl_percents.size > 1:
+        sigma = float(np.std(pnl_percents, ddof=1))
+        if sigma > 0.0:
+            mu = float(np.mean(pnl_percents))
+            sharpe_ratio = (mu / sigma) * math.sqrt(pnl_percents.size)
+        else:
+            sharpe_ratio = 0.0
+    else:
+        sharpe_ratio = 0.0
+
+    # Max Drawdown (%) sur l'equity cumulée (en USDT), normalisée par le pic courant
+    equity_curve = np.cumsum(pnls).astype(float)
+    running_max = np.maximum.accumulate(equity_curve)
+    drawdown = equity_curve - running_max  # <= 0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dd_pct = np.where(running_max != 0.0, drawdown / running_max, 0.0)
+    max_drawdown_percent = float(abs(np.min(dd_pct)) * 100.0) if dd_pct.size > 0 else 0.0
 
     return {
-        "total_trades": total_trades, "nb_wins": nb_wins, "nb_losses": nb_losses,
-        "win_rate": win_rate, "total_pnl": total_pnl, "profit_factor": profit_factor,
-        "avg_trade_pnl_percent": avg_trade_pnl_percent, "sharpe_ratio": sharpe_ratio,
-        "max_drawdown_percent": max_drawdown_percent
+        "total_trades": total_trades,
+        "nb_wins": nb_wins,
+        "nb_losses": nb_losses,
+        "win_rate": round(win_rate, 2),
+        "total_pnl": round(total_pnl, 2),
+        "profit_factor": profit_factor,  # laissé tel quel pour être formaté à l'affichage
+        "avg_trade_pnl_percent": round(avg_trade_pnl_percent, 2),
+        "sharpe_ratio": round(sharpe_ratio, 2),
+        "max_drawdown_percent": round(max_drawdown_percent, 2),
     }
 
 def _compute_upnl_rpnl(pos: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
@@ -145,8 +174,15 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
     if stats.get("total_trades", 0) < 1:
         return header + "\n- Pas assez de données de trades pour générer un rapport."
 
-    pf_str = "Infini" if stats.get('profit_factor', 0) == float('inf') else f"{stats.get('profit_factor', 0):.2f}"
-    
+    # >>> PF: formatage robuste (— pour indéfini, ∞ si aucune perte)
+    pf = stats.get('profit_factor', None)
+    if pf is None:
+        pf_str = "—"
+    elif pf == float('inf') or pf == math.inf:
+        pf_str = "∞"
+    else:
+        pf_str = f"{pf:.2f}"
+
     headers = ["Statistique", "Valeur"]
     table_data = [
         ["Trades Total", f"{stats.get('total_trades', 0)}"],
