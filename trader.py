@@ -1,4 +1,4 @@
-# Fichier: trader.py
+    # Fichier: trader.py
 import os
 import time
 import ccxt
@@ -22,6 +22,12 @@ REACTION_WINDOW_BARS = 3
 PINBAR_MAX_BODY = 0.30      # ≤ 30% du range
 IMPULSE_MIN_BODY = 0.30     # ≥ 30% du range
 SIMPLE_WICK_MIN = 0.30      # ≥ 30% du range
+
+# --- Frais & BE ---
+FEE_ENTRY_PCT   = float(os.getenv("FEE_ENTRY_PCT", "0.0010"))  # 0.1% typique taker
+FEE_EXIT_PCT    = float(os.getenv("FEE_EXIT_PCT",  "0.0010"))  # 0.1% typique taker
+BE_BUFFER_PCT   = float(os.getenv("BE_BUFFER_PCT", "0.0020"))  # +0.2% au-dessus du VRAI BE
+BE_BUFFER_USDT  = float(os.getenv("BE_BUFFER_USDT","0.0"))     # buffer absolu optionnel (USDT). Laisse 0 si tu n’en veux pas.
 
 # ==============================================================================
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
@@ -1077,7 +1083,7 @@ def get_portfolio_equity_usdt(exchange) -> float:
 
     return 0.0
 
-def _cap_qty_for_margin_and_filters(exchange, symbol: str, side: str, qty: float, price: float) -> tuple[float, dict]:
+def _cap_qty_for_margin_and_filters(exchange, symbol: str, side: str, qty: float, price: float) -> Tuple[float, Dict[str, Any]]:
     """
     (MIS À JOUR) Borne la quantité par la marge disponible et respecte les filtres du marché.
     - Utilise _fetch_balance_safe() (évite l’erreur Bitget 'productType cannot be empty').
@@ -1159,7 +1165,7 @@ def _cap_qty_for_margin_and_filters(exchange, symbol: str, side: str, qty: float
         return float(qty), meta
 
 
-def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, price: float | None = None, params: Optional[Dict[str, Any]] = None):
+def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, price: Optional[float] = None, params: Optional[Dict[str, Any]] = None):
     """
     (MODIFIÉ) Envoi d'ordre avec garde-fous:
       - Cap par marge + respect min_qty/step/min_notional
@@ -1233,7 +1239,7 @@ def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, p
         raise
 
 
-def adjust_tp_for_bb_offset(raw_tp: float, side: str, atr: float = 0.0, ref_price: float | None = None) -> float:
+def adjust_tp_for_bb_offset(raw_tp: float, side: str, atr: float = 0.0, ref_price: Optional[float] = None) -> float:
     """
     (MISE À JOUR) Offset hybride pour le TP : max(pourcentage, ATR*k).
     - ref_price: la borne visée (BB80_up/lo ou BB20_mid) pour convertir ATR en %.
@@ -1260,7 +1266,7 @@ def adjust_tp_for_bb_offset(raw_tp: float, side: str, atr: float = 0.0, ref_pric
     return float(raw_tp)
 
 
-def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: float | None = None) -> float:
+def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: Optional[float] = None) -> float:
     """
     (MISE À JOUR) Offset hybride pour le SL : max(pourcentage, ATR*k).
     - ref_price: l’ancre (high/low de la bougie d’ancrage) pour convertir ATR en %.
@@ -1483,6 +1489,56 @@ def get_tp_offset_pct() -> float:
     if v > 0.1:     v = 0.1
     return v
 
+def compute_fee_safe_be_price(
+    entry: float,
+    side: str,                 # 'long' | 'short'
+    qty: float,                # taille position (en "coin" pour linéaires USDT)
+    fee_in_pct: float,
+    fee_out_pct: float,
+    buffer_pct: float = 0.0,   # petit surplus pour finir > 0
+    buffer_usdt: float = 0.0   # OU buffer absolu sur la position
+) -> float:
+    """
+    Retourne le prix de stop 'break-even' qui couvre:
+      - PnL +/- (exit - entry) * qty
+      - frais d'entrée: fee_in_pct * entry * qty
+      - frais de sortie: fee_out_pct * exit  * qty
+      - buffer: soit % de notional d'entrée (buffer_pct * entry * qty), soit absolu USDT (buffer_usdt)
+    Formules (linéaire USDT):
+      Long  : exit >= (E*(1+fin) + b_per_qty)/(1 - fout)
+      Short : exit <= (E*(1-fin) - b_per_qty)/(1 + fout)
+    """
+    side = (side or "").lower()
+    E = float(entry)
+    Q = max(0.0, float(qty))
+    fin = max(0.0, float(fee_in_pct))
+    fout = max(0.0, float(fee_out_pct))
+
+    # buffer exprimé par "unité de qty"
+    b_per_qty = float(buffer_pct) * E
+    if buffer_usdt and Q > 0:
+        b_per_qty += float(buffer_usdt) / Q
+
+    if side == 'long':
+        # exit >= (E*(1+fin) + b_per_qty) / (1 - fout)
+        denom = (1.0 - fout)
+        if denom <= 0:
+            # sécurité extrême (frais erronés) : fallback sans fout
+            return E * (1.0 + fin) + b_per_qty
+        return (E * (1.0 + fin) + b_per_qty) / denom
+
+    elif side == 'short':
+        # exit <= (E*(1-fin) - b_per_qty) / (1 + fout)
+        denom = (1.0 + fout)
+        if denom <= 0:
+            # sécurité extrême : fallback sans fout
+            return E * (1.0 - fin) - b_per_qty
+        return (E * (1.0 - fin) - b_per_qty) / denom
+
+    else:
+        return E  # si side inconnu, ne bouge pas
+
+
 def manage_open_positions(ex: ccxt.Exchange):
     """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/CT, trailing après BE.
        Tous les ordres sont MARKET reduceOnly (triggers) + precision quantité + sécurisation modes."""
@@ -1574,14 +1630,21 @@ def manage_open_positions(ex: ccxt.Exchange):
                     except Exception as e:
                         if '22001' not in str(e):
                             raise
-                    fees_bps = float(database.get_setting('FEES_BPS', 100))
-                    fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
-                    new_sl_be = pos['entry_price'] * fee_factor
-
+                    be_side = 'long' if is_long else 'short'
+                    new_sl_be = compute_fee_safe_be_price(
+                        entry=float(pos['entry_price']),
+                        side=be_side,
+                        qty=float(remaining_qty),
+                        fee_in_pct=FEE_ENTRY_PCT,
+                        fee_out_pct=FEE_EXIT_PCT,
+                        buffer_pct=BE_BUFFER_PCT,
+                        buffer_usdt=BE_BUFFER_USDT
+                    )
                     try:
-                        remaining_qty = float(ex.amount_to_precision(symbol, remaining_qty))
+                        new_sl_be = float(ex.price_to_precision(symbol, new_sl_be))
                     except Exception:
                         pass
+
                     if remaining_qty > 0:
                         ex.create_order(symbol, 'market', close_side, remaining_qty, price=None,
                                         params={**common_params, 'stopLossPrice': float(new_sl_be), 'triggerType': 'mark'})
@@ -1608,10 +1671,8 @@ def manage_open_positions(ex: ccxt.Exchange):
                             ex.cancel_all_orders(symbol)
                         except Exception as e:
                             if '22001' not in str(e):
-                                raise
-                        fees_bps = float(database.get_setting('FEES_BPS', 100))
-                        fee_factor = (1.0 - fees_bps / 10000.0) if is_long else (1.0 + fees_bps / 10000.0)
-                        new_sl_be = float(pos['entry_price']) * fee_factor
+                                raise        
+                        be_side = 'long' if is_long else 'short'
 
                         qty = float(pos['quantity'])
                         try:
@@ -1620,11 +1681,27 @@ def manage_open_positions(ex: ccxt.Exchange):
                             pass
                         if qty <= 0:
                             continue
-
-                        ex.create_order(symbol, 'market', close_side, qty, price=None,
-                                        params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'})
-                        ex.create_order(symbol, 'market', close_side, qty, price=None,
-                                        params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'})
+                        
+                        new_sl_be = compute_fee_safe_be_price(
+                            entry=float(pos['entry_price']),
+                            side=be_side,
+                            qty=qty,
+                            fee_in_pct=FEE_ENTRY_PCT,
+                            fee_out_pct=FEE_EXIT_PCT,
+                            buffer_pct=BE_BUFFER_PCT,
+                            buffer_usdt=BE_BUFFER_USDT
+                        )
+                        try:
+                            new_sl_be = float(ex.price_to_precision(symbol, new_sl_be))
+                        except Exception:
+                            pass
+        
+                        ex.create_order(
+                            symbol, 'market', close_side, qty, price=None,
+                            params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'})
+                        ex.create_order(
+                            symbol, 'market', close_side, qty, price=None,
+                            params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'})
 
                         database.update_trade_to_breakeven(pos['id'], qty, new_sl_be)
                         notifier.send_breakeven_notification(symbol, 0.0, qty)
