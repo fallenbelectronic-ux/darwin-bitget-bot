@@ -904,6 +904,36 @@ def _prepare_validated_tp(exchange, symbol: str, side: str, raw_tp: float) -> fl
     market = exchange.market(symbol) or {}
     tick_size = _bitget_tick_size(market)
     return _validate_tp_for_side(side, float(raw_tp), current_price, tick_size)
+    
+# --- à placer près de _prepare_validated_tp / _bitget_tick_size ---
+
+def _current_mark_price(exchange, symbol: str) -> float:
+    """Renvoie un proxy du 'current price' pertinent pour les triggers mark."""
+    t = exchange.fetch_ticker(symbol) or {}
+    info = t.get("info") or {}
+    # Plusieurs clés possibles selon ccxt/route
+    for k in ("markPrice", "mark", "indexPrice", "last", "close", "bid", "ask"):
+        v = info.get(k) if k in info else t.get(k)
+        if v:
+            try: return float(v)
+            except Exception: pass
+    return float(t.get("last") or t.get("close") or 0.0)
+
+def _validate_sl_for_side(side: str, sl_price: float, current_mark: float, tick_size: float) -> float:
+    """
+    Bitget: 
+      - short  : SL > current_mark
+      - long   : SL < current_mark
+    On pousse d'au moins 2 ticks pour être safe vs micro-écarts.
+    """
+    if tick_size <= 0: tick_size = 0.0001
+    if str(side).lower() in ("sell", "short"):
+        if sl_price <= current_mark:
+            sl_price = current_mark + 2.0 * tick_size
+    else:
+        if sl_price >= current_mark:
+            sl_price = current_mark - 2.0 * tick_size
+    return sl_price
 
 def _extract_tp_sl_from_orders(orders: list) -> Tuple[Optional[float], Optional[float]]:
     """Retourne (tp_price, sl_price) détectés dans les ordres ouverts."""
@@ -1405,9 +1435,16 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
 
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
-    """Tente d'exécuter un trade avec toutes les vérifications de sécurité + cap marge anti-40762."""
+    """Exécute un trade avec sécurisations Bitget:
+       - Sync optionnelle avant exécution
+       - Validation SL/TP vs règles Bitget (TP côté opposé au prix courant, SL côté mark)
+       - Gap de sécurité vs prix d’entrée
+       - Cap de la taille par marge/filters marché
+       - Ordre d’entrée MARKET + SL/TP MARKET reduceOnly (trigger mark)
+    """
     _ensure_bitget_mix_options(ex)
-    is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+
+    is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
 
     # --- Sync/guard optionnels avant toute exécution ---
@@ -1417,175 +1454,210 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     except Exception:
         pass
 
-    # … (aucune modification dans les vérifications précédentes) …
-
+    # --- Guards de base ---
     if len(database.get_open_positions()) >= max_pos:
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
     if database.is_position_open(symbol):
         return False, "Rejeté: Position déjà ouverte (DB)."
-    
+
     balance = get_usdt_balance(ex)
     if balance is None or balance <= 10:
         return False, f"Rejeté: Solde insuffisant ({balance or 0:.2f} USDT) ou erreur API."
-    
-    quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, signal['sl'])
+
+    # --- Prépare SL / TP issus du signal ---
+    side = (signal.get('side') or '').lower()  # 'buy' | 'sell'
+    is_long = (side == 'buy')
+    price_ref = float(entry_price)
+
+    sl = float(signal['sl'])
+    tp = float(signal['tp'])
+
+    # Gap de sécurité vs prix d’entrée
+    try:
+        gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
+    except Exception:
+        gap_pct = 0.0003
+    if is_long:
+        if sl >= price_ref:
+            sl = price_ref * (1.0 - gap_pct)
+        if tp <= price_ref:
+            tp = price_ref * (1.0 + gap_pct)
+    else:
+        if sl <= price_ref:
+            sl = price_ref * (1.0 + gap_pct)
+        if tp >= price_ref:
+            tp = price_ref * (1.0 - gap_pct)
+
+    # Précisions marché
+    market = ex.market(symbol) or {}
+    tick_size = _bitget_tick_size(market)
+
+    # Valide SL côté 'mark' (Bitget)
+    mark_now = _current_mark_price(ex, symbol)
+    sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
+
+    # Valide TP selon règle Bitget: short → TP < current ; long → TP > current
+    try:
+        side_for_tp = ('buy' if is_long else 'sell')  # règle _validate_tp_for_side
+        tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(tp))
+    except Exception:
+        # fallback minimal si validation échoue
+        t = ex.fetch_ticker(symbol) or {}
+        last_px = float(t.get("last") or t.get("close") or price_ref)
+        if is_long and tp <= last_px:
+            tp = last_px * (1.0 + gap_pct)
+        if (not is_long) and tp >= last_px:
+            tp = last_px * (1.0 - gap_pct)
+
+    # Ajuste quantités avec SL final
+    quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, price_ref, sl)
     if quantity <= 0:
         return False, f"Rejeté: Quantité calculée nulle ({quantity})."
-        
-    notional_value = quantity * entry_price
+
+    # Cap par marge + filtres marché
+    ref_price = price_ref
+    if not ref_price:
+        try:
+            t = ex.fetch_ticker(symbol) or {}
+            ref_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
+        except Exception:
+            ref_price = price_ref
+
+    capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, abs(float(quantity)), ref_price or price_ref)
+    if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
+        try:
+            need_notional = (abs(float(quantity)) * (ref_price or price_ref or 0.0))
+            max_notional = meta.get("max_notional")
+            txt = (
+                f"❌ <b>Ordre annulé</b> (solde insuffisant)\n"
+                f"• {symbol} {side.upper()} MARKET\n"
+                f"• Notional requise: <code>{need_notional:.2f} USDT</code>\n"
+                f"• Max possible (marge): <code>{(max_notional or 0.0):.2f} USDT</code>\n"
+                f"• Levier: <code>{meta.get('leverage')}</code>\n"
+                f"• Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>\n"
+                f"• Filtres marché: min_qty=<code>{meta.get('min_qty')}</code>, "
+                f"min_notional=<code>{meta.get('min_notional')}</code>\n"
+            )
+            notifier.tg_send(txt)
+        except Exception:
+            pass
+        return False, "Ordre annulé: solde insuffisant."
+
+    if meta.get("reason") == "CAPPED_BY_MARGIN" and capped_qty > 0:
+        try:
+            reduced_pct = (1.0 - (capped_qty / max(abs(float(quantity)), 1e-12))) * 100.0
+            notifier.tg_send(
+                f"⚠️ Taille réduite par marge\n"
+                f"• {symbol} {side.upper()} MARKET\n"
+                f"• Demandée: <code>{quantity}</code> → Envoyée: <code>{capped_qty}</code> "
+                f"(-{reduced_pct:.2f}%)\n"
+                f"• Levier: <code>{meta.get('leverage')}</code> | Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>"
+            )
+        except Exception:
+            pass
+
+    notional_value = capped_qty * price_ref
     if notional_value < MIN_NOTIONAL_VALUE:
         return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
-    
-    final_entry_price = entry_price
+
+    # Arrondis de précision
+    try:
+        sl = float(ex.price_to_precision(symbol, sl))
+        tp = float(ex.price_to_precision(symbol, tp))
+        quantity = float(ex.amount_to_precision(symbol, capped_qty))
+    except Exception:
+        quantity = float(capped_qty)
+
+    if quantity <= 0:
+        return False, "Rejeté: quantité finale arrondie à 0."
+
+    final_entry_price = price_ref
+    management_strategy = "NORMAL"
+    if str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper() == 'SPLIT':
+        management_strategy = "SPLIT"
+
+    common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+
+    # --- Envoi ordres ---
     if not is_paper_mode:
         try:
-            # 2) S’assurer du contexte (avant ordres/lectures)
-            ex.set_leverage(LEVERAGE, symbol)
-            try: ex.set_margin_mode('cross', symbol)
-            except Exception: pass
-            try: ex.set_position_mode(False, symbol)  # False => oneway
-            except Exception: pass
-
-            common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-
-            # Garde-fou SL/TP vs prix d'entrée
-            gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
-            price_ref = float(entry_price)
-            side = signal['side']
-
-            sl = float(signal['sl'])
-            tp = float(signal['tp'])
-
-            if side == 'sell':  # SHORT
-                if sl <= price_ref: sl = price_ref * (1.0 + gap_pct)
-                if tp >= price_ref: tp = price_ref * (1.0 - gap_pct)
-            else:  # BUY (LONG)
-                if sl >= price_ref: sl = price_ref * (1.0 - gap_pct)
-                if tp <= price_ref: tp = price_ref * (1.0 + gap_pct)
-
-            # Précision prix
+            # Contexte symbole
             try:
-                sl = float(ex.price_to_precision(symbol, sl))
-                tp = float(ex.price_to_precision(symbol, tp))
+                ex.set_leverage(LEVERAGE, symbol)
+                try: ex.set_margin_mode('cross', symbol)
+                except Exception: pass
+                try: ex.set_position_mode(False, symbol)  # oneway
+                except Exception: pass
             except Exception:
                 pass
 
-            signal['sl'] = sl
-            signal['tp'] = tp
-
-            # Recalcule taille avec SL ajusté
-            qty_adj = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, entry_price, sl)
-            quantity = min(quantity, qty_adj)
-            if quantity <= 0:
-                return False, "Rejeté: quantité recalculée à 0."
-
-            # --- 🔒 CAP marge anti-40762 (avec ticker si besoin pour ref_price) ---
-            ref_price = price_ref
-            if not ref_price:
-                try:
-                    t = ex.fetch_ticker(symbol) or {}
-                    ref_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
-                except Exception:
-                    ref_price = price_ref
-
-            capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, abs(float(quantity)), ref_price or price_ref)
-
-            # Insuffisant après cap → on annule proprement (notif déjà claire ici)
-            if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
-                try:
-                    need_notional = (abs(float(quantity)) * (ref_price or price_ref or 0.0))
-                    max_notional = meta.get("max_notional")
-                    txt = (
-                        f"❌ <b>Ordre annulé</b> (solde insuffisant)\n"
-                        f"• {symbol} {side.upper()} MARKET\n"
-                        f"• Notional requise: <code>{need_notional:.2f} USDT</code>\n"
-                        f"• Max possible (marge): <code>{(max_notional or 0.0):.2f} USDT</code>\n"
-                        f"• Levier: <code>{meta.get('leverage')}</code>\n"
-                        f"• Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>\n"
-                        f"• Filtres marché: min_qty=<code>{meta.get('min_qty')}</code>, "
-                        f"min_notional=<code>{meta.get('min_notional')}</code>\n"
-                    )
-                    notifier.tg_send(txt)
-                except Exception:
-                    pass
-                return False, "Ordre annulé: solde insuffisant."
-
-            # Taille réduite → on informe (transparence)
-            if meta.get("reason") == "CAPPED_BY_MARGIN" and capped_qty > 0:
-                try:
-                    reduced_pct = (1.0 - (capped_qty / max(abs(float(quantity)), 1e-12))) * 100.0
-                    notifier.tg_send(
-                        f"⚠️ Taille réduite par marge\n"
-                        f"• {symbol} {side.upper()} MARKET\n"
-                        f"• Demandée: <code>{quantity}</code> → Envoyée: <code>{capped_qty}</code> "
-                        f"(-{reduced_pct:.2f}%)\n"
-                        f"• Levier: <code>{meta.get('leverage')}</code> | Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>"
-                    )
-                except Exception:
-                    pass
-
-            # Recheck notional avec qty cappée
-            notional_value = capped_qty * price_ref
-            if notional_value < MIN_NOTIONAL_VALUE:
-                return False, f"Rejeté: Notional après cap ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
-
-            # Arrondi quantité finale
-            try:
-                quantity = float(ex.amount_to_precision(symbol, capped_qty))
-            except Exception:
-                quantity = float(capped_qty)
-            if quantity <= 0:
-                return False, "Rejeté: quantité finale arrondie à 0."
-
-            # 1) Entrée au marché
-            order = ex.create_market_order(symbol, signal['side'], quantity, params=common_params)
-
-            # 2) SL/TP triggers en MARKET, reduceOnly
-            close_side = 'sell' if signal['side'] == 'buy' else 'buy'
-            ex.create_order(symbol, 'market', close_side, quantity, price=None,
-                            params={**common_params, 'stopLossPrice': sl, 'reduceOnly': True, 'triggerType': 'mark'})
-            ex.create_order(symbol, 'market', close_side, quantity, price=None,
-                            params={**common_params, 'takeProfitPrice': tp, 'reduceOnly': True, 'triggerType': 'mark'})
-
+            # Entrée MARKET
+            order = ex.create_market_order(symbol, side, quantity, params=common_params)
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
+            # Place SL/TP (close side)
+            close_side = 'sell' if is_long else 'buy'
+
+            # Re-valide SL juste avant pose (mark peut avoir changé)
+            mark_now = _current_mark_price(ex, symbol)
+            sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
+
+            ex.create_order(
+                symbol, 'market', close_side, quantity, price=None,
+                params={**common_params, 'stopLossPrice': float(sl), 'reduceOnly': True, 'triggerType': 'mark'}
+            )
+            ex.create_order(
+                symbol, 'market', close_side, quantity, price=None,
+                params={**common_params, 'takeProfitPrice': float(tp), 'reduceOnly': True, 'triggerType': 'mark'}
+            )
+
         except Exception as e:
+            # Tentative de réduire si entrée partielle
             try:
-                close_side = 'sell' if signal['side'] == 'buy' else 'buy'
-                # on tente de réduire ce qui a pu s’ouvrir
+                close_side = 'sell' if is_long else 'buy'
                 ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
             return False, f"Erreur d'exécution: {e}"
 
+    # --- DB + Notifs ---
     signal['entry'] = final_entry_price
-    
-    management_strategy = "NORMAL"
-    if database.get_setting('STRATEGY_MODE', 'NORMAL').upper() == 'SPLIT':
-        management_strategy = "SPLIT"
-        
+    signal['sl'] = float(sl)
+    signal['tp'] = float(tp)
+
     database.create_trade(
         symbol=symbol,
-        side=signal['side'],
-        regime=signal['regime'],
+        side=side,
+        regime=signal.get('regime', 'Tendance'),
         entry_price=final_entry_price,
-        sl_price=signal['sl'],
-        tp_price=signal['tp'],
-        quantity=quantity,
+        sl_price=float(sl),
+        tp_price=float(tp),
+        quantity=float(quantity),
         risk_percent=RISK_PER_TRADE_PERCENT,
         management_strategy=management_strategy,
-        entry_atr=signal.get('entry_atr', 0.0) or 0.0,
-        entry_rsi=signal.get('entry_rsi', 0.0) or 0.0,
+        entry_atr=float(signal.get('entry_atr', 0.0) or 0.0),
+        entry_rsi=float(signal.get('entry_rsi', 0.0) or 0.0),
     )
-    
-    chart_image = charting.generate_trade_chart(symbol, df, signal)
+
+    try:
+        chart_image = charting.generate_trade_chart(symbol, df, signal)
+    except Exception:
+        chart_image = None
+
     mode_text = "PAPIER" if is_paper_mode else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
-    notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
-    
-    return True,"Position ouverte avec succès."
+
+    try:
+        if chart_image is not None:
+            notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
+        else:
+            notifier.tg_send(trade_message)
+    except Exception:
+        pass
+
+    return True, "Position ouverte avec succès."
 
 
 def get_tp_offset_pct() -> float:
@@ -1656,6 +1728,7 @@ def manage_open_positions(ex: ccxt.Exchange):
     base de trailing si FOLLOW_MANUAL_SL_WITH_TRAILING = true.
     Tous les ordres sont MARKET reduceOnly (triggers) + sécurisation leverage/modes."""
     _ensure_bitget_mix_options(ex)
+
     if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
         return
 
@@ -1785,6 +1858,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                     except Exception:
                         pass
 
+                    # ✅ Valide SL vs mark
+                    market = ex.market(symbol) or {}
+                    tick_size = _bitget_tick_size(market)
+                    mark_now = _current_mark_price(ex, symbol)
+                    new_sl_be = _validate_sl_for_side(('buy' if is_long else 'sell'), float(new_sl_be), mark_now, tick_size)
+
                     if remaining_qty > 0:
                         ex.create_order(
                             symbol, 'market', close_side, remaining_qty, price=None,
@@ -1842,6 +1921,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                         except Exception:
                             pass
 
+                        # ✅ Valide SL vs mark
+                        market = ex.market(symbol) or {}
+                        tick_size = _bitget_tick_size(market)
+                        mark_now = _current_mark_price(ex, symbol)
+                        new_sl_be = _validate_sl_for_side(('buy' if is_long else 'sell'), float(new_sl_be), mark_now, tick_size)
+
                         ex.create_order(
                             symbol, 'market', close_side, qty, price=None,
                             params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'}
@@ -1893,7 +1978,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                     moved = candidate < current_sl and (current_sl <= 0 or (current_sl - candidate) / max(current_sl, 1e-12) >= move_min_pct)
 
                 if not moved or skip_sl_updates:
-                    # soit pas de mouvement utile, soit SL manuel gelé (si FOLLOW_MANUAL_SL... = false)
                     pass
                 else:
                     try:
@@ -1907,6 +1991,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                                 candidate = float(ex.price_to_precision(symbol, candidate))
                             except Exception:
                                 pass
+
+                            # ✅ Valide SL vs mark
+                            market = ex.market(symbol) or {}
+                            tick_size = _bitget_tick_size(market)
+                            mark_now = _current_mark_price(ex, symbol)
+                            candidate = _validate_sl_for_side(('buy' if is_long else 'sell'), float(candidate), mark_now, tick_size)
 
                             try_cancel = str(database.get_setting('TRY_CANCEL_BEFORE_SL_UPDATE', 'false')).lower() == 'true'
                             if try_cancel:
@@ -1979,12 +2069,11 @@ def manage_open_positions(ex: ccxt.Exchange):
                     if sl_price <= last_px:
                         sl_price = last_px * (1.0 + gap_pct)
 
-                # ✅ Valide TP selon règles Bitget (short < prix courant ; long > prix courant)
+                # ✅ Valide TP selon règle Bitget (short < prix courant ; long > prix courant)
                 try:
                     side_for_tp = ('buy' if is_long else 'sell')
                     target_tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(target_tp))
                 except Exception:
-                    # fallback minime si la validation échoue
                     if is_long and target_tp <= last_px:
                         target_tp = last_px * (1.0 + gap_pct)
                     if (not is_long) and target_tp >= last_px:
@@ -1999,6 +2088,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                     pass
                 if qty <= 0:
                     continue
+
+                # ✅ Valide SL vs mark avant replacement
+                market = ex.market(symbol) or {}
+                tick_size = _bitget_tick_size(market)
+                mark_now = _current_mark_price(ex, symbol)
+                sl_price = _validate_sl_for_side(('buy' if is_long else 'sell'), float(sl_price), mark_now, tick_size)
 
                 # Replace propre SL/TP (reduceOnly mark)
                 ex.create_order(
@@ -2017,6 +2112,7 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         except Exception as e:
             print(f"Erreur TP dynamique {symbol}: {e}")
+
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """Solde USDT/équity robuste (Bitget v2 compatible, évite 'Parameter productType error')."""
