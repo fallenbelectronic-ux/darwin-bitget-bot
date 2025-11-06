@@ -86,17 +86,17 @@ def _maybe_improve_rr_with_cut_wick(prev: pd.Series, entry: float, sl: float, tp
         return rr_alt, sl
 
 def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Series] = None) -> bool:
-    """Validation stricte de la bougie de réaction (patterns + seuils) — agnostique à la couleur.
+    """Validation stricte de la bougie de réaction.
     Règles DB:
       - DOJI_BODY_MAX (def 0.10)
       - PINBAR_MAX_BODY (def 0.30)
-      - SIMPLE_WICK_MIN (def 0.30)
+      - SIMPLE_WICK_MIN (def 0.30)   # >= 30% du range pour la grande mèche
       - PINBAR_OPP_WICK_MAX (def 0.20)
       - MARUBOZU_MIN_BODY (def 0.30)
       - WICK_HUGE_MAX (def 0.70)
-    Ajouts DOCS:
-      - GAP + IMPULSION (via prev)
-      - DOUBLE MARUBOZU 30 % (via prev)
+    Spécifique:
+      - PINBAR: couleur indifférente ; on exige seulement la bonne mèche (opposée au trade) et les ratios ci-dessus.
+      - Autres patterns (impulsion/marubozu/gap/double): direction dans le sens du trade.
     """
     try:
         doji_max            = float(database.get_setting('DOJI_BODY_MAX', 0.10))
@@ -120,30 +120,38 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
     w_up_r = w_up / rng
     w_dn_r = w_dn / rng
 
-    # (A) Rejet sécurité : mèche “énorme” du côté signal
+    # (A) Rejet sécurité : mèche énorme du côté trade
     if side == 'buy' and w_dn_r > wick_huge_max:
         return False
     if side == 'sell' and w_up_r > wick_huge_max:
         return False
 
-    # (B) Pinbar en priorité (avant test doji)
+    # (B) PINBAR (couleur indifférente) — uniquement des conditions de mèches/corps
     if body_r <= pinbar_max_body:
         if side == 'buy':
+            # Long ⇒ grande mèche basse (>= 30%), petite mèche haute (<= opp max)
             if w_dn_r >= simple_wick_min and w_up_r <= pinbar_opp_wick_max:
                 return True
         else:
+            # Short ⇒ grande mèche haute, petite mèche basse
             if w_up_r >= simple_wick_min and w_dn_r <= pinbar_opp_wick_max:
                 return True
+        # si pinbar non valide, on continue aux autres patterns
 
-    # (C) Si pas pinbar, on peut éliminer les dojis trop faibles
+    # (C) Éliminer les dojis trop faibles pour le reste
     if body_r < doji_max:
         return False
 
-    # (D) Impulsion / marubozu relatif (grand corps)
+    # (D) Pour les autres patterns, on exige la direction dans le sens du trade
+    is_bull = c > o
+    if (side == 'buy' and not is_bull) or (side == 'sell' and is_bull):
+        return False
+
+    # (E) Impulsion / marubozu directionnels
     if body_r >= marubozu_min_body:
         return True
 
-    # (E) Cas DOCS dépendant de prev: GAP+IMPULSION ou DOUBLE MARUBOZU
+    # (F) Motifs inter-bougies (avec direction du cur déjà validée ci-dessus)
     if prev is not None:
         if _is_gap_impulse(prev, candle, side):
             return True
@@ -151,6 +159,7 @@ def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Ser
             return True
 
     return False
+
 
 
 def _compute_body_wicks(candle: pd.Series) -> Tuple[float, float, float, float]:
@@ -485,11 +494,23 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     def _inside_bb20_only(candle):
         return _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
 
-    # (1) PINBAR sur la bougie de contact (corps ≤ 30%) + CLÔTURE à l’intérieur de BB80 ET BB20
+    # (1) PINBAR sur la bougie de contact (réaction = contact) + inside (BB80 & BB20) — couleur indifférente
     pinbar_contact_ok = False
     try:
         if _body_ratio(c1) <= PINBAR_MAX_BODY and _inside_both(c1):
-            pinbar_contact_ok = True
+            o1, c1v = float(c1['open']), float(c1['close'])
+            h1, l1 = float(c1['high']), float(c1['low'])
+            rng1 = max(1e-12, h1 - l1)
+            w_up1 = max(0.0, h1 - max(o1, c1v)) / rng1
+            w_dn1 = max(0.0, min(o1, c1v) - l1) / rng1
+            if side_guess == 'buy':
+                # Long ⇒ grande mèche basse, petite mèche haute
+                if w_dn1 >= SIMPLE_WICK_MIN and w_up1 <= PINBAR_OPP_WICK_MAX:
+                    pinbar_contact_ok = True
+            else:
+                # Short ⇒ grande mèche haute, petite mèche basse
+                if w_up1 >= SIMPLE_WICK_MIN and w_dn1 <= PINBAR_OPP_WICK_MAX:
+                    pinbar_contact_ok = True
     except Exception:
         pinbar_contact_ok = False
 
