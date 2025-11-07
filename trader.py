@@ -20,8 +20,12 @@ MIN_NOTIONAL_VALUE = float(os.getenv("MIN_NOTIONAL_VALUE", "5"))
 # --- Filtres de réaction (paternes) ---
 REACTION_WINDOW_BARS = 3
 PINBAR_MAX_BODY = 0.30      # ≤ 30% du range
-IMPULSE_MIN_BODY = 0.30     # ≥ 30% du range
-SIMPLE_WICK_MIN = 0.30      # ≥ 30% du range
+IMPULSE_MIN_BODY = 0.35     # ≥ 35% du range
+SIMPLE_WICK_MIN = 0.35      # ≥ 35% du range
+
+# Confirmation obligatoire après une pinbar-contact
+PINBAR_CONFIRM_MAX_BARS = 2     # nb de bougies max pour voir la réaction
+PINBAR_CONFIRM_MIN_BODY = 0.20  # corps min de la bougie de réaction
 
 # --- Frais & BE ---
 FEE_ENTRY_PCT   = float(os.getenv("FEE_ENTRY_PCT", "0.0010"))  # 0.1% typique taker
@@ -185,15 +189,15 @@ def _is_gap_impulse(prev: pd.Series, cur: pd.Series, side: str) -> bool:
     """
     Détection 'Gap + Impulsion' entre prev et cur (agnostique à la couleur).
       - GAP_MIN_PCT (def 0.001 = 0.1%)
-      - IMPULSE_MIN_BODY (def 0.30 = 30% du range)
+      - IMPULSE_MIN_BODY (def 0.35 = 35% du range)
     """
     if prev is None or cur is None:
         return False
     try:
         gap_min_pct      = float(database.get_setting('GAP_MIN_PCT', 0.001))
-        impulse_min_body = float(database.get_setting('IMPULSE_MIN_BODY', 0.30))
+        impulse_min_body = float(database.get_setting('IMPULSE_MIN_BODY', 0.35))
     except Exception:
-        gap_min_pct, impulse_min_body = 0.001, 0.30
+        gap_min_pct, impulse_min_body = 0.001, 0.35
 
     prev_close = float(prev['close'])
     cur_open   = float(cur['open'])
@@ -494,25 +498,65 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     def _inside_bb20_only(candle):
         return _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
 
-    # (1) PINBAR sur la bougie de contact (réaction = contact) + inside (BB80 & BB20) — couleur indifférente
-    pinbar_contact_ok = False
+    # (1) PINBAR sur la bougie de contact (contact ≠ réaction) + inside (BB80 & BB20)
+    pinbar_confirmed = False
     try:
+        # paramètres DB (fallback sur constantes locales)
+        try:
+            pinbar_opp_wick_max = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.25))
+        except Exception:
+            pinbar_opp_wick_max = 0.25
+        try:
+            pinbar_confirm_max = int(database.get_setting('PINBAR_CONFIRM_MAX_BARS', PINBAR_CONFIRM_MAX_BARS))
+        except Exception:
+            pinbar_confirm_max = PINBAR_CONFIRM_MAX_BARS
+        try:
+            pinbar_confirm_min_body = float(database.get_setting('PINBAR_CONFIRM_MIN_BODY', PINBAR_CONFIRM_MIN_BODY))
+        except Exception:
+            pinbar_confirm_min_body = PINBAR_CONFIRM_MIN_BODY
+
+        # c1 doit être une pinbar "de contact" et inside BB80 & BB20
+        is_pinbar_contact = False
         if _body_ratio(c1) <= PINBAR_MAX_BODY and _inside_both(c1):
             o1, c1v = float(c1['open']), float(c1['close'])
             h1, l1 = float(c1['high']), float(c1['low'])
             rng1 = max(1e-12, h1 - l1)
             w_up1 = max(0.0, h1 - max(o1, c1v)) / rng1
             w_dn1 = max(0.0, min(o1, c1v) - l1) / rng1
+
             if side_guess == 'buy':
-                # Long ⇒ grande mèche basse, petite mèche haute
-                if w_dn1 >= SIMPLE_WICK_MIN and w_up1 <= PINBAR_OPP_WICK_MAX:
-                    pinbar_contact_ok = True
+                # Long ⇒ grosse mèche basse, petite mèche haute
+                is_pinbar_contact = (w_dn1 >= SIMPLE_WICK_MIN and w_up1 <= pinbar_opp_wick_max)
             else:
-                # Short ⇒ grande mèche haute, petite mèche basse
-                if w_up1 >= SIMPLE_WICK_MIN and w_dn1 <= PINBAR_OPP_WICK_MAX:
-                    pinbar_contact_ok = True
+                # Short ⇒ grosse mèche haute, petite mèche basse
+                is_pinbar_contact = (w_up1 >= SIMPLE_WICK_MIN and w_dn1 <= pinbar_opp_wick_max)
+
+        # si pinbar-contact valide, exiger une bougie de réaction (c2/c3) + cassure du high/low de la pinbar
+        if is_pinbar_contact:
+            pb_high, pb_low = float(c1['high']), float(c1['low'])
+            for j in range(1, pinbar_confirm_max + 1):
+                k = contact_idx + j
+                if k >= len(df):
+                    break
+                rc = df.iloc[k]
+                o, c = float(rc['open']), float(rc['close'])
+                h, l = float(rc['high']), float(rc['low'])
+                rng = max(1e-12, h - l)
+                body_r = abs(c - o) / rng
+
+                if side_guess == 'buy':
+                    # réaction haussière + cassure du high de la pinbar
+                    if (c >= o) and (body_r >= pinbar_confirm_min_body) and (h >= pb_high):
+                        pinbar_confirmed = True
+                        break
+                else:
+                    # réaction baissière + cassure du low de la pinbar
+                    if (c <= o) and (body_r >= pinbar_confirm_min_body) and (l <= pb_low):
+                        pinbar_confirmed = True
+                        break
     except Exception:
-        pinbar_contact_ok = False
+        pinbar_confirmed = False
+
 
     # (2) Réintégration dans la FENÊTRE (barres 2–3) selon le régime
     #     - CT  : inside BB80 ET BB20 (sur c2 OU c3) si ct_reintegrate_both=True
@@ -545,7 +589,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if is_valid_reaction_candle(cx, side_guess, prev=pv):
             pat_ok = True
             break
-    if pinbar_contact_ok:
+
+    # si pinbar-contact, on n'accepte que si la réaction confirmée a eu lieu
+    if pinbar_confirmed:
         pat_ok = True
 
     # (4) Disqualifiants : pas de pattern validé après 3 barres ⇒ on annule
@@ -1661,12 +1707,12 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
 
 def get_tp_offset_pct() -> float:
-    """Retourne le pourcentage d'offset (ex: 0.0015 = 0.15%) pour TP/SL depuis la DB,
+    """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
     clampé pour garantir que le TP se place AVANT la borne (jamais 0)."""
     try:
-        v = float(database.get_setting('TP_BB_OFFSET_PCT', 0.0015))
+        v = float(database.get_setting('TP_BB_OFFSET_PCT', 0.003))
     except Exception:
-        v = 0.0015
+        v = 0.003
     # Clamp : min 0.05% ; max 10%
     if v < 0.0005: v = 0.0005
     if v > 0.1:     v = 0.1
@@ -1728,10 +1774,7 @@ def manage_open_positions(ex: ccxt.Exchange):
     base de trailing si FOLLOW_MANUAL_SL_WITH_TRAILING = true.
     Tous les ordres sont MARKET reduceOnly (triggers) + sécurisation leverage/modes."""
     _ensure_bitget_mix_options(ex)
-
-    if database.get_setting('PAPER_TRADING_MODE', 'true') == 'true':
-        return
-
+        
     # Sync (optionnel) avant gestion
     try:
         need_sync = str(database.get_setting('SYNC_BEFORE_MANAGE', 'true')).lower() == 'true'
