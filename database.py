@@ -1,4 +1,5 @@
 # Fichier: database.py
+import os
 import sqlite3
 import time
 from typing import List, Dict, Any, Optional, Tuple
