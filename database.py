@@ -82,7 +82,15 @@ def setup_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
         conn.commit()
-
+        
+def _store():
+    """Singleton mémoire (léger) pour éviter toute dépendance externe."""
+    st = getattr(_store, "_st", None)
+    if st is None:
+        st = {"settings": {}, "trades": [], "signals": [], "next_trade_id": 1}
+        _store._st = st
+    return st
+    
 def _dedup_signals(conn: sqlite3.Connection) -> None:
     """Supprime les doublons (symbol, side, timeframe, ts) en gardant le plus récent."""
     try:
@@ -103,18 +111,16 @@ def _dedup_signals(conn: sqlite3.Connection) -> None:
 def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """
     Retourne une liste de signaux (dict) depuis la table 'signals'.
-    - state: filtre optionnel (ex: 'PENDING', 'VALID_SKIPPED')
+    - state: filtre optionnel (ex: 'PENDING', 'VALID', 'SKIPPED', ou 'VALID_SKIPPED' pour combiner VALID et SKIPPED)
     - since_minutes: fenêtre glissante en minutes, basée sur 'ts' (accepte ts en sec ou ms)
     - limit: max éléments retournés après filtres (ordre anté-chronologique)
     Champs utilisés par notifier: symbol, timeframe, side, entry, sl, tp, rr, ts.
     """
     with get_db_connection() as conn:
         cur = conn.cursor()
-        # On charge un tampon large, puis on filtre côté Python pour gérer ts sec/ms en sûreté
         try:
             rows = cur.execute("SELECT * FROM signals ORDER BY ts DESC LIMIT 1000").fetchall()
         except sqlite3.OperationalError:
-            # table absente: renvoyer liste vide pour éviter le crash côté notifier
             return []
 
     import time as _t
@@ -126,12 +132,20 @@ def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None
         except Exception:
             min_ts_sec = None
 
+    want_valid_skipped = (str(state).upper() == "VALID_SKIPPED") if state is not None else False
     out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        # Filtre state
-        if state is not None and str(d.get("state", "")).upper() != str(state).upper():
-            continue
+
+        # Filtre state (inclut cas spécial VALID_SKIPPED)
+        if state is not None:
+            st = str(d.get("state", "")).upper()
+            if want_valid_skipped:
+                if st not in ("VALID", "SKIPPED"):
+                    continue
+            else:
+                if st != str(state).upper():
+                    continue
 
         # Filtre fenêtre temporelle (support ts en sec ou ms)
         if min_ts_sec is not None:
@@ -144,11 +158,14 @@ def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None
                 continue
 
         out.append(d)
-
         if len(out) >= int(limit):
             break
 
     return out
+
+def upsert_open_position(rec: Dict[str, Any]) -> bool:
+    """Compatibilité: pas de table 'open_positions' dédiée — no-op pour rester compatible avec l'appelant."""
+    return True
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, coltype: str, default_sql_literal: str):
     cur = conn.cursor()
@@ -200,13 +217,14 @@ def create_trade(
         conn.commit()
         return cur.lastrowid
 
+
 def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
-    """Met à jour après mise à breakeven (valeur 'ACTIVATED' conservée pour compat)."""
+    """Mise à breakeven : breakeven_status='ACTIVE', maj quantité et SL."""
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE trades
-               SET breakeven_status = 'ACTIVATED',
+               SET breakeven_status = 'ACTIVE',
                    quantity = ?,
                    sl_price = ?
              WHERE id = ?
@@ -276,23 +294,37 @@ def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
 
 # -------- Settings (key/value) --------
 def get_setting(key: str, default: Any = None) -> Any:
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cur.fetchone()
-        return row["value"] if row else default
+    """
+    Lecture robuste d’un paramètre. Retourne `default` si la clé est absente
+    ou en cas d’erreur DB (table/connexion/etc.).
+    """
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+            if not row:
+                return default
+            # Supporte row_mapping (dict-like) ou tuple selon row_factory
+            try:
+                val = row["value"]  # type: ignore[index]
+            except Exception:
+                val = row[0] if isinstance(row, (list, tuple)) and len(row) > 0 else None
+            return default if (val is None or val == "") else val
+    except Exception:
+        return default
 
-def set_setting(key: str, value: Any):
+
+def set_setting(key: str, value: Any) -> None:
     with get_db_connection() as conn:
         cur = conn.cursor()
-        # Upsert propre (évite INSERT OR REPLACE qui supprime la ligne puis recrée)
         cur.execute("""
             INSERT INTO settings(key, value)
             VALUES(?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (key, str(value)))
+        """, (str(key), str(value)))
         conn.commit()
-    print(f"DB: Paramètre '{key}' mis à jour.")
+        
 
 def toggle_setting_bool(key: str, default_true: bool = False) -> bool:
     curr = str(get_setting(key, 'true' if default_true else 'false')).lower() in ("1","true","yes","on")
@@ -648,3 +680,34 @@ def set_signal_state(symbol: str, side: str, timeframe: str, ts: int, new_state:
         """, (str(new_state), str(symbol), str(side).lower(), str(timeframe), int(ts)))
         conn.commit()
         return res.rowcount > 0
+
+def insert_signal(**payload):
+    """Alias compat: insert → upsert_signal, avec normalisation légère des champs."""
+    sig = dict(payload.pop('sig', {})) if isinstance(payload.get('sig'), dict) else dict(payload)
+    # Normalisations
+    if 'side' in sig: sig['side'] = str(sig['side']).lower()
+    if 'ts' in sig:
+        try:
+            ts_raw = float(sig['ts'])
+            # Standardise en millisecondes si fourni en secondes
+            sig['ts'] = int(ts_raw if ts_raw > 10_000_000_000 else ts_raw * 1000.0)
+        except Exception:
+            sig['ts'] = int(time.time() * 1000)
+    state = str(sig.pop('state', 'PENDING'))
+    return upsert_signal(sig, state=state)
+
+def save_signal(**payload):
+    """Alias compat: save → upsert_signal, même normalisation que insert_signal."""
+    sig = dict(payload.pop('sig', {})) if isinstance(payload.get('sig'), dict) else dict(payload)
+    if 'side' in sig: sig['side'] = str(sig['side']).lower()
+    if 'ts' in sig:
+        try:
+            ts_raw = float(sig['ts'])
+            sig['ts'] = int(ts_raw if ts_raw > 10_000_000_000 else ts_raw * 1000.0)
+        except Exception:
+            sig['ts'] = int(time.time() * 1000)
+    state = str(sig.pop('state', 'PENDING'))
+    return upsert_signal(sig, state=state)
+
+
+
