@@ -441,16 +441,14 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     last = df.iloc[last_idx]
     base_idx = len(df) + last_idx
 
-    # Prix d'entrée utilisé pour le sizing/RR :
-    # - si enforce_next_bar: on entre à l'OPEN de la bougie courante (df.iloc[-1])
-    # - sinon: on entre à la CLOSE de la bougie "last" (réaction)
+    # Prix d'entrée utilisé pour le sizing/RR
     if enforce_next_bar and len(df) >= 1:
         next_open = float(df.iloc[-1]['open'])
         entry_px_for_rr = next_open
     else:
         entry_px_for_rr = float(last['close'])
 
-    # --- Cherche la bougie CONTACT (≤ reaction_max_bars avant la réaction) ---
+    # --- Cherche la bougie CONTACT ---
     contact, contact_idx = None, None
     for back in range(1, reaction_max_bars + 1):
         idx = base_idx - back
@@ -477,16 +475,13 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if in_dead_zone:
         prev_wave = _previous_wave_by_bb80(df, base_idx, MM_DEAD_ZONE_PERCENT)
 
-
     # --- Fenêtre 3 barres incluant la bougie de CONTACT ---
-    # contact = c1, puis réactions possibles: c2, c3 (si dispo)
     c1 = contact
     c2 = df.iloc[contact_idx + 1] if (contact_idx + 1) < len(df) else None
     c3 = df.iloc[contact_idx + 2] if (contact_idx + 2) < len(df) else None
 
-    # Détermination finale du sens MM80 (après pat_ok / avant tests Tendance/CT)
+    # Détermination finale du sens MM80
     if in_dead_zone and prev_wave in ('up', 'down'):
-        # en hésitation, on tranche par la vague précédente
         is_above_mm80 = (prev_wave == 'up')
     else:
         is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
@@ -501,7 +496,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # (1) PINBAR sur la bougie de contact (contact ≠ réaction) + inside (BB80 & BB20)
     pinbar_confirmed = False
     try:
-        # paramètres DB (fallback sur constantes locales)
+        # --- harmonisation des seuils issus de la DB ---
         try:
             pinbar_opp_wick_max = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.25))
         except Exception:
@@ -514,6 +509,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             pinbar_confirm_min_body = float(database.get_setting('PINBAR_CONFIRM_MIN_BODY', PINBAR_CONFIRM_MIN_BODY))
         except Exception:
             pinbar_confirm_min_body = PINBAR_CONFIRM_MIN_BODY
+        # ✅ nouveau : utiliser la valeur DB de SIMPLE_WICK_MIN au lieu de la constante
+        try:
+            simple_wick_min_dyn = float(database.get_setting('SIMPLE_WICK_MIN', SIMPLE_WICK_MIN))
+        except Exception:
+            simple_wick_min_dyn = SIMPLE_WICK_MIN
 
         # c1 doit être une pinbar "de contact" et inside BB80 & BB20
         is_pinbar_contact = False
@@ -525,11 +525,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             w_dn1 = max(0.0, min(o1, c1v) - l1) / rng1
 
             if side_guess == 'buy':
-                # Long ⇒ grosse mèche basse, petite mèche haute
-                is_pinbar_contact = (w_dn1 >= SIMPLE_WICK_MIN and w_up1 <= pinbar_opp_wick_max)
+                # Long ⇒ grande mèche basse, petite mèche haute
+                is_pinbar_contact = (w_dn1 >= simple_wick_min_dyn and w_up1 <= pinbar_opp_wick_max)
             else:
-                # Short ⇒ grosse mèche haute, petite mèche basse
-                is_pinbar_contact = (w_up1 >= SIMPLE_WICK_MIN and w_dn1 <= pinbar_opp_wick_max)
+                # Short ⇒ grande mèche haute, petite mèche basse
+                is_pinbar_contact = (w_up1 >= simple_wick_min_dyn and w_dn1 <= pinbar_opp_wick_max)
 
         # si pinbar-contact valide, exiger une bougie de réaction (c2/c3) + cassure du high/low de la pinbar
         if is_pinbar_contact:
@@ -545,41 +545,30 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 body_r = abs(c - o) / rng
 
                 if side_guess == 'buy':
-                    # réaction haussière + cassure du high de la pinbar
                     if (c >= o) and (body_r >= pinbar_confirm_min_body) and (h >= pb_high):
                         pinbar_confirmed = True
                         break
                 else:
-                    # réaction baissière + cassure du low de la pinbar
                     if (c <= o) and (body_r >= pinbar_confirm_min_body) and (l <= pb_low):
                         pinbar_confirmed = True
                         break
     except Exception:
         pinbar_confirmed = False
 
-
-    # (2) Réintégration dans la FENÊTRE (barres 2–3) selon le régime
-    #     - CT  : inside BB80 ET BB20 (sur c2 OU c3) si ct_reintegrate_both=True
-    #             sinon inside BB20 suffit
-    #     - Tend: inside BB20 (sur c2 OU c3)
+    # (2) Réintégration dans la FENÊTRE (barres 2–3)
     inside_both_seen = False
     inside_bb20_seen = False
-
     for cx in (c2, c3):
         if cx is None:
             continue
         if _inside_both(cx):
             inside_both_seen = True
-            inside_bb20_seen = True  # inside_both ⇒ inside_bb20
+            inside_bb20_seen = True
         elif _inside_bb20_only(cx):
             inside_bb20_seen = True
 
-    # Tendance : réintégration BB20 suffit
     trend_reintegration_ok = inside_bb20_seen
-
-    # CT : selon le toggle
     ct_reintegration_ok = inside_both_seen if ct_reintegrate_both else inside_bb20_seen
-
 
     # (3) Pattern valide (1→4) dans la fenêtre
     pat_ok = False
@@ -589,18 +578,13 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if is_valid_reaction_candle(cx, side_guess, prev=pv):
             pat_ok = True
             break
-
-    # si pinbar-contact, on n'accepte que si la réaction confirmée a eu lieu
     if pinbar_confirmed:
         pat_ok = True
-
-    # (4) Disqualifiants : pas de pattern validé après 3 barres ⇒ on annule
     if not pat_ok:
         return None
 
     # ATR courant (pour offset hybride TP)
     last_atr = float(last.get('atr', contact.get('atr', 0.0)))
-
     signal = None
 
     touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
@@ -610,7 +594,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_above_mm80 and touched_bb20_low and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
-        sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
+        sl = float(_anchor_sl_from_extreme(df, 'buy'))
 
         target_band = float(last['bb80_up'])
         eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
@@ -630,7 +614,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     elif (not is_above_mm80) and touched_bb20_high and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
-        sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
+        sl = float(_anchor_sl_from_extreme(df, 'sell'))
 
         target_band = float(last['bb80_lo'])
         eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
@@ -659,7 +643,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # --- CONTRE-TENDANCE ---
     if not signal:
         prev = contact
-        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))  # tolérance BB80 (contact) ONLY
+        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))
 
         touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
             float(prev['low'])  <= float(prev['bb80_lo']) or _near_bb80_with_tolerance(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow, atr_contact, atr_tol_k)
@@ -671,7 +655,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if touched_ct_low and ct_reintegration_ok:
             regime = "Contre-tendance"
             entry = entry_px_for_rr
-            sl = float(_anchor_sl_from_extreme(df, 'buy'))  # SL hybride
+            sl = float(_anchor_sl_from_extreme(df, 'buy'))
 
             target_band = float(last['bb20_mid'])
             eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
@@ -691,7 +675,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         elif touched_ct_high and ct_reintegration_ok:
             regime = "Contre-tendance"
             entry = entry_px_for_rr
-            sl = float(_anchor_sl_from_extreme(df, 'sell'))  # SL hybride
+            sl = float(_anchor_sl_from_extreme(df, 'sell'))
 
             target_band = float(last['bb20_mid'])
             eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
@@ -715,6 +699,108 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return signal
 
     return None
+
+def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
+    """
+    Charge le DF préparé, appelle detect_signal(), enregistre le signal et notifie.
+    Ne casse rien si la DB n’a pas l’API attendue (record_signal_from_trader gère déjà).
+    Retourne le signal si valide, sinon None.
+    """
+    try:
+        df = utils.fetch_and_prepare_df(ex, symbol, timeframe)
+        if df is None or len(df) < 81:
+            return None
+
+        sig = detect_signal(symbol, df)
+        ts = int(time.time() * 1000)
+        if not sig:
+            # Traçage léger optionnel (SKIPPED) — tu peux commenter si tu ne veux pas de logs
+            try:
+                record_signal_from_trader(
+                    symbol=symbol, side="-", timeframe=timeframe, ts=ts,
+                    price=float(df.iloc[-1]["close"]), rr=0.0, regime="-",
+                    pattern="NONE", status="SKIPPED", meta={"reason": "no_pattern"}
+                )
+            except Exception:
+                pass
+            return None
+
+        # Enregistrement + notif
+        try:
+            record_signal_from_trader(
+                symbol=symbol,
+                side=sig.get("side", "-"),
+                timeframe=timeframe,
+                ts=ts,
+                price=float(sig.get("entry") or df.iloc[-1]["close"]),
+                rr=float(sig.get("rr", 0.0)),
+                regime=str(sig.get("regime", "-")),
+                pattern="AUTO",
+                status="VALID",
+                meta={"tp": sig.get("tp"), "sl": sig.get("sl")}
+            )
+        except Exception:
+            pass
+
+        try:
+            notifier.send_signal_notification(symbol, timeframe, sig)
+        except Exception:
+            pass
+
+        return sig
+    except Exception:
+        return None
+
+def record_signal_from_trader(
+    symbol: str,
+    side: str,
+    timeframe: str,
+    ts: int,
+    price: float,
+    rr: float,
+    regime: str,
+    pattern: str,
+    status: str = "PENDING",
+    meta: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Enregistre proprement un signal détecté (ou tenté) côté trader.
+    Ne casse jamais le flux en cas d'erreur DB : log et continue.
+    """
+    payload = {
+        "symbol": symbol,
+        "side": side,
+        "timeframe": timeframe,
+        "ts": int(ts),
+        "price": float(price),
+        "rr": float(rr) if rr is not None else None,
+        "regime": str(regime) if regime is not None else None,
+        "pattern": str(pattern) if pattern is not None else None,
+        "status": str(status) if status else "PENDING",
+        "meta": meta or {}
+    }
+    try:
+        # Préférence : fonction dédiée côté database (sera ajoutée ensuite).
+        if hasattr(database, "upsert_signal"):
+            database.upsert_signal(**payload)
+        else:
+            # Fallback souple : si une API custom existe déjà (insert_signal / save_signal), on tente.
+            if hasattr(database, "insert_signal"):
+                database.insert_signal(**payload)  # type: ignore[arg-type]
+            elif hasattr(database, "save_signal"):
+                database.save_signal(**payload)    # type: ignore[arg-type]
+            else:
+                # Dernier recours : simple log Telegram pour traçabilité sans bloquer.
+                try:
+                    notifier.tg_send(f"ℹ️ Signal non persisté (API DB manquante): {symbol} {side} {timeframe} @ {price}")
+                except Exception:
+                    pass
+    except Exception as e:
+        # On ne laisse jamais une erreur DB casser le trader.
+        try:
+            notifier.tg_send(f"⚠️ Échec enregistrement signal: {symbol} {side} {timeframe} @ {price} — {e}")
+        except Exception:
+            pass
 
 
 # ==============================================================================
