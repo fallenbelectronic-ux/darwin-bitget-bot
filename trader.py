@@ -3,7 +3,7 @@ import os
 import time
 import ccxt
 import pandas as pd
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import database
 import notifier
 import charting
@@ -756,140 +756,86 @@ def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, q
     except Exception as e:
         notifier.tg_send_error(f"Import position {symbol} -> DB", e)
 
-def sync_positions_with_exchange(ex: ccxt.Exchange) -> Dict[str, Any]:
+def sync_positions_with_exchange(ex: ccxt.Exchange) -> None:
     """
-    Vérifie la cohérence entre les positions ouvertes sur l'exchange (Bitget via CCXT)
-    et les trades 'OPEN' en base. Peut importer automatiquement les positions présentes
-    sur l'exchange mais absentes en DB (AUTO_IMPORT_EX_POS = true)."""
-    _ensure_bitget_mix_options(ex)
-    report = {
-        "only_on_exchange": [],
-        "only_in_db": [],
-        "qty_mismatch": [],
-        "matched": [],
-    }
-
+    Synchronise les positions ouvertes depuis l'exchange vers la base locale.
+    - Tolère les exchanges où `fetch_positions()` n'est pas complet.
+    - Met à jour/insère les positions ouvertes et retire celles qui n'existent plus côté exchange.
+    """
     try:
-        ex_positions_raw = _fetch_positions_safe(ex)
-
-        ex_open = []
-        for p in (ex_positions_raw or []):
+        # 1) Récupération robuste des positions
+        positions = []
+        if hasattr(ex, "fetch_positions"):
             try:
-                symbol = p.get('symbol') or (p.get('info', {}) or {}).get('symbol')
-                if not symbol:
-                    continue
-                contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
-                if contracts <= 0:
-                    continue
-                side_raw = (p.get('side') or '').lower()
-                if side_raw in ('long', 'buy'):
-                    side = 'buy'
-                elif side_raw in ('short', 'sell'):
-                    side = 'sell'
-                else:
-                    side = 'buy'
-                entry = float(p.get('entryPrice') or 0.0)
-                ex_open.append({'symbol': symbol, 'side': side, 'quantity': contracts, 'entry_price': entry})
+                positions = ex.fetch_positions()
             except Exception:
+                positions = []
+
+        open_symbols = []
+
+        # 2) Parcours des positions valides (contrats != 0)
+        for p in positions or []:
+            try:
+                amt = float(p.get("contracts") or p.get("amount") or 0.0)
+            except Exception:
+                amt = 0.0
+            if abs(amt) < 1e-9:
                 continue
 
-        ex_map = {(r['symbol'], r['side']): r for r in ex_open}
+            symbol    = p.get("symbol")
+            entry     = float(p.get("entryPrice") or p.get("entry_price") or 0.0)
+            mark      = float(p.get("markPrice") or p.get("mark_price") or entry or 0.0)
+            leverage  = float(p.get("leverage") or 0.0)
+            upnl      = float(p.get("unrealizedPnl") or p.get("unrealized_pnl") or 0.0)
+            side_raw  = p.get("side")
+            side      = side_raw if side_raw in ("long", "short") else ("long" if amt > 0 else "short")
+            notional  = abs(amt) * (mark if mark > 0 else entry)
 
-        db_open = database.get_open_positions() or []
-        db_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for d in db_open:
+            rec = {
+                "symbol": symbol,
+                "side": side,
+                "amount": abs(amt),
+                "entry_price": entry,
+                "mark_price": mark,
+                "leverage": leverage,
+                "unrealized_pnl": upnl,
+                "notional": notional,
+            }
+
+            # 3) Upsert tolérant selon les fonctions disponibles dans database.py
+            if hasattr(database, "upsert_open_position"):
+                database.upsert_open_position(rec)
+            elif hasattr(database, "save_open_position"):
+                database.save_open_position(rec)
+            elif hasattr(database, "save_or_update_position"):
+                database.save_or_update_position(rec)
+
+            if symbol:
+                open_symbols.append(symbol)
+
+        # 4) Retirer côté DB les positions qui n'existent plus sur l'exchange
+        if hasattr(database, "get_open_positions") and callable(database.get_open_positions):
             try:
-                key = (d['symbol'], d['side'])
-                if key not in db_map:
-                    db_map[key] = {'ids': [d['id']], 'quantity': float(d['quantity']), 'entry_price': float(d.get('entry_price') or 0.0)}
-                else:
-                    db_map[key]['ids'].append(d['id'])
-                    db_map[key]['quantity'] += float(d['quantity'])
+                db_positions = database.get_open_positions() or []
             except Exception:
-                continue
-
-        tol_qty_pct = float(database.get_setting('SYNC_QTY_TOL_PCT', 0.01))
-        only_on_exchange, only_in_db, qty_mismatch, matched = [], [], [], []
-
-        for key, ex_pos in ex_map.items():
-            symbol, side = key
-            ex_qty = float(ex_pos['quantity'])
-            if key not in db_map:
-                only_on_exchange.append((symbol, side, ex_qty, ex_pos.get('entry_price', 0.0)))
-            else:
-                db_qty = float(db_map[key]['quantity'])
-                if db_qty == 0 and ex_qty > 0:
-                    qty_mismatch.append(((db_map[key]['ids'], symbol, side), db_qty, ex_qty))
-                else:
-                    diff_pct = abs(ex_qty - db_qty) / max(ex_qty, db_qty)
-                    if diff_pct > tol_qty_pct:
-                        qty_mismatch.append(((db_map[key]['ids'], symbol, side), db_qty, ex_qty))
-                    else:
-                        matched.append((db_map[key]['ids'], symbol, side, min(db_qty, ex_qty)))
-
-        for key, d in db_map.items():
-            if key not in ex_map:
-                symbol, side = key
-                only_in_db.append((d['ids'], symbol, side, float(d['quantity'])))
-
-        report.update({
-            "only_on_exchange": only_on_exchange,
-            "only_in_db": only_in_db,
-            "qty_mismatch": qty_mismatch,
-            "matched": matched,
-        })
-
-        try:
-            do_import = str(database.get_setting('AUTO_IMPORT_EX_POS', 'true')).lower() == 'true'
-        except Exception:
-            do_import = True
-
-        if do_import and only_on_exchange:
-            for symbol, side, q, ep in only_on_exchange:
-                try:
-                    if database.is_position_open(symbol):
-                        continue
-                except Exception:
-                    pass
-                _import_exchange_position_to_db(ex, symbol, side, q, ep)
-
-        # --- NEW: Fermeture auto des orphelins DB (positions disparues côté exchange) ---
-        auto_close_orphans = str(database.get_setting('AUTO_CLOSE_DB_ORPHANS', 'true')).lower() == 'true'
-        if auto_close_orphans and only_in_db:
-            for ids, symbol, side, qty in only_in_db:
-                try:
-                    for tid in (ids if isinstance(ids, list) else [ids]):
-                        database.close_trade(tid, status='CLOSED_BY_EXCHANGE', pnl=0.0)
-                    notifier.tg_send(f"🧹 Sync: fermeture auto — {symbol} {side} (qty≈{qty}) disparue côté exchange.")
-                except Exception as e:
-                    notifier.tg_send_error(f"Sync — fermeture orphelin {symbol}", e)
-
-        try:
-            want_notify = str(database.get_setting('SYNC_NOTIFY', 'false')).lower() == 'true'
-        except Exception:
-            want_notify = False
-        if want_notify:
-            lines = ["🧭 Vérification positions (Exchange vs DB)"]
-            if only_on_exchange:
-                lines.append("• Uniquement sur l'exchange:")
-                for symbol, side, q, ep in only_on_exchange:
-                    lines.append(f"   - {symbol} {side} qty={q} entry≈{ep}")
-            if only_in_db:
-                lines.append("• Uniquement en DB:")
-                for ids, symbol, side, q in only_in_db:
-                    lines.append(f"   - {symbol} {side} qtyDB={q} (ids={ids})")
-            if qty_mismatch:
-                lines.append("• Écarts de quantités:")
-                for (ids, symbol, side), qdb, qex in qty_mismatch:
-                    lines.append(f"   - {symbol} {side} DB={qdb} vs EX={qex} (ids={ids})")
-            if matched and not (only_on_exchange or only_in_db or qty_mismatch):
-                lines.append("• OK: toutes les positions concordent.")
-            notifier.tg_send("\n".join(lines))
+                db_positions = []
+            for dbp in db_positions:
+                sym = (dbp or {}).get("symbol")
+                if sym and sym not in open_symbols:
+                    for fn in ("remove_open_position", "close_position", "mark_position_closed", "delete_open_position"):
+                        if hasattr(database, fn):
+                            try:
+                                getattr(database, fn)(sym)
+                                break
+                            except Exception:
+                                pass
 
     except Exception as e:
-        notifier.tg_send_error("Sync positions — erreur inattendue", e)
+        try:
+            notifier.tg_send_error(f"Sync positions error: {e}")
+        except Exception:
+            print(f"sync_positions_with_exchange error: {e}")
 
-    return report
 
 def _validate_tp_for_side(side: str, tp_price: float, current_price: float, tick_size: float) -> float:
     """
@@ -1077,17 +1023,39 @@ def _bitget_positions_params() -> Dict[str, str]:
 
 
 def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
+    """
+    Idempotent: prépare l'instance ccxt pour Bitget “mix” USDT linéaire.
+    - defaultType='swap' (perp)
+    - defaultSubType='linear' (USDT)
+    - initialise ex.params avec des valeurs sûres (subType/productType)
+    Ne lève jamais d’exception.
+    """
     try:
-        if getattr(ex, "id", "") != "bitget":
-            return
         if not hasattr(ex, "options") or ex.options is None:
             ex.options = {}
-        ex.options["defaultType"] = "swap"
-        ex.options["defaultSettle"] = "USDT"
-        ex.options["productType"] = "USDT-FUTURES"
-    except Exception:
-        pass
 
+        # Perp par défaut
+        if ex.options.get("defaultType") != "swap":
+            ex.options["defaultType"] = "swap"
+
+        if getattr(ex, "id", "") == "bitget":
+            # Linear (USDT) par défaut
+            if ex.options.get("defaultSubType") not in ("linear", "inverse"):
+                ex.options["defaultSubType"] = "linear"
+            # Devise de règlement par défaut (utilisée par ccxt pour certaines routes)
+            ex.options.setdefault("defaultSettle", "USDT")
+
+        # Paramètres génériques pour les requêtes
+        if not hasattr(ex, "params") or ex.params is None:
+            ex.params = {}
+
+        if getattr(ex, "id", "") == "bitget":
+            ex.params.setdefault("subType", ex.options.get("defaultSubType", "linear"))
+            # USDT-UMCBL = Bitget Linear USDT Perp
+            ex.params.setdefault("productType", "USDT-UMCBL")
+    except Exception:
+        # On ne propage pas : la gestion appelante doit rester robuste
+        pass
 
 def _resolve_bitget_route(exchange):
     try:
@@ -1104,67 +1072,52 @@ def _resolve_bitget_route(exchange):
         "primary": "USDT-FUTURES",
     }
 
-
-def _fetch_positions_safe(exchange, symbols=None):
+def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Récupère les positions ouvertes de façon robuste.
+    - Supporte Bitget (swap USDT) et fallback silencieux si non supporté.
+    - Ne lève pas d’exception : retourne [] en cas d’échec.
+    """
     try:
-        exchange.load_markets()
-    except Exception:
-        pass
-
-    ex_id = getattr(exchange, "id", "")
-    if ex_id == "bitget":
-        route = _resolve_bitget_route(exchange)
-        mc = route["marginCoin"]
-
-        params_base = {"type": "swap", "productType": "USDT-FUTURES", "marginCoin": mc}
-        last_err = None
-
+        # Certaines implémentations exigent les marchés chargés
         try:
-            res = exchange.fetch_positions(symbols, params_base)
-            return res if res is not None else []
-        except Exception as e1:
-            last_err = e1
-
-        positions = []
-        try:
-            if symbols is None:
-                swap_usdt = [
-                    m for m, info in (exchange.markets or {}).items()
-                    if info.get("swap") and str(info.get("settle", "")).upper() == "USDT"
-                ]
-            else:
-                swap_usdt = list(symbols)
-        except Exception:
-            swap_usdt = []
-
-        for sym in swap_usdt[:100]:
-            try:
-                p = exchange.fetch_position(sym, params_base)
-                if p:
-                    positions.append(p)
-            except Exception:
-                continue
-
-        if positions:
-            return positions
-
-        try:
-            notifier.tg_send(f"❌ Erreur: Lecture des positions exchange\nbitget {str(last_err)}")
+            if not getattr(ex, "markets", None):
+                ex.load_markets()
         except Exception:
             pass
-        return []
-    else:
-        try:
-            res = exchange.fetch_positions(symbols)
-            return res if res is not None else []
-        except Exception as e:
-            try:
-                notifier.tg_send(f"❌ Erreur: Lecture des positions exchange\n{getattr(exchange,'id','')} {str(e)}")
-            except Exception:
-                pass
+
+        # Si la bourse ne supporte pas fetchPositions, on sort proprement
+        if not getattr(ex, "has", {}).get("fetchPositions", False):
             return []
 
+        # Appel principal (symbols peut être None)
+        positions = ex.fetch_positions(symbols=symbols) if symbols is not None else ex.fetch_positions()
 
+        # Normalisation légère / garde-fous
+        out: List[Dict[str, Any]] = []
+        for p in positions or []:
+            try:
+                sym   = p.get("symbol") or p.get("info", {}).get("symbol")
+                size  = float(p.get("contracts") or p.get("contractsSize") or p.get("positionAmt") or 0.0)
+                side  = p.get("side") or ("long" if size > 0 else "short" if size < 0 else None)
+                entry = float(p.get("entryPrice") or p.get("averagePrice") or 0.0)
+                lev   = float(p.get("leverage") or 0.0)
+                upnl  = float(p.get("unrealizedPnl") or p.get("unrealizedProfit") or 0.0)
+                if sym:
+                    out.append({
+                        "symbol": sym,
+                        "side": side,
+                        "size": size,
+                        "entryPrice": entry,
+                        "leverage": lev,
+                        "unrealizedPnl": upnl,
+                        "raw": p
+                    })
+            except Exception:
+                # On skippe les lignes corrompues sans casser le flux
+                continue
+        return out
+    except Exception:
+        return []
             
 def _fetch_balance_safe(exchange):
     try:
