@@ -80,6 +80,44 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
 
     target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
     tg_send(message, chat_id=target_chat_id)
+def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]) -> None:
+    """
+    Message Telegram propre pour un signal détecté (sans impacter le reste).
+    Envoie une image si charting renvoie un buffer, sinon texte seul.
+    """
+    try:
+        side = signal.get("side", "").upper()
+        regime = signal.get("regime", "-")
+        entry = signal.get("entry", None)
+        tp = signal.get("tp", None)
+        sl = signal.get("sl", None)
+        rr = signal.get("rr", None)
+
+        lines = [
+            f"🔔 <b>SIGNAL</b> {symbol} • {timeframe}",
+            f"• Sens: <b>{side}</b> • Régime: <b>{regime}</b>",
+        ]
+        if entry is not None: lines.append(f"• Entrée: <code>{float(entry):.6f}</code>")
+        if tp is not None:    lines.append(f"• TP: <code>{float(tp):.6f}</code>")
+        if sl is not None:    lines.append(f"• SL: <code>{float(sl):.6f}</code>")
+        if rr is not None:    lines.append(f"• RR: <b>{float(rr):.2f}</b>")
+
+        msg = "\n".join(lines)
+
+        # Essai d’image “signal” si dispo, sinon texte
+        try:
+            # Si tu as déjà une fonction dédiée, remplace par charting.generate_trade_chart(...)
+            img = charting.generate_trade_chart(symbol, None, signal)
+        except Exception:
+            img = None
+
+        if img is not None:
+            tg_send_with_photo(photo_buffer=img, caption=msg)
+        else:
+            tg_send(msg)
+    except Exception:
+        # Ne bloque jamais le flux si la notif échoue
+        pass
 
 # ==============================================================================
 # FONCTIONS DE COMMUNICATION DE BASE
