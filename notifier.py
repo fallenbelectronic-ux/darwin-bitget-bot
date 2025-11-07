@@ -577,13 +577,16 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
 
 def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
     """
-    Route Offset/Signaux/Restart : transmet message_id + callback_query_id pour l’édition en place.
+    Route Offset/Signaux/Restart/Stats : transmet message_id + callback_query_id pour l’édition en place.
     """
     try:
-        if not data: return False
+        if not data:
+            return False
         cmd = data.get("data")
-        if not cmd: return False
+        if not cmd:
+            return False
 
+        # ----- OFFSETS -----
         if cmd.startswith("OFS:"):
             msg = data.get("message") or {}
             chat = msg.get("chat") or {}
@@ -593,21 +596,37 @@ def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
             handle_offset_callback(cmd, chat_id=chat_id, message_id=message_id, callback_query_id=cq_id)
             return True
 
+        # ----- MENUS SIGNaux -----
         if cmd == "menu_signals":
             send_signals_menu()
             return True
-
         if cmd == "signals_pending":
             tg_show_signals_pending()
             return True
-
         if cmd == "signals_6h":
             tg_show_signals_6h()
             return True
 
-        if cmd == "restart_bot": handle_restart_callback(data); return True
-        if cmd == "confirm_restart_bot": handle_restart_confirm(data); return True
-        if cmd == "cancel_restart_bot": handle_restart_cancel(data); return True
+        # ----- STATS -----
+        if cmd == "get_stats":
+            tg_show_stats("24h")
+            return True
+        if cmd.startswith("stats:"):
+            period = cmd.split(":", 1)[1] if ":" in cmd else "24h"
+            tg_show_stats(period)
+            cq_id = data.get("id")
+            if cq_id:
+                tg_answer_callback_query(cq_id)
+            return True
+
+        # ----- RESTART -----
+        if cmd == "restart_bot":
+            handle_restart_callback(data); return True
+        if cmd == "confirm_restart_bot":
+            handle_restart_confirm(data); return True
+        if cmd == "cancel_restart_bot":
+            handle_restart_cancel(data); return True
+
         return False
     except Exception as e:
         tg_send_error("Callback routing", e)
@@ -942,6 +961,73 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (report): {e}")
+
+# ===== Stats persistées (depuis database.trades) =====
+
+def _fmt_pf(x):
+    try:
+        return "–" if (x is None) else f"{float(x):.2f}"
+    except Exception:
+        return "–"
+
+def _load_balance_optional() -> Optional[float]:
+    try:
+        b = database.get_setting('CURRENT_BALANCE_USDT', None)
+        if b is None: 
+            b = database.get_setting('LAST_BALANCE_USDT', None)
+        return float(b) if b is not None and str(b) != "" else None
+    except Exception:
+        return None
+
+def _render_stats_period(period: str) -> str:
+    period = (period or "24h").lower()
+    if period == "7d":
+        s = database.get_stats_7d()
+        title = "Bilan Hebdo (7j)"
+    elif period == "30d":
+        s = database.get_stats_30d()
+        title = "Bilan 30 jours"
+    elif period == "all":
+        s = database.get_stats_all()
+        title = "Bilan Global"
+    else:
+        s = database.get_stats_24h()
+        title = "Bilan Quotidien (24h)"
+
+    bal = _load_balance_optional()
+    header = f"<b>📊 {title}</b>\n\n"
+    if bal is not None:
+        header += f"💰 <b>Solde Actuel:</b> {bal:.2f} USDT\n\n"
+
+    body = (
+        "<b>Statistique</b>           <b>Valeur</b>\n"
+        "=================           ======\n"
+        f"Trades Total                {int(s.get('trades_total', 0))}\n"
+        f"Taux de Réussite           {float(s.get('win_rate', 0.0)):.2f}%\n"
+        f"PNL Net Total              {float(s.get('pnl_net_total', 0.0)):.2f} USDT\n"
+        f"Profit Factor              {_fmt_pf(s.get('profit_factor'))}\n"
+        f"Gain Moyen / Trade         {float(s.get('avg_gain_per_trade', 0.0)):.2f} USDT\n"
+        f"Ratio de Sharpe (approx.)  {float(s.get('sharpe_approx', 0.0)):.2f}\n"
+        f"Drawdown Max               {float(s.get('max_drawdown_pct', 0.0)):.2f}%\n"
+    )
+    return header + body
+
+def _stats_keyboard(active: str = "24h") -> Dict:
+    active = (active or "24h").lower()
+    def tag(lbl, key):
+        prefix = "✅ " if key == active else ""
+        return {"text": f"{prefix}{lbl}", "callback_data": f"stats:{key}"}
+    return {
+        "inline_keyboard": [
+            [tag("24h", "24h"), tag("7j", "7d"), tag("30j", "30d"), tag("Tout", "all")],
+            [{"text": "↩️ Retour", "callback_data": "main_menu"}]
+        ]
+    }
+
+def tg_show_stats(period: str = "24h"):
+    text = _render_stats_period(period)
+    kb = _stats_keyboard(period)
+    edit_main(text, kb)
 
 def format_open_positions(positions: List[Dict[str, Any]]):
     """Affiche les positions ouvertes dans le message principal (pas de spam) avec PNL si prix courant dispo
