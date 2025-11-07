@@ -765,60 +765,44 @@ def record_signal_from_trader(
 ) -> None:
     """
     Enregistre proprement un signal détecté (ou tenté) côté trader.
-    Mappe correctement vers la table `signals` (state, entry, sl, tp, rr, ts...).
-    Ne casse jamais le flux en cas d'erreur DB : log et continue.
+    - Utilise database.upsert_signal(sig: dict, state: str) quand disponible (signature correcte).
+    - Fallback vers insert_signal/save_signal si nécessaire.
+    - Ne casse jamais le flux en cas d'erreur DB.
     """
-    # Normalisation côté DB (la table `signals` attend: symbol, side, timeframe, regime, entry, sl, tp, rr, ts, state)
+    payload = {
+        "symbol": str(symbol),
+        "side": str(side).lower(),
+        "timeframe": str(timeframe),
+        "ts": int(ts),
+        "price": float(price),
+        "rr": float(rr) if rr is not None else 0.0,
+        "regime": str(regime) if regime is not None else "",
+        "pattern": str(pattern) if pattern is not None else "",
+        "meta": dict(meta or {}),
+    }
+    state = str(status or "PENDING")
+
     try:
-        # ts en millisecondes (la DB accepte sec ou ms, mais on homogénéise en ms ici)
-        try:
-            ts_val = float(ts)
-            ts_ms = int(ts_val if ts_val > 10_000_000_000 else ts_val * 1000.0)
-        except Exception:
-            ts_ms = int(time.time() * 1000)
-
-        side_norm = str(side).lower()
-        entry = float(price) if price is not None else 0.0
-
-        sl = None
-        tp = None
-        if isinstance(meta, dict):
-            try: sl = float(meta.get("sl")) if meta.get("sl") is not None else None
-            except Exception: sl = None
-            try: tp = float(meta.get("tp")) if meta.get("tp") is not None else None
-            except Exception: tp = None
-
-        sig_payload = {
-            "symbol": str(symbol),
-            "side": side_norm,
-            "timeframe": str(timeframe),
-            "regime": str(regime) if regime is not None else "",
-            "entry": float(entry),
-            "sl": float(sl) if sl is not None else 0.0,
-            "tp": float(tp) if tp is not None else 0.0,
-            "rr": float(rr) if rr is not None else 0.0,
-            "ts": int(ts_ms),
-        }
-        state = str(status).upper() if status else "PENDING"
-
-        # Utiliser l’API de compat côté database (évite l’erreur d’arguments inattendus)
-        if hasattr(database, "insert_signal"):
-            database.insert_signal(sig=sig_payload, state=state)
+        if hasattr(database, "upsert_signal"):
+            # ✅ signature attendue: upsert_signal(sig: Dict, state: str = "PENDING")
+            database.upsert_signal(payload, state=state)
+        elif hasattr(database, "insert_signal"):
+            database.insert_signal(**payload, state=state)  # type: ignore[arg-type]
         elif hasattr(database, "save_signal"):
-            database.save_signal(sig=sig_payload, state=state)
-        elif hasattr(database, "upsert_signal"):
-            database.upsert_signal(sig_payload, state=state)
+            database.save_signal(**payload, state=state)    # type: ignore[arg-type]
         else:
-            # Dernier recours : trace Telegram sans bloquer
             try:
-                notifier.tg_send(f"ℹ️ Signal non persisté (API DB manquante): {symbol} {side_norm} {timeframe} @ {entry}")
+                notifier.tg_send(
+                    f"ℹ️ Signal non persisté (API DB manquante): "
+                    f"{symbol} {side} {timeframe} @ {price} [{state}]"
+                )
             except Exception:
                 pass
-
     except Exception as e:
-        # On ne laisse jamais une erreur DB casser le trader.
         try:
-            notifier.tg_send(f"⚠️ Échec enregistrement signal: {symbol} {side} {timeframe} @ {price} — {e}")
+            notifier.tg_send(
+                f"⚠️ Échec enregistrement signal: {symbol} {side} {timeframe} @ {price} — {e}"
+            )
         except Exception:
             pass
 
