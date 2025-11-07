@@ -703,7 +703,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
     """
     Charge le DF préparé, appelle detect_signal(), enregistre le signal et notifie.
-    Ne casse rien si la DB n’a pas l’API attendue (record_signal_from_trader gère déjà).
+    Différencie désormais clairement :
+      - PENDING : dès qu’un signal est détecté
+      - VALID / SKIPPED : mis à jour plus tard par execute_trade() selon issue d’exécution
     Retourne le signal si valide, sinon None.
     """
     try:
@@ -713,6 +715,7 @@ def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> O
 
         sig = detect_signal(symbol, df)
         ts = int(time.time() * 1000)
+
         if not sig:
             # Traçage léger optionnel (SKIPPED) — tu peux commenter si tu ne veux pas de logs
             try:
@@ -725,7 +728,8 @@ def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> O
                 pass
             return None
 
-        # Enregistrement + notif
+        # ✅ marquer immédiatement le signal comme PENDING (en attente d’exécution)
+        sig["ts"] = ts
         try:
             record_signal_from_trader(
                 symbol=symbol,
@@ -736,7 +740,7 @@ def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> O
                 rr=float(sig.get("rr", 0.0)),
                 regime=str(sig.get("regime", "-")),
                 pattern="AUTO",
-                status="VALID",
+                status="PENDING",
                 meta={"tp": sig.get("tp"), "sl": sig.get("sl")}
             )
         except Exception:
@@ -751,6 +755,7 @@ def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> O
     except Exception:
         return None
 
+
 def record_signal_from_trader(
     symbol: str,
     side: str,
@@ -764,10 +769,9 @@ def record_signal_from_trader(
     meta: Optional[Dict[str, Any]] = None
 ) -> None:
     """
-    Enregistre proprement un signal détecté (ou tenté) côté trader.
-    - Utilise database.upsert_signal(sig: dict, state: str) quand disponible (signature correcte).
-    - Fallback vers insert_signal/save_signal si nécessaire.
-    - Ne casse jamais le flux en cas d'erreur DB.
+    Enregistre/Met à jour un signal détecté par le trader.
+    - Clé logique: (symbol, timeframe, ts) ⇒ permet de passer PENDING → VALID/SKIPPED sans doublon.
+    - Utilise database.upsert_signal(sig, state) si dispo, sinon fallback tolerant.
     """
     payload = {
         "symbol": str(symbol),
@@ -784,12 +788,18 @@ def record_signal_from_trader(
 
     try:
         if hasattr(database, "upsert_signal"):
-            # ✅ signature attendue: upsert_signal(sig: Dict, state: str = "PENDING")
             database.upsert_signal(payload, state=state)
         elif hasattr(database, "insert_signal"):
-            database.insert_signal(**payload, state=state)  # type: ignore[arg-type]
+            # on tente une mise à jour simple si déjà existant
+            try:
+                if hasattr(database, "update_signal_state"):
+                    database.update_signal_state(symbol, timeframe, ts, state, payload.get("meta", {}))
+                else:
+                    database.insert_signal(**payload, state=state)  # type: ignore[arg-type]
+            except Exception:
+                database.insert_signal(**payload, state=state)      # type: ignore[arg-type]
         elif hasattr(database, "save_signal"):
-            database.save_signal(**payload, state=state)    # type: ignore[arg-type]
+            database.save_signal(**payload, state=state)            # type: ignore[arg-type]
         else:
             try:
                 notifier.tg_send(
@@ -1524,86 +1534,93 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
 
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
-    """Exécute un trade avec sécurisations Bitget:
-       - Sync optionnelle avant exécution
-       - Validation SL/TP vs règles Bitget (TP côté opposé au prix courant, SL côté mark)
-       - Gap de sécurité vs prix d’entrée
-       - Cap de la taille par marge/filters marché
-       - Ordre d’entrée MARKET + SL/TP MARKET reduceOnly (trigger mark)
-    """
+    """Exécute un trade avec sécurisations Bitget et met à jour l’état du signal PENDING → VALID/SKIPPED."""
     _ensure_bitget_mix_options(ex)
+
+    # helper interne : mise à jour d’état du signal s’il est horodaté
+    def _update_signal_state(state: str, reason: Optional[str] = None, tp: Optional[float] = None, sl: Optional[float] = None):
+        try:
+            ts_sig = int(signal.get("ts", 0) or 0)
+            if ts_sig <= 0:
+                return
+            meta = {}
+            if tp is not None: meta["tp"] = float(tp)
+            if sl is not None: meta["sl"] = float(sl)
+            if reason: meta["reason"] = str(reason)
+            record_signal_from_trader(
+                symbol=symbol,
+                side=(signal.get("side") or "-"),
+                timeframe=TIMEFRAME,
+                ts=ts_sig,
+                price=float(entry_price),
+                rr=float(signal.get("rr", 0.0)),
+                regime=str(signal.get("regime", "-")),
+                pattern="AUTO",
+                status=state,
+                meta=meta
+            )
+        except Exception:
+            pass
 
     is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
 
-    # --- Sync/guard optionnels avant toute exécution ---
     try:
         if str(database.get_setting('SYNC_BEFORE_EXECUTE', 'true')).lower() == 'true':
             sync_positions_with_exchange(ex)
     except Exception:
         pass
 
-    # --- Guards de base ---
     if len(database.get_open_positions()) >= max_pos:
+        _update_signal_state("SKIPPED", reason=f"max_positions({max_pos})")
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
     if database.is_position_open(symbol):
+        _update_signal_state("SKIPPED", reason="already_open_in_db")
         return False, "Rejeté: Position déjà ouverte (DB)."
 
     balance = get_usdt_balance(ex)
     if balance is None or balance <= 10:
+        _update_signal_state("SKIPPED", reason=f"low_balance({balance or 0:.2f} USDT)")
         return False, f"Rejeté: Solde insuffisant ({balance or 0:.2f} USDT) ou erreur API."
 
-    # --- Prépare SL / TP issus du signal ---
-    side = (signal.get('side') or '').lower()  # 'buy' | 'sell'
+    side = (signal.get('side') or '').lower()
     is_long = (side == 'buy')
     price_ref = float(entry_price)
 
     sl = float(signal['sl'])
     tp = float(signal['tp'])
 
-    # Gap de sécurité vs prix d’entrée
     try:
         gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
     except Exception:
         gap_pct = 0.0003
     if is_long:
-        if sl >= price_ref:
-            sl = price_ref * (1.0 - gap_pct)
-        if tp <= price_ref:
-            tp = price_ref * (1.0 + gap_pct)
+        if sl >= price_ref: sl = price_ref * (1.0 - gap_pct)
+        if tp <= price_ref: tp = price_ref * (1.0 + gap_pct)
     else:
-        if sl <= price_ref:
-            sl = price_ref * (1.0 + gap_pct)
-        if tp >= price_ref:
-            tp = price_ref * (1.0 - gap_pct)
+        if sl <= price_ref: sl = price_ref * (1.0 + gap_pct)
+        if tp >= price_ref: tp = price_ref * (1.0 - gap_pct)
 
-    # Précisions marché
     market = ex.market(symbol) or {}
     tick_size = _bitget_tick_size(market)
 
-    # Valide SL côté 'mark' (Bitget)
     mark_now = _current_mark_price(ex, symbol)
     sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
 
-    # Valide TP selon règle Bitget: short → TP < current ; long → TP > current
     try:
-        side_for_tp = ('buy' if is_long else 'sell')  # règle _validate_tp_for_side
+        side_for_tp = ('buy' if is_long else 'sell')
         tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(tp))
     except Exception:
-        # fallback minimal si validation échoue
         t = ex.fetch_ticker(symbol) or {}
         last_px = float(t.get("last") or t.get("close") or price_ref)
-        if is_long and tp <= last_px:
-            tp = last_px * (1.0 + gap_pct)
-        if (not is_long) and tp >= last_px:
-            tp = last_px * (1.0 - gap_pct)
+        if is_long and tp <= last_px: tp = last_px * (1.0 + gap_pct)
+        if (not is_long) and tp >= last_px: tp = last_px * (1.0 - gap_pct)
 
-    # Ajuste quantités avec SL final
     quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, price_ref, sl)
     if quantity <= 0:
+        _update_signal_state("SKIPPED", reason="qty_zero_after_sizing")
         return False, f"Rejeté: Quantité calculée nulle ({quantity})."
 
-    # Cap par marge + filtres marché
     ref_price = price_ref
     if not ref_price:
         try:
@@ -1614,6 +1631,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
     capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, abs(float(quantity)), ref_price or price_ref)
     if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
+        _update_signal_state("SKIPPED", reason="insufficient_after_cap")
         try:
             need_notional = (abs(float(quantity)) * (ref_price or price_ref or 0.0))
             max_notional = meta.get("max_notional")
@@ -1632,24 +1650,11 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             pass
         return False, "Ordre annulé: solde insuffisant."
 
-    if meta.get("reason") == "CAPPED_BY_MARGIN" and capped_qty > 0:
-        try:
-            reduced_pct = (1.0 - (capped_qty / max(abs(float(quantity)), 1e-12))) * 100.0
-            notifier.tg_send(
-                f"⚠️ Taille réduite par marge\n"
-                f"• {symbol} {side.upper()} MARKET\n"
-                f"• Demandée: <code>{quantity}</code> → Envoyée: <code>{capped_qty}</code> "
-                f"(-{reduced_pct:.2f}%)\n"
-                f"• Levier: <code>{meta.get('leverage')}</code> | Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>"
-            )
-        except Exception:
-            pass
-
     notional_value = capped_qty * price_ref
     if notional_value < MIN_NOTIONAL_VALUE:
+        _update_signal_state("SKIPPED", reason=f"below_min_notional({notional_value:.2f}<{MIN_NOTIONAL_VALUE})")
         return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
 
-    # Arrondis de précision
     try:
         sl = float(ex.price_to_precision(symbol, sl))
         tp = float(ex.price_to_precision(symbol, tp))
@@ -1658,6 +1663,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         quantity = float(capped_qty)
 
     if quantity <= 0:
+        _update_signal_state("SKIPPED", reason="qty_zero_after_precision")
         return False, "Rejeté: quantité finale arrondie à 0."
 
     final_entry_price = price_ref
@@ -1667,28 +1673,23 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
     common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
 
-    # --- Envoi ordres ---
     if not is_paper_mode:
         try:
-            # Contexte symbole
             try:
                 ex.set_leverage(LEVERAGE, symbol)
                 try: ex.set_margin_mode('cross', symbol)
                 except Exception: pass
-                try: ex.set_position_mode(False, symbol)  # oneway
+                try: ex.set_position_mode(False, symbol)
                 except Exception: pass
             except Exception:
                 pass
 
-            # Entrée MARKET
             order = ex.create_market_order(symbol, side, quantity, params=common_params)
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
-            # Place SL/TP (close side)
             close_side = 'sell' if is_long else 'buy'
 
-            # Re-valide SL juste avant pose (mark peut avoir changé)
             mark_now = _current_mark_price(ex, symbol)
             sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
 
@@ -1702,13 +1703,13 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             )
 
         except Exception as e:
-            # Tentative de réduire si entrée partielle
             try:
                 close_side = 'sell' if is_long else 'buy'
                 ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
+            _update_signal_state("SKIPPED", reason=f"execution_error:{e}")
             return False, f"Erreur d'exécution: {e}"
 
     # --- DB + Notifs ---
@@ -1730,6 +1731,9 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         entry_rsi=float(signal.get('entry_rsi', 0.0) or 0.0),
     )
 
+    # ✅ marquer le signal comme VALID après ouverture
+    _update_signal_state("VALID", tp=float(tp), sl=float(sl))
+
     try:
         chart_image = charting.generate_trade_chart(symbol, df, signal)
     except Exception:
@@ -1747,6 +1751,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         pass
 
     return True, "Position ouverte avec succès."
+
 
 
 def get_tp_offset_pct() -> float:
@@ -1837,10 +1842,11 @@ def manage_open_positions(ex: ccxt.Exchange):
         live_map = {}
         for p in (ex_pos_list or []):
             try:
+                # _fetch_positions_safe() normalise la taille sous la clé 'size'
                 sym = p.get('symbol') or (p.get('info', {}) or {}).get('symbol')
-                contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+                size_val = float(p.get('size') or p.get('contracts') or p.get('positionAmt') or 0.0)
                 if sym:
-                    live_map[sym] = live_map.get(sym, 0.0) + max(0.0, contracts)
+                    live_map[sym] = live_map.get(sym, 0.0) + max(0.0, size_val)
             except Exception:
                 continue
     except Exception:
@@ -2198,6 +2204,7 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         except Exception as e:
             print(f"Erreur TP dynamique {symbol}: {e}")
+
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
