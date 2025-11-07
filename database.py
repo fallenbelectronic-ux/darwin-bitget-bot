@@ -83,11 +83,6 @@ def setup_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
         conn.commit()
 
-        # Index signaux
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
-        conn.commit()
-
 def _dedup_signals(conn: sqlite3.Connection) -> None:
     """Supprime les doublons (symbol, side, timeframe, ts) en gardant le plus récent."""
     try:
