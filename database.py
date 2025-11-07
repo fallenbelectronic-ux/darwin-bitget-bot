@@ -54,11 +54,21 @@ def setup_database():
                 sl REAL,
                 tp REAL,
                 rr REAL,
-                ts INTEGER NOT NULL,          -- epoch en secondes ou millisecondes
-                state TEXT                    -- ex: 'PENDING', 'VALID_SKIPPED', ...
+                ts INTEGER NOT NULL,
+                state TEXT
             );
         """)
-        # Migrations idempotentes (ignore si déjà présentes)
+
+        # Dédup avant contrainte d'unicité (garde le dernier enregistrement)
+        _dedup_signals(conn)
+
+        # Unicité logique d’un signal : même symbol/side/timeframe/ts
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_uni
+            ON signals(symbol, side, timeframe, ts)
+        """)
+
+        # Migrations idempotentes
         _ensure_column(conn, "trades", "pnl_percent", "REAL", "0")
         _ensure_column(conn, "trades", "entry_atr", "REAL", "0")
         _ensure_column(conn, "trades", "entry_rsi", "REAL", "0")
@@ -69,10 +79,31 @@ def setup_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_status ON trades(symbol, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_close_ts ON trades(close_timestamp)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
+        conn.commit()
+
         # Index signaux
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
         conn.commit()
+
+def _dedup_signals(conn: sqlite3.Connection) -> None:
+    """Supprime les doublons (symbol, side, timeframe, ts) en gardant le plus récent."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM signals
+             WHERE rowid NOT IN (
+                   SELECT MAX(rowid)
+                     FROM signals
+                    GROUP BY symbol, side, timeframe, ts
+             )
+        """)
+        conn.commit()
+    except sqlite3.OperationalError:
+        # table peut ne pas exister lors du tout premier run
+        pass
 
 def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """
@@ -481,7 +512,7 @@ def purge_persistence(retention_days: int = 180, max_execs: int = 10000, max_ord
 from math import sqrt
 from datetime import datetime, timedelta, timezone
 
-def _compute_stats_from_pnls(pnls: list[float]) -> Dict[str, Any]:
+def _compute_stats_from_pnls(pnls: List[float]) -> Dict[str, Any]:
     n = len(pnls)
     if n == 0:
         return {
@@ -561,3 +592,64 @@ def get_stats_30d(now: Optional[datetime] = None) -> Dict[str, Any]:
 
 def get_stats_all() -> Dict[str, Any]:
     return get_stats_since_epoch(0)
+
+def upsert_signal(sig: Dict[str, Any], state: str = "PENDING") -> int:
+    """
+    Insère ou met à jour un signal par (symbol, side, timeframe, ts).
+    Champs pris en compte: symbol, side, timeframe, regime, entry, sl, tp, rr, ts, state.
+    Retourne l'id du signal.
+    """
+    required = ("symbol", "side", "timeframe", "ts")
+    for k in required:
+        if k not in sig:
+            raise ValueError(f"upsert_signal: champ manquant '{k}'")
+
+    payload = {
+        "symbol": str(sig["symbol"]),
+        "side": str(sig["side"]).lower(),
+        "timeframe": str(sig["timeframe"]),
+        "regime": str(sig.get("regime") or ""),
+        "entry": float(sig.get("entry") or 0.0),
+        "sl": float(sig.get("sl") or 0.0),
+        "tp": float(sig.get("tp") or 0.0),
+        "rr": float(sig.get("rr") or 0.0),
+        "ts": int(sig["ts"]),
+        "state": str(state),
+    }
+
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        # Existe déjà ?
+        row = cur.execute(
+            "SELECT id FROM signals WHERE symbol=? AND side=? AND timeframe=? AND ts=?",
+            (payload["symbol"], payload["side"], payload["timeframe"], payload["ts"])
+        ).fetchone()
+
+        if row:
+            cur.execute("""
+                UPDATE signals
+                   SET regime = ?, entry = ?, sl = ?, tp = ?, rr = ?, state = ?
+                 WHERE id = ?
+            """, (payload["regime"], payload["entry"], payload["sl"], payload["tp"],
+                  payload["rr"], payload["state"], row["id"]))
+            conn.commit()
+            return int(row["id"])
+        else:
+            cur.execute("""
+                INSERT INTO signals(symbol, side, timeframe, regime, entry, sl, tp, rr, ts, state)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (payload["symbol"], payload["side"], payload["timeframe"], payload["regime"],
+                  payload["entry"], payload["sl"], payload["tp"], payload["rr"],
+                  payload["ts"], payload["state"]))
+            conn.commit()
+            return int(cur.lastrowid)
+
+def set_signal_state(symbol: str, side: str, timeframe: str, ts: int, new_state: str) -> bool:
+    """Change l'état d’un signal identifié par (symbol, side, timeframe, ts). Retourne True si modifié."""
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        res = cur.execute("""
+            UPDATE signals SET state=? WHERE symbol=? AND side=? AND timeframe=? AND ts=?
+        """, (str(new_state), str(symbol), str(side).lower(), str(timeframe), int(ts)))
+        conn.commit()
+        return res.rowcount > 0
