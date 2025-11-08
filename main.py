@@ -24,7 +24,7 @@ API_SECRET       = os.getenv("BITGET_API_SECRET", "")
 PASSPHRASSE      = os.getenv("BITGET_API_PASSWORD", "") or os.getenv("BITGET_PASSPHRASSE", "")
 
 TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
-UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "30"))
+UNIVERSE_SIZE    = int(os.getenv("UNIVERSE_SIZE", "500"))
 MIN_RR           = float(os.getenv("MIN_RR", "3.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
 LOOP_DELAY       = int(os.getenv("LOOP_DELAY", "5"))
