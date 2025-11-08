@@ -861,11 +861,11 @@ def send_main_menu(is_paused: bool):
     risk = getattr(trader, "RISK_PER_TRADE_PERCENT", 1.0)
     leverage = getattr(trader, "LEVERAGE", 1)
 
-    # NEW: Univers scanné
+    # Univers scanné (fallback 500)
     try:
-        universe_size = int(database.get_setting('UNIVERSE_SIZE', os.getenv("UNIVERSE_SIZE", "30")))
+        universe_size = int(database.get_setting('UNIVERSE_SIZE', os.getenv("UNIVERSE_SIZE", "500")))
     except Exception:
-        universe_size = int(os.getenv("UNIVERSE_SIZE", "30"))
+        universe_size = int(os.getenv("UNIVERSE_SIZE", "500"))
 
     # Stratégie actuelle
     current_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
@@ -894,7 +894,6 @@ def send_main_menu(is_paused: bool):
     keyboard = get_main_menu_keyboard(is_paused)
     msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
 
-    # Essayer d'éditer pour éviter le spam
     if TG_TOKEN and TG_CHAT_ID and msg_id:
         try:
             payload_edit = {
@@ -911,7 +910,6 @@ def send_main_menu(is_paused: bool):
         except Exception as e:
             print(f"Erreur editMessageText: {e}")
 
-    # Sinon envoyer et mémoriser l'id (⚠️ pas d’épinglage)
     try:
         payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
         r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
