@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 import reporting
 import database
 import trader
+import charting
 
 
 # --- PARAMÈTRES TELEGRAM ---
