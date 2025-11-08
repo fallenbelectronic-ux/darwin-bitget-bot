@@ -50,106 +50,79 @@ def get_universe_size() -> int:
         except Exception:
             return 500
 
-def get_universe_by_market_cap(ex: ccxt.Exchange, size: int) -> list:
+def get_universe_by_market_cap(ex: ccxt.Exchange, size: int) -> List[str]:
     """
-    Construit l'univers des paires FUTURES USDT Bitget (linéaires) en top capitalisation.
-    Cache 1×/jour dans settings.UNIVERSE_BY_MCAP_JSON et settings.UNIVERSE_BY_MCAP_TS.
-    Exclut les stablecoins (USDT, USDC, FDUSD, BUSD, TUSD, DAI, PYUSD, USD, EUR, GBP).
-    Retourne une liste de symbols ccxt (ex: 'BTC/USDT:USDT').
+    Retourne la liste des paires futures USDT Bitget (format CCXT) triées par market cap (CoinGecko),
+    sans limite artificielle à 100. Supporte jusqu'à 500 via pagination (250/par page).
+    On retourne strictement les 'size' premières paires disponibles sur Bitget.
+
+    Cache léger en RAM pour la journée courante + taille demandée.
     """
-    import time, json
+    import time
+    import requests
+
+    # --- cache process-local (clé = (jour_utc, size)) ---
+    now_day = time.gmtime().tm_yday
+    key = (now_day, int(size))
+    if not hasattr(get_universe_by_market_cap, "_cache"):
+        get_universe_by_market_cap._cache = {}
+    cache = get_universe_by_market_cap._cache
+    if key in cache:
+        return cache[key][:size]
+
+    # Charger les marchés Bitget une fois
     try:
-        cached_ts = float(database.get_setting('UNIVERSE_BY_MCAP_TS', '0') or '0')
-    except Exception:
-        cached_ts = 0.0
-    now = time.time()
-    one_day = 23 * 3600  # fenêtre ~1 jour
-
-    if now - cached_ts < one_day:
-        try:
-            raw = database.get_setting('UNIVERSE_BY_MCAP_JSON', '[]') or '[]'
-            cached = json.loads(raw)
-            if isinstance(cached, list) and cached:
-                return cached[:int(size)]
-        except Exception:
-            pass  # on retombe en mode rebuild
-
-    # Rebuild
-    try:
-        markets = ex.load_markets()
-    except Exception:
-        markets = {}
-
-    eligible = []
-    for m in markets.values():
-        try:
-            if m.get('swap') and m.get('linear') and m.get('quote') == 'USDT' and m.get('active', True):
-                eligible.append(m)
-        except Exception:
-            continue
-
-    # Map bases disponibles côté Bitget
-    bitget_bases = {}
-    for m in eligible:
-        base = str(m.get('base') or '').upper()
-        if not base:
-            continue
-        # Conserver le meilleur symbole par base (peu importe ici, on classera ensuite)
-        if base not in bitget_bases:
-            bitget_bases[base] = []
-        bitget_bases[base].append(m.get('symbol'))
-
-    # Récup liste CoinGecko (cache 1j)
-    cg_list = _coingecko_coin_list_cached()
-
-    # symbols stables à exclure
-    STABLES = {'USDT','USDC','FDUSD','BUSD','TUSD','DAI','PYUSD','USD','EUR','GBP'}
-
-    # Map base -> [cg_ids] par symbol
-    sym_to_ids = {}
-    for coin in cg_list:
-        try:
-            sym = str(coin.get('symbol') or '').upper()
-            cid = str(coin.get('id') or '')
-            if not sym or not cid:
-                continue
-            if sym not in sym_to_ids:
-                sym_to_ids[sym] = []
-            sym_to_ids[sym].append(cid)
-        except Exception:
-            continue
-
-    # Pour chaque base Bitget, récupérer la meilleure mcap via CG et scorer
-    base_scores = []
-    bases = [b for b in bitget_bases.keys() if b and b not in STABLES]
-    mcap_map = _coingecko_market_caps_for_symbols(bases, sym_to_ids)
-
-    for base in bases:
-        mc = mcap_map.get(base, 0.0) or 0.0
-        if mc > 0:
-            base_scores.append((base, mc))
-
-    # Tri par market cap décroissant + sélection
-    base_scores.sort(key=lambda x: x[1], reverse=True)
-
-    out_symbols = []
-    for base, _ in base_scores:
-        syms = bitget_bases.get(base, [])
-        if not syms:
-            continue
-        # Choisir le 1er symbol (toutes sont des swaps USDT linéaires)
-        out_symbols.append(syms[0])
-        if len(out_symbols) >= int(size):
-            break
-
-    # Cache en DB
-    try:
-        database.set_setting('UNIVERSE_BY_MCAP_JSON', json.dumps(out_symbols))
-        database.set_setting('UNIVERSE_BY_MCAP_TS', str(now))
+        ex.load_markets()
     except Exception:
         pass
+    markets = getattr(ex, "markets", {}) or {}
+    symbols_set = set(markets.keys()) if isinstance(markets, dict) else set()
 
-    return out_symbols
+    def _to_ccxt_candidates(base: str) -> List[str]:
+        base = (base or "").upper().replace(" ", "").replace("-", "")
+        # variantes les plus fréquentes côté Bitget futures USDT
+        return [f"{base}/USDT:USDT", f"{base}/USDT"]
+
+    # --- Pagination CoinGecko: 250 par page, autant de pages que nécessaire ---
+    per_page = 250
+    pages = (int(size) + per_page - 1) // per_page
+    picked: List[str] = []
+
+    for page in range(1, pages + 1):
+        try:
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+            params = {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": per_page,
+                "page": page,
+                "price_change_percentage": "24h",
+                "sparkline": "false",
+            }
+            r = requests.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            items = r.json() or []
+        except Exception:
+            break  # en cas d'erreur réseau, on sort proprement (build_universe gère le fallback)
+
+        for it in items:
+            # On prend le 'symbol' CoinGecko (ex: "btc", "eth", "sol")
+            base = str(it.get("symbol", "")).upper()
+            if not base:
+                continue
+            for cand in _to_ccxt_candidates(base):
+                if cand in symbols_set:
+                    picked.append(cand)
+                    break  # on a mappé cette base => passe à la suivante
+            if len(picked) >= size:
+                break
+        if len(picked) >= size:
+            break
+
+    # Mémorise dans le cache du jour (même si incomplet, on laisse le fallback du caller gérer)
+    cache[key] = picked[:]
+    return picked[:size]
+
 
 
 def _coingecko_coin_list_cached() -> list:
