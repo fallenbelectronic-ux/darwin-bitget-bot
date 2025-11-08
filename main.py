@@ -530,6 +530,47 @@ def check_scheduled_reports():
 # ==============================================================================
 # BOUCLES ET MAIN
 # ==============================================================================
+def check_restart_request():
+    """
+    Si RESTART_REQUESTED == 'true', consomme prudemment les updates restants (si offset connu),
+    réinitialise le drapeau puis relance le process via os.execl.
+    """
+    try:
+        flag = str(database.get_setting('RESTART_REQUESTED', 'false')).lower() == 'true'
+    except Exception:
+        flag = False
+
+    if not flag:
+        return
+
+    # Tenter d'avancer l'offset Telegram si on a mémorisé un update_id
+    try:
+        last_uid_raw = database.get_setting('LAST_TELEGRAM_UPDATE_ID', None)
+        if last_uid_raw is not None and str(last_uid_raw).strip() != "":
+            try:
+                import requests  # local import pour éviter hard deps au chargement
+                from notifier import TELEGRAM_API  # réutilise la même base d'URL
+                offset = int(last_uid_raw) + 1
+                requests.get(f"{TELEGRAM_API}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=3)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Réarmer le drapeau AVANT relance
+    try:
+        database.set_setting('RESTART_REQUESTED', 'false')
+    except Exception:
+        pass
+
+    # Relance "propre" du process
+    try:
+        import os, sys
+        os.execl(sys.executable, sys.executable, *sys.argv)
+    except Exception:
+        # En cas d'échec execl, on termine en dernier recours
+        import os
+        os._exit(0)
 
 def route_inline_restart_callback(update: Dict[str, Any]) -> bool:
     """
@@ -546,7 +587,6 @@ def route_inline_restart_callback(update: Dict[str, Any]) -> bool:
 
 def poll_telegram_updates():
     """Récupère et distribue les mises à jour de Telegram. C'est le cœur de la réactivité."""
-    # Anti-doublon simple: on ignore un même callback_id reçu 2x (retries Telegram)
     if not hasattr(poll_telegram_updates, "_last_cb_id"):
         poll_telegram_updates._last_cb_id = None
 
@@ -554,8 +594,14 @@ def poll_telegram_updates():
     updates = notifier.tg_get_updates(_last_update_id + 1 if _last_update_id else None)
     for upd in updates:
         _last_update_id = upd.get("update_id", _last_update_id)
+        try:
+            # Sauvegarde l’offset courant pour un redémarrage propre
+            if _last_update_id is not None:
+                database.set_setting('LAST_TELEGRAM_UPDATE_ID', str(int(_last_update_id)))
+        except Exception:
+            pass
 
-        # --- Routage prioritaire (OFS:, signaux, restart...) déjà géré côté notifier ---
+        # Routage prioritaire (OFS:, signaux, restart...) déjà géré côté notifier
         if route_inline_restart_callback(upd):
             continue
 
@@ -563,9 +609,8 @@ def poll_telegram_updates():
             cb = upd['callback_query']
             cb_id = cb.get('id')
             if cb_id and cb_id == poll_telegram_updates._last_cb_id:
-                continue  # ← ignore le doublon exact
+                continue
             poll_telegram_updates._last_cb_id = cb_id
-
             process_callback_query(cb)
         elif 'message' in upd:
             process_message(upd['message'])
@@ -576,12 +621,16 @@ def telegram_listener_loop():
     print("🤖 Thread Telegram démarré.")
     while True:
         try:
+            # ← vérifie en tête de boucle si un redémarrage a été demandé
+            check_restart_request()
+
             poll_telegram_updates()
             check_scheduled_reports()
             time.sleep(0.5)
         except Exception as e:
             print(f"Erreur dans le thread Telegram: {e}")
             time.sleep(5)
+
 
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
@@ -590,6 +639,8 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
 
     while True:
         try:
+            check_restart_request()
+            
             with _lock: is_paused = _paused
             if is_paused:
                 print("   -> (Pause)"); time.sleep(LOOP_DELAY); continue
