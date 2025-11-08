@@ -104,9 +104,18 @@ def create_exchange():
     return ex
 
 def build_universe(ex: ccxt.Exchange) -> List[str]:
-    """Construit la liste des paires à trader."""
+    """Construit la liste des paires à trader (TOP market cap futures USDT Bitget, fallback volume 24h)."""
     print("Construction de l'univers de trading...")
     size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
+    # 1) Essai via market cap (cache 1×/jour dans trader.get_universe_by_market_cap)
+    try:
+        syms = trader.get_universe_by_market_cap(ex, size)
+        if syms:
+            return syms[:size]
+    except Exception as e:
+        print(f"Univers mcap indisponible, fallback volume 24h — {e}")
+
+    # 2) Fallback : volume 24h (logique précédente)
     try:
         ex.load_markets()
         tickers = ex.fetch_tickers()
@@ -114,7 +123,8 @@ def build_universe(ex: ccxt.Exchange) -> List[str]:
         sorted_symbols = sorted(swap_tickers, key=lambda s: swap_tickers[s]['quoteVolume'], reverse=True)
         return sorted_symbols[:size]
     except Exception as e:
-        print(f"Erreur univers: {e}"); return []
+        print(f"Erreur univers (fallback): {e}")
+        return []
 
 def start_live_sync(ex):
     t = threading.Thread(target=_live_sync_worker, args=(ex,), daemon=True)
@@ -401,7 +411,6 @@ def process_callback_query(callback_query: Dict):
             notifier.send_signals_menu()
 
         # ⚠️ SUPPRIMÉ: le bloc 'signals_6h' ici (déjà géré par notifier.try_handle_inline_callback)
-        # Cela évite un double appel qui créait parfois un deuxième message.
 
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
@@ -411,7 +420,7 @@ def process_callback_query(callback_query: Dict):
             notifier.send_strategy_menu(current_strategy)
 
         elif data == 'show_mode':
-            current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
+            current_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
             notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
 
         elif data == 'switch_to_REAL':
@@ -454,8 +463,7 @@ def process_message(message: Dict):
 
     elif command == "/mode":
         # --- LOGIQUE POUR LA COMMANDE /mode ---
-        current_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true').lower() == 'true'
-        # Assurez-vous que cette fonction existe bien dans votre notifier.py
+        current_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
         notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
 
     elif command == "/offset":
@@ -476,7 +484,6 @@ def process_message(message: Dict):
             except ValueError:
                 notifier.tg_send("❌ Valeur invalide. Utilisez: /setuniverse 30")
 
-                
         elif command == "/setmaxpos" and len(parts) > 1:
             try:
                 max_p = int(parts[1])
@@ -487,13 +494,13 @@ def process_message(message: Dict):
                     notifier.tg_send("❌ Le nombre doit être >= 0.")
             except ValueError:
                 notifier.tg_send("❌ Valeur invalide. Utilisez: /setmaxpos 3")
-   
+
     elif command == "/stats":
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
-    
+
 def check_scheduled_reports():
     """Gère les rapports automatiques."""
     global _last_daily_report_day, _last_weekly_report_day
@@ -579,6 +586,7 @@ def telegram_listener_loop():
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
     last_hour = -1
+    last_day = -1  # refresh univers 1×/jour
 
     while True:
         try:
@@ -586,7 +594,25 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             if is_paused:
                 print("   -> (Pause)"); time.sleep(LOOP_DELAY); continue
 
-            curr_hour = datetime.now(timezone.utc).hour
+            now_utc = datetime.now(timezone.utc)
+            curr_hour = now_utc.hour
+            curr_day = now_utc.day
+
+            # Refresh univers 1×/jour (utilise le cache 1j de trader.get_universe_by_market_cap)
+            if curr_day != last_day:
+                try:
+                    size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
+                except Exception:
+                    size = UNIVERSE_SIZE
+                try:
+                    new_universe = trader.get_universe_by_market_cap(ex, size)
+                    if new_universe:
+                        universe = new_universe[:size]
+                        print(f"🔁 Univers rafraîchi ({len(universe)} paires).")
+                except Exception as e:
+                    print(f"Refresh univers échoué — on conserve l'existant: {e}")
+                last_day = curr_day
+
             if curr_hour != last_hour:
                 select_and_execute_best_pending_signal(ex)
                 last_hour = curr_hour
@@ -604,7 +630,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                 signal = trader.detect_signal(symbol, df)
                 if signal:
                     with _lock:
-                        # Nouveau signal → pending (évite doublon symbole)
                         if symbol not in get_pending_signals():
                             print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
                             set_pending_signal(symbol, {
@@ -613,11 +638,9 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                                 'candle_timestamp': df.index[-1],
                                 'df': df
                             })
-                            # Alerte optionnelle contrôlée par setting
                             if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
                                 notifier.send_pending_signal_notification(symbol, signal)
 
-                        # Historique récent (indépendant du pending)
                         if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
                             _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
 
@@ -626,6 +649,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
         except Exception:
             err = traceback.format_exc()
             print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
+
 
 def main():
     database.setup_database()
