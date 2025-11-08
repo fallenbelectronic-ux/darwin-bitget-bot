@@ -1055,37 +1055,39 @@ def _load_balance_optional() -> Optional[float]:
         return None
 
 def _render_stats_period(period: str) -> str:
+    """
+    Construit le message Stats pour 24h / 7d / 30d / all à partir des TRADES fermés.
+    -> Récupère les trades sur la fenêtre, calcule les stats via reporting,
+       puis formate avec reporting.format_report_message (comme send_report).
+    """
     period = (period or "24h").lower()
+
+    # Fenêtre & titre
     if period == "7d":
-        s = database.get_stats_7d()
-        title = "Bilan Hebdo (7j)"
+        seconds = 7 * 24 * 60 * 60
+        title = "Bilan Hebdomadaire (7 jours)"
     elif period == "30d":
-        s = database.get_stats_30d()
+        seconds = 30 * 24 * 60 * 60
         title = "Bilan 30 jours"
     elif period == "all":
-        s = database.get_stats_all()
+        seconds = None
         title = "Bilan Global"
     else:
-        s = database.get_stats_24h()
+        seconds = 24 * 60 * 60
         title = "Bilan Quotidien (24h)"
 
-    bal = _load_balance_optional()
-    header = f"<b>📊 {title}</b>\n\n"
-    if bal is not None:
-        header += f"💰 <b>Solde Actuel:</b> {bal:.2f} USDT\n\n"
+    # Récupération trades fermés dans la fenêtre
+    try:
+        since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
+        trades = database.get_closed_trades_since(since_ts)
+    except Exception:
+        trades = []
 
-    body = (
-        "<b>Statistique</b>           <b>Valeur</b>\n"
-        "=================           ======\n"
-        f"Trades Total                {int(s.get('trades_total', 0))}\n"
-        f"Taux de Réussite           {float(s.get('win_rate', 0.0)):.2f}%\n"
-        f"PNL Net Total              {float(s.get('pnl_net_total', 0.0)):.2f} USDT\n"
-        f"Profit Factor              {_fmt_pf(s.get('profit_factor'))}\n"
-        f"Gain Moyen / Trade         {float(s.get('avg_gain_per_trade', 0.0)):.2f} USDT\n"
-        f"Ratio de Sharpe (approx.)  {float(s.get('sharpe_approx', 0.0)):.2f}\n"
-        f"Drawdown Max               {float(s.get('max_drawdown_pct', 0.0)):.2f}%\n"
-    )
-    return header + body
+    # Calcul stats + formatage
+    stats = reporting.calculate_performance_stats(trades)
+    balance = _load_balance_optional()
+    return reporting.format_report_message(title, stats, balance)
+
 
 def _stats_keyboard(active: str = "24h") -> Dict:
     active = (active or "24h").lower()
