@@ -36,6 +36,19 @@ BE_BUFFER_USDT  = float(os.getenv("BE_BUFFER_USDT","0.0"))     # buffer absolu o
 # ==============================================================================
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
 # ==============================================================================
+def get_universe_size() -> int:
+    """
+    Lit UNIVERSE_SIZE depuis la base (fallback sur l'env, défaut 500).
+    À appeler à chaque itération de scan pour prise en compte immédiate.
+    """
+    try:
+        val = database.get_setting('UNIVERSE_SIZE', os.getenv("UNIVERSE_SIZE", "500"))
+        return max(1, int(val))
+    except Exception:
+        try:
+            return max(1, int(os.getenv("UNIVERSE_SIZE", "500")))
+        except Exception:
+            return 500
 
 def get_universe_by_market_cap(ex: ccxt.Exchange, size: int) -> list:
     """
