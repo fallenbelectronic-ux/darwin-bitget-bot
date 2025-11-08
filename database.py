@@ -502,6 +502,10 @@ def fetch_latest_stats(horizon: str) -> Dict[str, Any]:
     stats = _load_json_setting('STATS_CACHE', {})
     return stats.get(str(horizon).lower(), {}) if isinstance(stats, dict) else {}
 
+def get_stats_24h():
+    import time
+    return get_closed_trades_since(int(time.time()) - 24 * 60 * 60)
+
 def recompute_stats_from_executions(horizon: str) -> Dict[str, Any]:
     """
     Recalcule basiquement un snapshot de stats à partir d'EXECUTIONS_LOG.
