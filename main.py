@@ -462,27 +462,26 @@ def process_message(message: Dict):
         notifier.send_main_menu(_paused)
 
     elif command == "/mode":
-        # --- LOGIQUE POUR LA COMMANDE /mode ---
         current_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
         notifier.send_mode_message(is_testnet=BITGET_TESTNET, is_paper=current_paper_mode)
 
     elif command == "/offset":
-        # Ouvre directement le panneau Offset TP/SL (TP & SL séparés)
         chat_id = (message.get("chat") or {}).get("id")
         notifier.offset_command(chat_id=chat_id)
 
     elif command.startswith("/set"):
-        # Garde les commandes /set en textuel car elles prennent un argument
         if command == "/setuniverse" and len(parts) > 1:
             try:
                 size = int(parts[1])
                 if size > 0:
-                    database.set_setting('UNIVERSE_SIZE', size)
-                    notifier.tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (appliqué au redémarrage).")
+                    database.set_setting('UNIVERSE_SIZE', str(size))
+                    notifier.tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (prise en compte immédiate).")
+                    # rafraîchit l’affichage du menu pour refléter la nouvelle valeur
+                    notifier.send_main_menu(_paused)
                 else:
                     notifier.tg_send("❌ Le nombre doit être > 0.")
             except ValueError:
-                notifier.tg_send("❌ Valeur invalide. Utilisez: /setuniverse 30")
+                notifier.tg_send("❌ Valeur invalide. Utilisez: /setuniverse 500")
 
         elif command == "/setmaxpos" and len(parts) > 1:
             try:
@@ -636,6 +635,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
     last_hour = -1
     last_day = -1  # refresh univers 1×/jour
+    current_size = len(universe)
 
     while True:
         try:
@@ -649,16 +649,28 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             curr_hour = now_utc.hour
             curr_day = now_utc.day
 
-            # Refresh univers 1×/jour (utilise le cache 1j de trader.get_universe_by_market_cap)
+            # Application IMMÉDIATE d’un changement de taille d’univers (/setuniverse)
+            try:
+                desired_size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
+            except Exception:
+                desired_size = UNIVERSE_SIZE
+            if desired_size != current_size or not universe:
+                new_universe = build_universe(ex)
+                if new_universe:
+                    universe = new_universe[:desired_size]
+                    current_size = desired_size
+                    print(f"🔁 Univers mis à jour immédiatement ({len(universe)} paires).")
+                    try:
+                        notifier.send_main_menu(_paused)
+                    except Exception:
+                        pass
+
+            # Refresh univers 1×/jour (recalcule la composition à taille identique)
             if curr_day != last_day:
                 try:
-                    size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
-                except Exception:
-                    size = UNIVERSE_SIZE
-                try:
-                    new_universe = trader.get_universe_by_market_cap(ex, size)
+                    new_universe = trader.get_universe_by_market_cap(ex, current_size)
                     if new_universe:
-                        universe = new_universe[:size]
+                        universe = new_universe[:current_size]
                         print(f"🔁 Univers rafraîchi ({len(universe)} paires).")
                 except Exception as e:
                     print(f"Refresh univers échoué — on conserve l'existant: {e}")
@@ -700,7 +712,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
         except Exception:
             err = traceback.format_exc()
             print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
-
 
 def main():
     database.setup_database()
