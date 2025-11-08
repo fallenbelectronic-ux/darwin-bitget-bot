@@ -217,6 +217,25 @@ def create_trade(
         conn.commit()
         return cur.lastrowid
 
+def update_signal_state(symbol: str, timeframe: str, ts: int, new_state: str, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Alias compat : met à jour l'état d'un signal sans exiger 'side'.
+    Met à jour toutes les lignes correspondant à (symbol, timeframe, ts).
+    'meta' est accepté pour compat mais ignoré (pas de colonne dédiée).
+    Retourne True si au moins une ligne a été modifiée.
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        res = cur.execute("""
+            UPDATE signals
+               SET state = ?
+             WHERE symbol = ?
+               AND timeframe = ?
+               AND ts = ?
+        """, (str(new_state), str(symbol), str(timeframe), int(ts)))
+        conn.commit()
+        return res.rowcount > 0
+
 
 def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
     """Mise à breakeven : breakeven_status='ACTIVE', maj quantité et SL."""
@@ -534,91 +553,31 @@ def purge_persistence(retention_days: int = 180, max_execs: int = 10000, max_ord
     orders = _purge_by_age_and_size(orders, retention_days, max_orders, ts_field="placed_at")
     _save_json_setting('ORDERS_LOG', orders)
 
-
-# -------- Stats robustes depuis la table trades --------
-from math import sqrt
-from datetime import datetime, timedelta, timezone
-
-def _compute_stats_from_pnls(pnls: List[float]) -> Dict[str, Any]:
-    n = len(pnls)
-    if n == 0:
-        return {
-            "trades_total": 0,
-            "win_rate": 0.0,
-            "pnl_net_total": 0.0,
-            "profit_factor": None,
-            "avg_gain_per_trade": 0.0,
-            "sharpe_approx": 0.0,
-            "max_drawdown_pct": 0.0,
-        }
-
-    wins = [x for x in pnls if x > 0]
-    losses = [x for x in pnls if x < 0]
-    gross_profit = sum(wins) if wins else 0.0
-    gross_loss = -sum(losses) if losses else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
-
-    mean = sum(pnls) / n
-    var = sum((x - mean) ** 2 for x in pnls) / n
-    std = var ** 0.5 if var > 0 else 0.0
-    sharpe = (mean / std) * sqrt(n) if std > 0 else 0.0
-
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0  # négatif
-    for x in pnls:
-        equity += x
-        peak = max(peak, equity)
-        dd = equity - peak
-        if dd < max_dd:
-            max_dd = dd
-    max_dd_pct = abs(max_dd) * 100.0 if peak != 0 else 0.0
-
-    return {
-        "trades_total": n,
-        "win_rate": (len(wins) / n) * 100.0,
-        "pnl_net_total": sum(pnls),
-        "profit_factor": profit_factor,
-        "avg_gain_per_trade": mean,
-        "sharpe_approx": sharpe,
-        "max_drawdown_pct": max_dd_pct,
-    }
-
-def _fetch_pnls_since(since_ts: int) -> List[float]:
-    """Récupère la liste des PnL (colonne trades.pnl) pour les trades fermés depuis since_ts (epoch sec)."""
+def remove_open_position(symbol: str) -> int:
+    """
+    Alias compat pour trader.sync_positions_with_exchange():
+    ferme en DB toutes les positions OPEN du symbole donné
+    avec le statut 'CLOSED_BY_EXCHANGE' (PnL=0.0).
+    Retourne le nombre de trades affectés.
+    """
+    # On récupère les IDs sous une seule connexion, puis on ferme proprement.
     with get_db_connection() as conn:
         cur = conn.cursor()
         rows = cur.execute(
-            """
-            SELECT COALESCE(pnl, 0.0) AS pnl
-              FROM trades
-             WHERE status != 'OPEN'
-               AND close_timestamp IS NOT NULL
-               AND close_timestamp >= ?
-             ORDER BY close_timestamp ASC
-            """,
-            (int(since_ts),),
+            "SELECT id FROM trades WHERE symbol = ? AND status = 'OPEN'",
+            (str(symbol),)
         ).fetchall()
-    return [float(r["pnl"]) for r in rows]
+        ids = [int(r["id"]) for r in rows]
 
-def get_stats_since_epoch(since_ts: int) -> Dict[str, Any]:
-    pnls = _fetch_pnls_since(int(since_ts))
-    return _compute_stats_from_pnls(pnls)
+    # On ferme chaque trade via l’API existante (ouvre sa propre connexion).
+    for tid in ids:
+        try:
+            close_trade(tid, status='CLOSED_BY_EXCHANGE', pnl=0.0)
+        except Exception:
+            # on continue même si un trade pose problème
+            pass
 
-def get_stats_24h(now: Optional[datetime] = None) -> Dict[str, Any]:
-    now = now or datetime.now(timezone.utc)
-    return get_stats_since_epoch(int((now - timedelta(hours=24)).timestamp()))
-
-def get_stats_7d(now: Optional[datetime] = None) -> Dict[str, Any]:
-    now = now or datetime.now(timezone.utc)
-    return get_stats_since_epoch(int((now - timedelta(days=7)).timestamp()))
-
-def get_stats_30d(now: Optional[datetime] = None) -> Dict[str, Any]:
-    now = now or datetime.now(timezone.utc)
-    return get_stats_since_epoch(int((now - timedelta(days=30)).timestamp()))
-
-def get_stats_all() -> Dict[str, Any]:
-    return get_stats_since_epoch(0)
+    return len(ids)
 
 def upsert_signal(sig: Dict[str, Any], state: str = "PENDING") -> int:
     """
