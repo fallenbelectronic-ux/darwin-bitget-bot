@@ -650,19 +650,35 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
     except Exception as e:
         tg_send_error("Redémarrage (annulation)", e)
 
-def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
+def try_handle_inline_callback(event: Any) -> bool:
     """
-    Route Offset/Signaux/Restart/Stats : transmet message_id + callback_query_id pour l’édition en place.
+    Route Offset/Signaux/Restart/Stats.
+    Accepte soit un objet 'callback_query', soit un update complet, soit une LISTE d'updates.
     """
+    # Si on reçoit une liste d'updates, traiter chaque élément
+    if isinstance(event, list):
+        handled = False
+        for it in event:
+            if try_handle_inline_callback(it):
+                handled = True
+        return handled
+
+    # Doit être un dict
+    if not isinstance(event, dict):
+        return False
+
+    # Supporte update Telegram brut {"callback_query": {...}} ou l'objet callback lui-même
+    data = event.get("callback_query") if "callback_query" in event else event
+    if not isinstance(data, dict):
+        return False
+
     try:
-        if not data:
-            return False
         cmd = data.get("data")
         if not cmd:
             return False
 
         # ----- OFFSETS -----
-        if cmd.startswith("OFS:"):
+        if isinstance(cmd, str) and cmd.startswith("OFS:"):
             msg = data.get("message") or {}
             chat = msg.get("chat") or {}
             chat_id = chat.get("id")
@@ -673,20 +689,16 @@ def try_handle_inline_callback(data: Dict[str, Any]) -> bool:
 
         # ----- MENUS SIGNaux -----
         if cmd == "menu_signals":
-            send_signals_menu()
-            return True
+            send_signals_menu(); return True
         if cmd == "signals_pending":
-            tg_show_signals_pending()
-            return True
+            tg_show_signals_pending(); return True
         if cmd == "signals_6h":
-            tg_show_signals_6h()
-            return True
+            tg_show_signals_6h(); return True
 
         # ----- STATS -----
         if cmd == "get_stats":
-            tg_show_stats("24h")
-            return True
-        if cmd.startswith("stats:"):
+            tg_show_stats("24h"); return True
+        if isinstance(cmd, str) and cmd.startswith("stats:"):
             period = cmd.split(":", 1)[1] if ":" in cmd else "24h"
             tg_show_stats(period)
             cq_id = data.get("id")
