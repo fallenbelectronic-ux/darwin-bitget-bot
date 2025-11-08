@@ -37,6 +37,206 @@ BE_BUFFER_USDT  = float(os.getenv("BE_BUFFER_USDT","0.0"))     # buffer absolu o
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
 # ==============================================================================
 
+def get_universe_by_market_cap(ex: ccxt.Exchange, size: int) -> list:
+    """
+    Construit l'univers des paires FUTURES USDT Bitget (linéaires) en top capitalisation.
+    Cache 1×/jour dans settings.UNIVERSE_BY_MCAP_JSON et settings.UNIVERSE_BY_MCAP_TS.
+    Exclut les stablecoins (USDT, USDC, FDUSD, BUSD, TUSD, DAI, PYUSD, USD, EUR, GBP).
+    Retourne une liste de symbols ccxt (ex: 'BTC/USDT:USDT').
+    """
+    import time, json
+    try:
+        cached_ts = float(database.get_setting('UNIVERSE_BY_MCAP_TS', '0') or '0')
+    except Exception:
+        cached_ts = 0.0
+    now = time.time()
+    one_day = 23 * 3600  # fenêtre ~1 jour
+
+    if now - cached_ts < one_day:
+        try:
+            raw = database.get_setting('UNIVERSE_BY_MCAP_JSON', '[]') or '[]'
+            cached = json.loads(raw)
+            if isinstance(cached, list) and cached:
+                return cached[:int(size)]
+        except Exception:
+            pass  # on retombe en mode rebuild
+
+    # Rebuild
+    try:
+        markets = ex.load_markets()
+    except Exception:
+        markets = {}
+
+    eligible = []
+    for m in markets.values():
+        try:
+            if m.get('swap') and m.get('linear') and m.get('quote') == 'USDT' and m.get('active', True):
+                eligible.append(m)
+        except Exception:
+            continue
+
+    # Map bases disponibles côté Bitget
+    bitget_bases = {}
+    for m in eligible:
+        base = str(m.get('base') or '').upper()
+        if not base:
+            continue
+        # Conserver le meilleur symbole par base (peu importe ici, on classera ensuite)
+        if base not in bitget_bases:
+            bitget_bases[base] = []
+        bitget_bases[base].append(m.get('symbol'))
+
+    # Récup liste CoinGecko (cache 1j)
+    cg_list = _coingecko_coin_list_cached()
+
+    # symbols stables à exclure
+    STABLES = {'USDT','USDC','FDUSD','BUSD','TUSD','DAI','PYUSD','USD','EUR','GBP'}
+
+    # Map base -> [cg_ids] par symbol
+    sym_to_ids = {}
+    for coin in cg_list:
+        try:
+            sym = str(coin.get('symbol') or '').upper()
+            cid = str(coin.get('id') or '')
+            if not sym or not cid:
+                continue
+            if sym not in sym_to_ids:
+                sym_to_ids[sym] = []
+            sym_to_ids[sym].append(cid)
+        except Exception:
+            continue
+
+    # Pour chaque base Bitget, récupérer la meilleure mcap via CG et scorer
+    base_scores = []
+    bases = [b for b in bitget_bases.keys() if b and b not in STABLES]
+    mcap_map = _coingecko_market_caps_for_symbols(bases, sym_to_ids)
+
+    for base in bases:
+        mc = mcap_map.get(base, 0.0) or 0.0
+        if mc > 0:
+            base_scores.append((base, mc))
+
+    # Tri par market cap décroissant + sélection
+    base_scores.sort(key=lambda x: x[1], reverse=True)
+
+    out_symbols = []
+    for base, _ in base_scores:
+        syms = bitget_bases.get(base, [])
+        if not syms:
+            continue
+        # Choisir le 1er symbol (toutes sont des swaps USDT linéaires)
+        out_symbols.append(syms[0])
+        if len(out_symbols) >= int(size):
+            break
+
+    # Cache en DB
+    try:
+        database.set_setting('UNIVERSE_BY_MCAP_JSON', json.dumps(out_symbols))
+        database.set_setting('UNIVERSE_BY_MCAP_TS', str(now))
+    except Exception:
+        pass
+
+    return out_symbols
+
+
+def _coingecko_coin_list_cached() -> list:
+    """
+    Retourne la liste CoinGecko (id, symbol, name) avec cache 1×/jour
+    dans settings.COINGECKO_COIN_LIST_JSON et settings.COINGECKO_COIN_LIST_TS.
+    """
+    import time, json, requests
+    try:
+        ts = float(database.get_setting('COINGECKO_COIN_LIST_TS', '0') or '0')
+    except Exception:
+        ts = 0.0
+    now = time.time()
+    if now - ts < 23 * 3600:
+        try:
+            raw = database.get_setting('COINGECKO_COIN_LIST_JSON', '[]') or '[]'
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+
+    url = "https://api.coingecko.com/api/v3/coins/list"
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json() if r.content else []
+        if isinstance(data, list):
+            database.set_setting('COINGECKO_COIN_LIST_JSON', json.dumps(data))
+            database.set_setting('COINGECKO_COIN_LIST_TS', str(now))
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def _coingecko_market_caps_for_symbols(bases: list, sym_to_ids: dict) -> dict:
+    """
+    Pour chaque base (ex: 'BTC','ETH'), interroge CoinGecko /coins/markets
+    sur tous les ids possibles du symbole et retient la market cap max.
+    Retourne { 'BTC': mcap_usd, ... }.
+    """
+    import math, json, requests
+    result = {}
+    if not bases:
+        return result
+
+    # Construire la liste des ids à interroger à partir des symboles
+    ids = []
+    for base in bases:
+        ids.extend(sym_to_ids.get(base.upper(), []))
+    # Dédupliquer
+    ids = list(dict.fromkeys([i for i in ids if i]))
+
+    if not ids:
+        return {b: 0.0 for b in bases}
+
+    # CoinGecko limite per_page à 250
+    per_page = 200
+    pages = int(math.ceil(len(ids) / per_page))
+
+    id_to_mcap = {}
+    for p in range(pages):
+        chunk = ids[p * per_page:(p + 1) * per_page]
+        if not chunk:
+            continue
+        try:
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+            params = {
+                "vs_currency": "usd",
+                "ids": ",".join(chunk),
+                "order": "market_cap_desc",
+                "per_page": len(chunk),
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h"
+            }
+            r = requests.get(url, params=params, timeout=25)
+            r.raise_for_status()
+            data = r.json() if r.content else []
+            for item in data or []:
+                cid = str(item.get('id') or '')
+                mcap = float(item.get('market_cap') or 0.0)
+                if cid and mcap > 0:
+                    id_to_mcap[cid] = max(id_to_mcap.get(cid, 0.0), mcap)
+        except Exception:
+            continue
+
+    # Pour chaque base, prendre la meilleure mcap parmi ses ids
+    for base in bases:
+        best = 0.0
+        for cid in sym_to_ids.get(base.upper(), []):
+            mc = id_to_mcap.get(cid, 0.0)
+            if mc > best:
+                best = mc
+        result[base] = best
+
+    return result
+
+
 def _inside(val: float, lo: float, up: float) -> bool:
     return float(lo) <= float(val) <= float(up)
     
