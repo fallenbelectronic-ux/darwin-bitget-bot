@@ -76,18 +76,23 @@ def get_recent_signals_message(hours: int) -> str:
     return "\n".join(lines)
     
 def get_pending_signals_message() -> str:
-    with _lock:
-        items = list(_pending_signals.items())
+    from state import get_pending_signals
+    items = list(get_pending_signals().items())
     if not items:
         return "⏱️ Aucun signal en attente."
     lines = [f"<b>⏱️ {len(items)} Signal(s) en attente</b>\n"]
     for symbol, pending in items:
-        sig = pending.get('signal', {})
+        sig = (pending or {}).get('signal', {}) or {}
         side_icon = "📈" if sig.get('side') == 'buy' else "📉"
         rr = sig.get('rr', 0.0)
         regime = sig.get('regime', 'N/A')
-        lines.append(f"- {side_icon} <b>{symbol}</b> | {regime} | RR: <b>{rr:.2f}</b>")
+        try:
+            rr_txt = f"{float(rr):.2f}"
+        except Exception:
+            rr_txt = str(rr)
+        lines.append(f"- {side_icon} <b>{symbol}</b> | {regime} | RR: <b>{rr_txt}</b>")
     return "\n".join(lines)
+
 
 def create_exchange():
     """Crée l'objet exchange CCXT."""
@@ -302,34 +307,37 @@ def _telegram_command_handlers() -> Dict[str, Any]:
 
 
 def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
-    """Sélectionne le meilleur signal en attente et l'exécute."""
-    global _pending_signals
-    if not _pending_signals: return
-    print(f"-> Analyse de {len(_pending_signals)} signaux en attente...")
+    """Sélectionne le meilleur signal en attente (RR max) et l'exécute."""
+    from state import get_pending_signals, clear_pending_signals
+    pendings = list(get_pending_signals().values())
+    if not pendings:
+        return
+    print(f"-> Analyse de {len(pendings)} signaux en attente...")
 
     validated = []
-    # Utilisation d'une copie pour itérer
-    for symbol, pending in list(_pending_signals.items()):
-        df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
-        if df is None or df.index[-1] <= pending['candle_timestamp']: continue
+    for pending in pendings:
+        try:
+            symbol = pending['symbol']
+            df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+            if df is None or df.index[-1] <= pending.get('candle_timestamp'):
+                continue
+            # Re-validation légère (bougie close passée)
+            validated.append({**pending, 'df': df})
+        except Exception:
+            continue
 
-        # Logique de re-validation simplifiée mais efficace
-        # Ici on vérifie simplement que le signal est toujours pertinent
-        # Pour l'instant, on accepte tous les signaux qui ont survécu à la clôture
-        validated.append(pending)
-
-    with _lock: _pending_signals.clear()
+    clear_pending_signals()
 
     if not validated:
         print("   -> Aucun signal n'a été re-validé.")
         return
 
-    # Trie par RR décroissant et prend le meilleur
     best = sorted(validated, key=lambda x: x['signal']['rr'], reverse=True)[0]
     print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f})")
-    
+
     notifier.send_confirmed_signal_notification(best['symbol'], best['signal'], len(validated))
     trader.execute_trade(ex, best['symbol'], best['signal'], best['df'], best['signal']['entry'])
+
 
 def process_callback_query(callback_query: Dict):
     """Gère les clics sur les boutons interactifs de manière robuste et lisible."""
@@ -587,32 +595,37 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             cleanup_recent_signals()
             trader.manage_open_positions(ex)
 
+            from state import set_pending_signal, get_pending_signals
             print(f"--- Scan de {len(universe)} paires ---")
             for symbol in universe:
                 df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
                 if df is None: continue
-                
+
                 signal = trader.detect_signal(symbol, df)
                 if signal:
                     with _lock:
-                        # Si c'est un nouveau signal, on le met en attente
-                        if symbol not in _pending_signals:
-                             print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
-                             _pending_signals[symbol] = {'signal': signal, 'symbol': symbol, 'candle_timestamp': df.index[-1], 'df': df}
-                             #notifier.send_pending_signal_notification(symbol, signal)
+                        # Nouveau signal → pending (évite doublon symbole)
+                        if symbol not in get_pending_signals():
+                            print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
+                            set_pending_signal(symbol, {
+                                'signal': signal,
+                                'symbol': symbol,
+                                'candle_timestamp': df.index[-1],
+                                'df': df
+                            })
+                            # Alerte optionnelle contrôlée par setting
+                            if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
+                                notifier.send_pending_signal_notification(symbol, signal)
 
-                        if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
-                            notifier.send_pending_signal_notification(symbol, signal)
-                                
-                        # On l'ajoute toujours à l'historique récent
+                        # Historique récent (indépendant du pending)
                         if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
-                             _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+                            _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
 
             time.sleep(LOOP_DELAY)
 
         except Exception:
-             err = traceback.format_exc()
-             print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
+            err = traceback.format_exc()
+            print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
 
 def main():
     database.setup_database()
