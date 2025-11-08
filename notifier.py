@@ -861,6 +861,12 @@ def send_main_menu(is_paused: bool):
     risk = getattr(trader, "RISK_PER_TRADE_PERCENT", 1.0)
     leverage = getattr(trader, "LEVERAGE", 1)
 
+    # NEW: Univers scanné
+    try:
+        universe_size = int(database.get_setting('UNIVERSE_SIZE', os.getenv("UNIVERSE_SIZE", "30")))
+    except Exception:
+        universe_size = int(os.getenv("UNIVERSE_SIZE", "30"))
+
     # Stratégie actuelle
     current_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
     cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
@@ -872,6 +878,7 @@ def send_main_menu(is_paused: bool):
         f"{mode_chip} • {status_chip}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🔧 Configuration</b>\n"
+        f"🌐 Univers scanné : <code>{universe_size}</code>\n"
         f"🟩 Risque/Trade : <code>{risk:.1f}%</code>\n"
         f"🟦 Levier       : <code>x{leverage}</code>\n"
         f"🎯 RR Minimum   : <code>{min_rr:.1f}</code>\n"
@@ -913,6 +920,7 @@ def send_main_menu(is_paused: bool):
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (menu): {e}")
+
 
 def send_config_menu():
     text = "⚙️ <b>Menu Configuration</b>"
