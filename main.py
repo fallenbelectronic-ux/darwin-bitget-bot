@@ -104,26 +104,19 @@ def create_exchange():
     return ex
 
 def build_universe(ex: ccxt.Exchange) -> List[str]:
-    """Construit la liste des paires à trader (TOP market cap futures USDT Bitget, fallback volume 24h)."""
-    print("Construction de l'univers de trading...")
+    """Construit la liste des paires à trader STRICTEMENT par market cap (Bitget USDT futures)."""
+    print("Construction de l'univers de trading (market cap STRICT)...")
     size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
-    # 1) Essai via market cap (cache 1×/jour dans trader.get_universe_by_market_cap)
     try:
         syms = trader.get_universe_by_market_cap(ex, size)
-        if syms:
-            return syms[:size]
+        if not syms:
+            print("⚠️ get_universe_by_market_cap a renvoyé une liste vide.")
+            return []
+        if len(syms) < size:
+            print(f"⚠️ Market cap a renvoyé {len(syms)} paires (< {size}). Univers limité à ce résultat (strict).")
+        return syms[:size]
     except Exception as e:
-        print(f"Univers mcap indisponible, fallback volume 24h — {e}")
-
-    # 2) Fallback : volume 24h (logique précédente)
-    try:
-        ex.load_markets()
-        tickers = ex.fetch_tickers()
-        swap_tickers = {s: t for s, t in tickers.items() if ':USDT' in s and t.get('quoteVolume')}
-        sorted_symbols = sorted(swap_tickers, key=lambda s: swap_tickers[s]['quoteVolume'], reverse=True)
-        return sorted_symbols[:size]
-    except Exception as e:
-        print(f"Erreur univers (fallback): {e}")
+        print(f"Erreur univers (market cap strict): {e}")
         return []
 
 def start_live_sync(ex):
