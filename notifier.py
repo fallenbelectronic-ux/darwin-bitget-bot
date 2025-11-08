@@ -414,7 +414,7 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
     return []
 
 def set_universe_command(message: Dict[str, Any]):
-    """Commande texte: /setuniverse <nombre> — met à jour UNIVERSE_SIZE (appliqué au redémarrage)."""
+    """Commande texte: /setuniverse <nombre> — met à jour UNIVERSE_SIZE (prise en compte immédiate si la boucle lit la DB)."""
     try:
         text = (message or {}).get("text", "") or ""
         parts = text.strip().split()
@@ -426,7 +426,7 @@ def set_universe_command(message: Dict[str, Any]):
             tg_send("❌ Le nombre doit être > 0.")
             return
         database.set_setting('UNIVERSE_SIZE', size)
-        tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (appliqué au redémarrage).")
+        tg_send(f"✅ Taille de l'univers mise à <b>{size}</b>.")
     except Exception as e:
         tg_send(f"❌ Erreur /setuniverse: <code>{_escape(e)}</code>")
 
@@ -460,7 +460,6 @@ def get_config_menu_keyboard() -> Dict:
     return {
         "inline_keyboard": [
             [{"text": "📝 Changer Mode (Papier/Réel)", "callback_data": "show_mode"}],
-            [{"text": "🔩 Afficher Config Actuelle", "callback_data": "show_config"}],
             [{"text": cw_label, "callback_data": "toggle_cutwick"}],
             [{"text": "💹 Offset TP/SL", "callback_data": "OFS:ROOT"}],
             [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
