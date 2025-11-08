@@ -595,7 +595,8 @@ def handle_restart_callback(callback_query: Dict[str, Any]) -> None:
 def handle_restart_confirm(callback_query: Dict[str, Any]) -> None:
     """
     Étape 2 : confirmation '✅ Oui, redémarrer'.
-    Pose le timestamp de cooldown, notifie, puis quitte le process (superviseur relance).
+    Passe en mode 'redémarrage par drapeau' (RESTART_REQUESTED=true) et NOTIFIE,
+    sans quitter le process immédiatement (évitant les boucles).
     """
     try:
         cq_id = str(callback_query.get("id", "")) if callback_query else ""
@@ -609,16 +610,26 @@ def handle_restart_confirm(callback_query: Dict[str, Any]) -> None:
         except Exception:
             pass
 
+        # Drapeau de redémarrage (lu par main.check_restart_request)
+        try:
+            database.set_setting('RESTART_REQUESTED', 'true')
+        except Exception:
+            pass
+
         from_obj = (callback_query or {}).get("from", {}) or {}
         user_label = from_obj.get("username") or from_obj.get("first_name") or "inconnu"
 
         msg_chat_id = (((callback_query or {}).get("message", {}) or {}).get("chat", {}) or {}).get("id")
-        tg_send(f"♻️ Redémarrage demandé par <b>{_escape(user_label)}</b>. Le bot va redémarrer…", chat_id=msg_chat_id or TG_CHAT_ID)
+        tg_send(
+            f"♻️ Redémarrage demandé par <b>{_escape(user_label)}</b>. "
+            f"Le bot va se relancer proprement…",
+            chat_id=msg_chat_id or TG_CHAT_ID
+        )
 
-        time.sleep(1.0)
-        os._exit(0)
+        # ⚠️ Ne PAS quitter ici (pas de os._exit) : la boucle principale détectera le drapeau.
     except Exception as e:
         tg_send_error("Redémarrage (étape 2)", e)
+
         
 def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
     """Annule la confirmation et ré-affiche le menu Configuration."""
