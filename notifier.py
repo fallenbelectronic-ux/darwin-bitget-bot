@@ -414,19 +414,29 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
     return []
 
 def set_universe_command(message: Dict[str, Any]):
-    """Commande texte: /setuniverse <nombre> — met à jour UNIVERSE_SIZE (prise en compte immédiate si la boucle lit la DB)."""
+    """Commande texte: /setuniverse <nombre> — met à jour UNIVERSE_SIZE (impact IMMÉDIAT + rafraîchit le menu)."""
     try:
         text = (message or {}).get("text", "") or ""
         parts = text.strip().split()
         if len(parts) < 2:
             tg_send("❌ Utilisation: /setuniverse <nombre>")
             return
+
         size = int(parts[1])
         if size <= 0:
             tg_send("❌ Le nombre doit être > 0.")
             return
-        database.set_setting('UNIVERSE_SIZE', size)
+
+        # Enregistre et confirme
+        database.set_setting('UNIVERSE_SIZE', str(size))
         tg_send(f"✅ Taille de l'univers mise à <b>{size}</b>.")
+
+        # Rafraîchit immédiatement le menu principal pour refléter la valeur
+        try:
+            is_paused = str(database.get_setting('PAUSED', 'false')).lower() == 'true'
+        except Exception:
+            is_paused = False
+        send_main_menu(is_paused)
     except Exception as e:
         tg_send(f"❌ Erreur /setuniverse: <code>{_escape(e)}</code>")
 
