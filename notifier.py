@@ -412,6 +412,42 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
         
     return []
 
+def set_universe_command(message: Dict[str, Any]):
+    """Commande texte: /setuniverse <nombre> — met à jour UNIVERSE_SIZE (appliqué au redémarrage)."""
+    try:
+        text = (message or {}).get("text", "") or ""
+        parts = text.strip().split()
+        if len(parts) < 2:
+            tg_send("❌ Utilisation: /setuniverse <nombre>")
+            return
+        size = int(parts[1])
+        if size <= 0:
+            tg_send("❌ Le nombre doit être > 0.")
+            return
+        database.set_setting('UNIVERSE_SIZE', size)
+        tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (appliqué au redémarrage).")
+    except Exception as e:
+        tg_send(f"❌ Erreur /setuniverse: <code>{_escape(e)}</code>")
+
+
+def set_maxpos_command(message: Dict[str, Any]):
+    """Commande texte: /setmaxpos <nombre> — met à jour MAX_OPEN_POSITIONS (immédiat pour la logique qui lit la DB)."""
+    try:
+        text = (message or {}).get("text", "") or ""
+        parts = text.strip().split()
+        if len(parts) < 2:
+            tg_send("❌ Utilisation: /setmaxpos <nombre>")
+            return
+        max_p = int(parts[1])
+        if max_p < 0:
+            tg_send("❌ Le nombre doit être ≥ 0.")
+            return
+        database.set_setting('MAX_OPEN_POSITIONS', max_p)
+        tg_send(f"✅ Positions max mises à <b>{max_p}</b>.")
+    except Exception as e:
+        tg_send(f"❌ Erreur /setmaxpos: <code>{_escape(e)}</code>")
+
+
 # ==============================================================================
 # GESTION DES CLAVIERS INTERACTIFS
 # ==============================================================================
