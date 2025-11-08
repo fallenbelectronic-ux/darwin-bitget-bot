@@ -741,7 +741,7 @@ def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> O
                 regime=str(sig.get("regime", "-")),
                 pattern="AUTO",
                 status="PENDING",
-                meta={"tp": sig.get("tp"), "sl": sig.get("sl")}
+                meta={"entry": sig.get("entry"), "tp": sig.get("tp"), "sl": sig.get("sl")}
             )
         except Exception:
             pass
@@ -771,47 +771,52 @@ def record_signal_from_trader(
     """
     Enregistre/Met à jour un signal détecté par le trader.
     - Clé logique: (symbol, timeframe, ts) ⇒ permet de passer PENDING → VALID/SKIPPED sans doublon.
-    - Utilise database.upsert_signal(sig, state) si dispo, sinon fallback tolerant.
+    - Utilise database.upsert_signal(sig, state) si dispo, sinon fallback tolérant.
+    - ⚠️ Alimente désormais 'entry'/'sl'/'tp' dans la table signals (au lieu de seulement 'price' dans meta).
     """
-    payload = {
+    meta = dict(meta or {})
+    entry = float(meta.get("entry", price if price is not None else 0.0))
+    sl    = float(meta.get("sl",    0.0))
+    tp    = float(meta.get("tp",    0.0))
+
+    sig_payload = {
         "symbol": str(symbol),
         "side": str(side).lower(),
         "timeframe": str(timeframe),
         "ts": int(ts),
-        "price": float(price),
-        "rr": float(rr) if rr is not None else 0.0,
         "regime": str(regime) if regime is not None else "",
-        "pattern": str(pattern) if pattern is not None else "",
-        "meta": dict(meta or {}),
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "rr": float(rr) if rr is not None else 0.0,
     }
     state = str(status or "PENDING")
 
     try:
         if hasattr(database, "upsert_signal"):
-            database.upsert_signal(payload, state=state)
+            database.upsert_signal(sig_payload, state=state)
         elif hasattr(database, "insert_signal"):
-            # on tente une mise à jour simple si déjà existant
             try:
                 if hasattr(database, "update_signal_state"):
-                    database.update_signal_state(symbol, timeframe, ts, state, payload.get("meta", {}))
+                    database.update_signal_state(symbol, timeframe, ts, state, meta)
                 else:
-                    database.insert_signal(**payload, state=state)  # type: ignore[arg-type]
+                    database.insert_signal(**sig_payload, state=state)  # type: ignore[arg-type]
             except Exception:
-                database.insert_signal(**payload, state=state)      # type: ignore[arg-type]
+                database.insert_signal(**sig_payload, state=state)      # type: ignore[arg-type]
         elif hasattr(database, "save_signal"):
-            database.save_signal(**payload, state=state)            # type: ignore[arg-type]
+            database.save_signal(**sig_payload, state=state)            # type: ignore[arg-type]
         else:
             try:
                 notifier.tg_send(
                     f"ℹ️ Signal non persisté (API DB manquante): "
-                    f"{symbol} {side} {timeframe} @ {price} [{state}]"
+                    f"{symbol} {side} {timeframe} @ {entry} [{state}]"
                 )
             except Exception:
                 pass
     except Exception as e:
         try:
             notifier.tg_send(
-                f"⚠️ Échec enregistrement signal: {symbol} {side} {timeframe} @ {price} — {e}"
+                f"⚠️ Échec enregistrement signal: {symbol} {side} {timeframe} @ {entry} — {e}"
             )
         except Exception:
             pass
