@@ -1807,34 +1807,120 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
     return float(raw_sl)
 
 
-def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
-    """(MODIFIÉ) Exécute un trade avec sécurisations Bitget et met à jour l’état du signal PENDING → VALID/SKIPPED.
-       Utilise create_market_order_smart() pour éviter l’erreur BUY market Bitget."""
-    _ensure_bitget_mix_options(ex)
+def _update_signal_state(
+    symbol: str,
+    timeframe: str,
+    signal: Dict[str, Any],
+    entry_price: float,
+    state: str,
+    reason: Optional[str] = None,
+    tp: Optional[float] = None,
+    sl: Optional[float] = None,
+) -> None:
+    """Met à jour l’état d’un signal déjà persisté via record_signal_from_trader()."""
+    try:
+        ts_sig = int(signal.get("ts", 0) or 0)
+        if ts_sig <= 0:
+            return
+        meta: Dict[str, Any] = {}
+        if tp is not None:
+            meta["tp"] = float(tp)
+        if sl is not None:
+            meta["sl"] = float(sl)
+        if reason:
+            meta["reason"] = str(reason)
 
-    def _update_signal_state(state: str, reason: Optional[str] = None, tp: Optional[float] = None, sl: Optional[float] = None):
-        try:
-            ts_sig = int(signal.get("ts", 0) or 0)
-            if ts_sig <= 0:
-                return
-            meta = {}
-            if tp is not None: meta["tp"] = float(tp)
-            if sl is not None: meta["sl"] = float(sl)
-            if reason: meta["reason"] = str(reason)
-            record_signal_from_trader(
-                symbol=symbol,
-                side=(signal.get("side") or "-"),
-                timeframe=TIMEFRAME,
-                ts=ts_sig,
-                price=float(entry_price),
-                rr=float(signal.get("rr", 0.0)),
-                regime=str(signal.get("regime", "-")),
-                pattern="AUTO",
-                status=state,
-                meta=meta
-            )
-        except Exception:
-            pass
+        record_signal_from_trader(
+            symbol=symbol,
+            side=(signal.get("side") or "-"),
+            timeframe=timeframe,
+            ts=ts_sig,
+            price=float(entry_price),
+            rr=float(signal.get("rr", 0.0)),
+            regime=str(signal.get("regime", "-")),
+            pattern="AUTO",
+            status=state,
+            meta=meta,
+        )
+    except Exception:
+        pass
+
+def execute_signal_with_gates(
+    ex: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    signal: Dict[str, Any],
+    entry_price: float,
+) -> Tuple[bool, str]:
+    """Encapsule le recalcul live SL/TP + gate RR + exécution robuste."""
+    side = (signal.get('side') or '').lower()
+    regime = str(signal.get('regime', 'Tendance'))
+    is_long = (side == 'buy')
+    entry_px = float(entry_price)
+
+    if df is None or len(df) < 3:
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
+        return False, "Rejeté: données insuffisantes pour valider l’entrée."
+
+    last = df.iloc[-1]
+    last_atr = float(last.get('atr', 0.0))
+    try:
+        tp_pct = get_tp_offset_pct()
+    except Exception:
+        tp_pct = 0.003
+    try:
+        tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
+    except Exception:
+        tp_atr_k = 0.50
+    try:
+        cut_wick_enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    except Exception:
+        cut_wick_enabled = False
+
+    contact_idx = _find_contact_index(df, base_exclude_last=True, max_lookback=5)
+    contact = (df.iloc[contact_idx] if contact_idx is not None else None)
+
+    if contact is not None:
+        sl_live = float(_sl_from_contact_candle(contact, ('buy' if is_long else 'sell'), float(contact.get('atr', 0.0))))
+    else:
+        sl_live = float(signal.get('sl', 0.0))
+
+    if regime == "Tendance":
+        target_band = float(last['bb80_up'] if is_long else last['bb80_lo'])
+        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
+        tp_live = target_band * (1.0 - eff_pct) if is_long else target_band * (1.0 + eff_pct)
+    else:
+        target_band = float(last['bb20_up'] if is_long else last['bb20_lo'])
+        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
+        tp_live = target_band * (1.0 - eff_pct) if is_long else target_band * (1.0 + eff_pct)
+
+    rr = 0.0
+    if is_long:
+        if (entry_px > sl_live) and (tp_live > entry_px):
+            rr = (tp_live - entry_px) / (entry_px - sl_live)
+    else:
+        if (sl_live > entry_px) and (tp_live < entry_px):
+            rr = (entry_px - tp_live) / (sl_live - entry_px)
+
+    rr_final = rr
+    if rr_final < MIN_RR and rr_final >= 2.8 and cut_wick_enabled and contact is not None:
+        rr_alt, _ = _maybe_improve_rr_with_cut_wick(contact, entry_px, sl_live, tp_live, ('buy' if is_long else 'sell'))
+        rr_final = max(rr_final, rr_alt)
+
+    if rr_final < MIN_RR or rr_final <= 0.0:
+        signal['entry'] = entry_px
+        signal['sl'] = float(sl_live)
+        signal['tp'] = float(tp_live)
+        signal['rr'] = float(rr_final)
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED",
+                             reason=f"rr_entry_gate({rr_final:.2f})", tp=float(tp_live), sl=float(sl_live))
+        return False, f"Rejeté: RR entrée {rr_final:.2f} < MIN_RR ({MIN_RR})."
+
+    signal['entry'] = entry_px
+    signal['sl'] = float(sl_live)
+    signal['tp'] = float(tp_live)
+    signal['rr'] = float(rr_final)
 
     is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
@@ -1846,21 +1932,18 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         pass
 
     if len(database.get_open_positions()) >= max_pos:
-        _update_signal_state("SKIPPED", reason=f"max_positions({max_pos})")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"max_positions({max_pos})")
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
     if database.is_position_open(symbol):
-        _update_signal_state("SKIPPED", reason="already_open_in_db")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="already_open_in_db")
         return False, "Rejeté: Position déjà ouverte (DB)."
 
     balance = get_usdt_balance(ex)
     if balance is None or balance <= 10:
-        _update_signal_state("SKIPPED", reason=f"low_balance({balance or 0:.2f} USDT)")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"low_balance({balance or 0:.2f} USDT)")
         return False, f"Rejeté: Solde insuffisant ({balance or 0:.2f} USDT) ou erreur API."
 
-    side = (signal.get('side') or '').lower()
-    is_long = (side == 'buy')
-    price_ref = float(entry_price)
-
+    price_ref = entry_px
     sl = float(signal['sl'])
     tp = float(signal['tp'])
 
@@ -1869,11 +1952,15 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     except Exception:
         gap_pct = 0.0003
     if is_long:
-        if sl >= price_ref: sl = price_ref * (1.0 - gap_pct)
-        if tp <= price_ref: tp = price_ref * (1.0 + gap_pct)
+        if sl >= price_ref:
+            sl = price_ref * (1.0 - gap_pct)
+        if tp <= price_ref:
+            tp = price_ref * (1.0 + gap_pct)
     else:
-        if sl <= price_ref: sl = price_ref * (1.0 + gap_pct)
-        if tp >= price_ref: tp = price_ref * (1.0 - gap_pct)
+        if sl <= price_ref:
+            sl = price_ref * (1.0 + gap_pct)
+        if tp >= price_ref:
+            tp = price_ref * (1.0 - gap_pct)
 
     market = ex.market(symbol) or {}
     tick_size = _bitget_tick_size(market)
@@ -1887,12 +1974,14 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     except Exception:
         t = ex.fetch_ticker(symbol) or {}
         last_px = float(t.get("last") or t.get("close") or price_ref)
-        if is_long and tp <= last_px: tp = last_px * (1.0 + gap_pct)
-        if (not is_long) and tp >= last_px: tp = last_px * (1.0 - gap_pct)
+        if is_long and tp <= last_px:
+            tp = last_px * (1.0 + gap_pct)
+        if (not is_long) and tp >= last_px:
+            tp = last_px * (1.0 - gap_pct)
 
     quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, price_ref, sl)
     if quantity <= 0:
-        _update_signal_state("SKIPPED", reason="qty_zero_after_sizing")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="qty_zero_after_sizing")
         return False, f"Rejeté: Quantité calculée nulle ({quantity})."
 
     ref_price = price_ref
@@ -1905,7 +1994,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
     capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, abs(float(quantity)), ref_price or price_ref)
     if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
-        _update_signal_state("SKIPPED", reason="insufficient_after_cap")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="insufficient_after_cap")
         try:
             need_notional = (abs(float(quantity)) * (ref_price or price_ref or 0.0))
             max_notional = meta.get("max_notional")
@@ -1926,7 +2015,8 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
 
     notional_value = capped_qty * price_ref
     if notional_value < MIN_NOTIONAL_VALUE:
-        _update_signal_state("SKIPPED", reason=f"below_min_notional({notional_value:.2f}<{MIN_NOTIONAL_VALUE})")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED",
+                             reason=f"below_min_notional({notional_value:.2f}<{MIN_NOTIONAL_VALUE})")
         return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
 
     try:
@@ -1937,7 +2027,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         quantity = float(capped_qty)
 
     if quantity <= 0:
-        _update_signal_state("SKIPPED", reason="qty_zero_after_precision")
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="qty_zero_after_precision")
         return False, "Rejeté: quantité finale arrondie à 0."
 
     final_entry_price = price_ref
@@ -1951,20 +2041,22 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         try:
             try:
                 ex.set_leverage(LEVERAGE, symbol)
-                try: ex.set_margin_mode('cross', symbol)
-                except Exception: pass
-                try: ex.set_position_mode(False, symbol)
-                except Exception: pass
+                try:
+                    ex.set_margin_mode('cross', symbol)
+                except Exception:
+                    pass
+                try:
+                    ex.set_position_mode(False, symbol)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
-            # ✅ utilise le helper (BUY Bitget => amount ≡ cost)
             order = create_market_order_smart(ex, symbol, side, quantity, ref_price=final_entry_price, params=common_params)
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
             close_side = 'sell' if is_long else 'buy'
-
             mark_now = _current_mark_price(ex, symbol)
             sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
 
@@ -1980,13 +2072,14 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         except Exception as e:
             try:
                 close_side = 'sell' if is_long else 'buy'
-                # fermeture d'urgence si ouverture partielle
-                create_market_order_smart(ex, symbol, close_side, quantity, ref_price=final_entry_price,
-                                          params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                create_market_order_smart(
+                    ex, symbol, close_side, quantity, ref_price=final_entry_price,
+                    params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                )
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
-            _update_signal_state("SKIPPED", reason=f"execution_error:{e}")
+            _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"execution_error:{e}")
             return False, f"Erreur d'exécution: {e}"
 
     signal['entry'] = final_entry_price
@@ -1996,7 +2089,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
     database.create_trade(
         symbol=symbol,
         side=side,
-        regime=signal.get('regime', 'Tendance'),
+        regime=regime,
         entry_price=final_entry_price,
         sl_price=float(sl),
         tp_price=float(tp),
@@ -2007,7 +2100,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         entry_rsi=float(signal.get('entry_rsi', 0.0) or 0.0),
     )
 
-    _update_signal_state("VALID", tp=float(tp), sl=float(sl))
+    _update_signal_state(symbol, timeframe, signal, final_entry_price, "VALID", tp=float(tp), sl=float(sl))
 
     try:
         chart_image = charting.generate_trade_chart(symbol, df, signal)
@@ -2026,6 +2119,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         pass
 
     return True, "Position ouverte avec succès."
+
 
 def get_tp_offset_pct() -> float:
     """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
