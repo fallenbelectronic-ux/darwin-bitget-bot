@@ -1375,6 +1375,7 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
     - defaultType='swap' (perp)
     - defaultSubType='linear' (USDT)
     - initialise ex.params avec des valeurs sûres (subType/productType)
+    - désactive l'obligation 'price' pour les BUY market (amount ≡ cost)
     Ne lève jamais d’exception.
     """
     try:
@@ -1389,20 +1390,51 @@ def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
             # Linear (USDT) par défaut
             if ex.options.get("defaultSubType") not in ("linear", "inverse"):
                 ex.options["defaultSubType"] = "linear"
-            # Devise de règlement par défaut (utilisée par ccxt pour certaines routes)
             ex.options.setdefault("defaultSettle", "USDT")
+            # ❗ clé pour éviter l'erreur ccxt sur les market BUY
+            ex.options["createMarketBuyOrderRequiresPrice"] = False
 
         # Paramètres génériques pour les requêtes
         if not hasattr(ex, "params") or ex.params is None:
             ex.params = {}
-
         if getattr(ex, "id", "") == "bitget":
             ex.params.setdefault("subType", ex.options.get("defaultSubType", "linear"))
-            # USDT-UMCBL = Bitget Linear USDT Perp
             ex.params.setdefault("productType", "USDT-UMCBL")
     except Exception:
-        # On ne propage pas : la gestion appelante doit rester robuste
         pass
+
+def create_market_order_smart(ex: ccxt.Exchange, symbol: str, side: str, amount: float,
+                              ref_price: Optional[float] = None,
+                              params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Envoi MARKET robuste.
+    - Bitget BUY: `amount` est interprété comme COÛT (USDT). On convertit qty→cost via ref_price|ticker.
+    - Autres cas: inchangé (amount = quantité).
+    """
+    _ensure_bitget_mix_options(ex)
+    params = params or {}
+
+    s = (side or "").lower()
+    exid = getattr(ex, "id", "")
+
+    if exid == "bitget" and s == "buy":
+        px = None
+        if ref_price is not None:
+            try:
+                px = float(ref_price)
+            except Exception:
+                px = None
+        if px is None or px <= 0:
+            try:
+                t = ex.fetch_ticker(symbol) or {}
+                px = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
+            except Exception:
+                px = 0.0
+        cost = float(amount) * float(px) if px and px > 0 else float(amount)
+        return ex.create_order(symbol, "market", "buy", float(cost), None, params)
+
+    return ex.create_order(symbol, "market", side, float(amount), None, params)
+
 
 def _resolve_bitget_route(exchange):
     try:
@@ -1652,21 +1684,20 @@ def _cap_qty_for_margin_and_filters(exchange, symbol: str, side: str, qty: float
         return float(qty), meta
 
 
-def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, price: Optional[float] = None, params: Optional[Dict[str, Any]] = None):
+def place_order(exchange, symbol: str, side: str, order_type: str, qty: float,
+                price: Optional[float] = None, params: Optional[Dict[str, Any]] = None):
     """
     (MODIFIÉ) Envoi d'ordre avec garde-fous:
       - Cap par marge + respect min_qty/step/min_notional
       - Annulation propre + notif TG si solde insuffisant
-      - Ne change PAS le reste de ta logique (pas de refacto)
+      - Bitget BUY market: conversion qty→cost via create_market_order_smart()
     """
     try:
         q = abs(float(qty))
         p = float(price) if price is not None else None
 
-        # Cap par marge + filtres marché (uniquement si prix connu ou market avec best bid/ask récupérable)
         ref_price = p
         if ref_price is None:
-            # fallback: dernier prix du ticker pour estimer la notional si market order
             try:
                 t = exchange.fetch_ticker(symbol)
                 ref_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
@@ -1676,7 +1707,6 @@ def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, p
         capped_qty, meta = _cap_qty_for_margin_and_filters(exchange, symbol, side, q, ref_price or 0.0)
 
         if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
-            # Notif claire et on sort proprement
             try:
                 need_notional = (q * (ref_price or 0.0))
                 max_notional = meta.get("max_notional")
@@ -1693,29 +1723,26 @@ def place_order(exchange, symbol: str, side: str, order_type: str, qty: float, p
                 notifier.tg_send(txt)
             except Exception:
                 pass
-            return None  # on stoppe l'envoi d'ordre
+            return None
 
-        # Si la taille a été réduite, informer (transparence)
         if meta.get("reason") == "CAPPED_BY_MARGIN":
             try:
                 reduced_pct = (1.0 - (capped_qty / q)) * 100.0 if q > 0 else 0.0
-                txt = (
+                notifier.tg_send(
                     f"⚠️ Taille réduite par marge\n"
                     f"• {symbol} {side.upper()} {order_type.upper()}\n"
                     f"• Demandée: <code>{q}</code> → Envoyée: <code>{capped_qty}</code> "
                     f"(-{reduced_pct:.2f}%)\n"
                     f"• Levier: <code>{meta.get('leverage')}</code> | Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>\n"
                 )
-                notifier.tg_send(txt)
             except Exception:
                 pass
 
-        # Envoi réel de l'ordre (inchangé sinon)
         params = params or {}
         if order_type.lower() == "market":
-            return exchange.create_order(symbol, "market", side, capped_qty, None, params)
+            # Bitget BUY ⇒ amount=cost
+            return create_market_order_smart(exchange, symbol, side, capped_qty, ref_price=ref_price, params=params)
         else:
-            # limit/stop-limit nécessitent un price
             return exchange.create_order(symbol, order_type, side, capped_qty, p, params)
 
     except Exception as e:
@@ -1781,10 +1808,10 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
 
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd.DataFrame, entry_price: float) -> Tuple[bool, str]:
-    """Exécute un trade avec sécurisations Bitget et met à jour l’état du signal PENDING → VALID/SKIPPED."""
+    """(MODIFIÉ) Exécute un trade avec sécurisations Bitget et met à jour l’état du signal PENDING → VALID/SKIPPED.
+       Utilise create_market_order_smart() pour éviter l’erreur BUY market Bitget."""
     _ensure_bitget_mix_options(ex)
 
-    # helper interne : mise à jour d’état du signal s’il est horodaté
     def _update_signal_state(state: str, reason: Optional[str] = None, tp: Optional[float] = None, sl: Optional[float] = None):
         try:
             ts_sig = int(signal.get("ts", 0) or 0)
@@ -1931,7 +1958,8 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
             except Exception:
                 pass
 
-            order = ex.create_market_order(symbol, side, quantity, params=common_params)
+            # ✅ utilise le helper (BUY Bitget => amount ≡ cost)
+            order = create_market_order_smart(ex, symbol, side, quantity, ref_price=final_entry_price, params=common_params)
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
@@ -1952,14 +1980,15 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         except Exception as e:
             try:
                 close_side = 'sell' if is_long else 'buy'
-                ex.create_market_order(symbol, close_side, quantity, params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
+                # fermeture d'urgence si ouverture partielle
+                create_market_order_smart(ex, symbol, close_side, quantity, ref_price=final_entry_price,
+                                          params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'})
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
             _update_signal_state("SKIPPED", reason=f"execution_error:{e}")
             return False, f"Erreur d'exécution: {e}"
 
-    # --- DB + Notifs ---
     signal['entry'] = final_entry_price
     signal['sl'] = float(sl)
     signal['tp'] = float(tp)
@@ -1978,7 +2007,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         entry_rsi=float(signal.get('entry_rsi', 0.0) or 0.0),
     )
 
-    # ✅ marquer le signal comme VALID après ouverture
     _update_signal_state("VALID", tp=float(tp), sl=float(sl))
 
     try:
@@ -1998,8 +2026,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, signal: Dict[str, Any], df: pd
         pass
 
     return True, "Position ouverte avec succès."
-
-
 
 def get_tp_offset_pct() -> float:
     """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
@@ -2196,7 +2222,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         bb80_lo    = float(last['bb80_lo'])
         last_atr   = float(last.get('atr', 0.0))
 
-        # ---------- TP dynamique (inchangé vs version précédente) ----------
+        # ---------- TP dynamique (corrigé) ----------
         try:
             regime = pos.get('regime', 'Tendance')
             offset_pct = get_tp_offset_pct()
@@ -2204,6 +2230,11 @@ def manage_open_positions(ex: ccxt.Exchange):
                 tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
             except Exception:
                 tp_atr_k = 0.50
+            # epsilon configurable pour éviter l'effet “bruit”
+            try:
+                tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', 0.0005))  # 0.05%
+            except Exception:
+                tp_update_eps = 0.0005
 
             if regime == 'Tendance':
                 ref = bb80_up if is_long else bb80_lo
@@ -2214,7 +2245,10 @@ def manage_open_positions(ex: ccxt.Exchange):
             target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
             current_tp = float(pos['tp_price'])
-            improve = (is_long and target_tp > current_tp * 1.0002) or ((not is_long) and target_tp < current_tp * 0.9998)
+            # ✅ Correction : en LONG, un TP “qui se resserre” doit DESCENDRE ; en SHORT il doit MONTER.
+            improve = (is_long and (target_tp < current_tp * (1.0 - tp_update_eps))) or \
+                      ((not is_long) and (target_tp > current_tp * (1.0 + tp_update_eps)))
+
             if improve:
                 try:
                     tkr = ex.fetch_ticker(symbol) or {}
@@ -2275,17 +2309,15 @@ def manage_open_positions(ex: ccxt.Exchange):
         # 2) Condition de déclenchement BE: contact/franchissement BB20_mid
         be_trigger = False
         try:
-            # "contact/franchissement" : high>=mid pour long ; low<=mid pour short
             if is_long and (float(last['high']) >= bb20_mid):
                 be_trigger = True
             if (not is_long) and (float(last['low']) <= bb20_mid):
                 be_trigger = True
         except Exception:
-            # fallback: via close vs mid
             if is_long and last_close >= bb20_mid: be_trigger = True
             if (not is_long) and last_close <= bb20_mid: be_trigger = True
 
-        # 3) Calcul du prix BE (frais + buffer) — position linéaire USDT
+        # 3) Prix BE (frais + buffer)
         try:
             be_price_theo = compute_fee_safe_be_price(
                 entry=float(pos['entry_price']),
@@ -2299,7 +2331,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             be_price_theo = float(pos['entry_price'])
 
-        # 4) Activer BE si permis + trigger (et pas déjà ≥ BE)
         sl_current = float(pos.get('sl_price') or pos['entry_price'])
         be_armed = False
         try:
@@ -2313,10 +2344,9 @@ def manage_open_positions(ex: ccxt.Exchange):
             qty = float(pos['quantity'])
 
         if be_allowed and be_trigger and qty > 0:
-            # Déplacer SL au BE si amélioration (ne recule jamais)
             want_sl = be_price_theo
-            improve = (is_long and want_sl > sl_current) or ((not is_long) and want_sl < sl_current)
-            if improve:
+            improve_sl = (is_long and want_sl > sl_current) or ((not is_long) and want_sl < sl_current)
+            if improve_sl:
                 mark_now = _current_mark_price(ex, symbol)
                 want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
                 try:
@@ -2334,9 +2364,8 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         # 5) Trailing après BE actif
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
-            # seuil minimal de déplacement
             try:
-                min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))  # 0.10%
+                min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))      # 0.10%
             except Exception:
                 min_move_pct = 0.001
             try:
@@ -2347,18 +2376,15 @@ def manage_open_positions(ex: ccxt.Exchange):
             mark_now = _current_mark_price(ex, symbol)
             want_sl = _compute_trailing_sl(mark_now, ('buy' if is_long else 'sell'), last_atr)
 
-            # ne pas "dé-trailer" (jamais en arrière)
             if is_long and want_sl <= sl_current: 
                 continue
             if (not is_long) and want_sl >= sl_current:
                 continue
 
-            # mouvement minimal requis
             min_move_abs = max(min_move_pct * mark_now, min_move_atr_k * last_atr)
             if abs(want_sl - sl_current) < max(min_move_abs, tick_size):
                 continue
 
-            # clamp et envoi
             want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
             try:
                 want_sl = float(ex.price_to_precision(symbol, want_sl))
@@ -2370,9 +2396,10 @@ def manage_open_positions(ex: ccxt.Exchange):
             try:
                 database.update_trade_sl(pos['id'], float(want_sl))
                 pos['sl_price'] = float(want_sl)
-                pos['breakeven_status'] = 'ACTIVE'  # rester en mode trailing
+                pos['breakeven_status'] = 'ACTIVE'
             except Exception:
                 pass
+
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
@@ -2430,8 +2457,7 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
-    """Clôture manuelle robuste : vérifie la position réelle, arrondit la quantité, et ferme en MARKET reduceOnly.
-       Sécurise leverage/modes avant lecture des positions sur le symbole."""
+    """(MODIFIÉ) Clôture manuelle robuste : utilise create_market_order_smart() pour BUY (close short)."""
     _ensure_bitget_mix_options(ex)
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     trade = database.get_trade_by_id(trade_id)
@@ -2443,7 +2469,6 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     qty_db = float(trade['quantity'])
 
     try:
-        # 2) Contexte du symbole AVANT fetch_positions
         try:
             ex.set_leverage(LEVERAGE, symbol)
             try: ex.set_margin_mode('cross', symbol)
@@ -2453,7 +2478,6 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         except Exception:
             pass
 
-        # 1) Vérifier la position réelle
         real_qty = 0.0
         market = None
         try:
@@ -2487,11 +2511,19 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         if not is_paper_mode:
             close_side = 'sell' if side == 'buy' else 'buy'
             params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
-            ex.create_market_order(symbol, close_side, qty_to_close, params=params)
+            # ✅ BUY Bitget (fermeture d'un short) → utiliser le helper
+            if close_side == 'buy':
+                try:
+                    t = ex.fetch_ticker(symbol) or {}
+                    ref_px = float(t.get('last') or t.get('close') or 0.0)
+                except Exception:
+                    ref_px = 0.0
+                create_market_order_smart(ex, symbol, 'buy', qty_to_close, ref_price=ref_px, params=params)
+            else:
+                ex.create_market_order(symbol, 'sell', qty_to_close, params=params)
 
         database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
         notifier.tg_send(f"✅ Position sur {symbol} (Trade #{trade_id}) fermée manuellement (qty={qty_to_close}).")
 
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
-
