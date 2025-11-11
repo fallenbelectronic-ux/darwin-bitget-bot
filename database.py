@@ -236,6 +236,68 @@ def update_signal_state(symbol: str, timeframe: str, ts: int, new_state: str, me
         conn.commit()
         return res.rowcount > 0
 
+def upsert_signal_pending(symbol: str, timeframe: str, ts: int, side: str, regime: str,
+                          rr: float, entry: float, sl: float, tp: float) -> None:
+    """
+    Enregistre/Met à jour un signal en attente (state='PENDING') en DB.
+    Stratégie robuste : UPDATE par (symbol, ts) puis INSERT si aucune ligne modifiée.
+    """
+    import json
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE signals
+                   SET timeframe = ?, side = ?, regime = ?, rr = ?, entry = ?, sl = ?, tp = ?, state = 'PENDING'
+                 WHERE symbol = ? AND ts = ?
+            """, (timeframe, side, regime, float(rr), float(entry), float(sl), float(tp), symbol, int(ts)))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    INSERT INTO signals(symbol, timeframe, ts, side, regime, rr, entry, sl, tp, state)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                """, (symbol, timeframe, int(ts), side, regime, float(rr), float(entry), float(sl), float(tp)))
+        finally:
+            conn.commit()
+
+def mark_signal_validated(symbol: str, ts: int, payload: Dict[str, Any], taken: bool) -> None:
+    """
+    Marque un signal comme validé : state='VALID_TAKEN' si exécuté, sinon 'VALID_SKIPPED'.
+    Conserve les champs principaux et stocke le reste du payload en JSON si disponible.
+    """
+    import json
+    state = 'VALID_TAKEN' if taken else 'VALID_SKIPPED'
+    side   = str(payload.get('side',  payload.get('signal', {}).get('side', '')) or '')
+    regime = str(payload.get('regime', payload.get('signal', {}).get('regime', '')) or '')
+    rr     = float(payload.get('rr',   payload.get('signal', {}).get('rr', 0.0)) or 0.0)
+    entry  = float(payload.get('entry',payload.get('signal', {}).get('entry', 0.0)) or 0.0)
+    sl     = float(payload.get('sl',   payload.get('signal', {}).get('sl', 0.0)) or 0.0)
+    tp     = float(payload.get('tp',   payload.get('signal', {}).get('tp', 0.0)) or 0.0)
+    timeframe = str(payload.get('timeframe', payload.get('signal', {}).get('timeframe', '')) or '')
+
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            # Mise à jour si déjà présent, sinon insertion.
+            cur.execute("""
+                UPDATE signals
+                   SET timeframe = COALESCE(NULLIF(?, ''), timeframe),
+                       side = NULLIF(?, ''),
+                       regime = NULLIF(?, ''),
+                       rr = ?,
+                       entry = ?,
+                       sl = ?,
+                       tp = ?,
+                       state = ?
+                 WHERE symbol = ? AND ts = ?
+            """, (timeframe, side, regime, rr, entry, sl, tp, state, symbol, int(ts)))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    INSERT INTO signals(symbol, timeframe, ts, side, regime, rr, entry, sl, tp, state)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (symbol, timeframe, int(ts), side, regime, rr, entry, sl, tp, state))
+        finally:
+            conn.commit()
+
 
 def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: float):
     """Mise à breakeven : breakeven_status='ACTIVE', maj quantité et SL."""
