@@ -111,7 +111,8 @@ def _dedup_signals(conn: sqlite3.Connection) -> None:
 def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """
     Retourne une liste de signaux (dict) depuis la table 'signals'.
-    - state: filtre optionnel (ex: 'PENDING', 'VALID', 'SKIPPED', ou 'VALID_SKIPPED' pour combiner VALID et SKIPPED)
+    - state: filtre optionnel (ex: 'PENDING', 'VALID_TAKEN', 'VALID_SKIPPED',
+             ou 'VALID' / 'VALID_ANY' / 'VALID_COMBINED' pour combiner VALID_TAKEN+VALID_SKIPPED)
     - since_minutes: fenêtre glissante en minutes, basée sur 'ts' (accepte ts en sec ou ms)
     - limit: max éléments retournés après filtres (ordre anté-chronologique)
     Champs utilisés par notifier: symbol, timeframe, side, entry, sl, tp, rr, ts.
@@ -132,19 +133,21 @@ def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None
         except Exception:
             min_ts_sec = None
 
-    want_valid_skipped = (str(state).upper() == "VALID_SKIPPED") if state is not None else False
+    state_norm = (str(state).upper() if state is not None else None)
+    want_valid_combined = state_norm in ("VALID", "VALID_ANY", "VALID_COMBINED")
+
     out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
 
-        # Filtre state (inclut cas spécial VALID_SKIPPED)
-        if state is not None:
+        # Filtre state (inclut cas combiné VALID_TAKEN + VALID_SKIPPED)
+        if state_norm is not None:
             st = str(d.get("state", "")).upper()
-            if want_valid_skipped:
-                if st not in ("VALID", "SKIPPED"):
+            if want_valid_combined:
+                if st not in ("VALID_TAKEN", "VALID_SKIPPED"):
                     continue
             else:
-                if st != str(state).upper():
+                if st != state_norm:
                     continue
 
         # Filtre fenêtre temporelle (support ts en sec ou ms)
@@ -240,22 +243,26 @@ def upsert_signal_pending(symbol: str, timeframe: str, ts: int, side: str, regim
                           rr: float, entry: float, sl: float, tp: float) -> None:
     """
     Enregistre/Met à jour un signal en attente (state='PENDING') en DB.
-    Stratégie robuste : UPDATE par (symbol, ts) puis INSERT si aucune ligne modifiée.
+    Respecte l'unicité (symbol, side, timeframe, ts) pour éviter d'écraser un autre signal.
     """
-    import json
     with get_db_connection() as conn:
         cur = conn.cursor()
         try:
+            # UPDATE précis par clé logique complète
             cur.execute("""
                 UPDATE signals
-                   SET timeframe = ?, side = ?, regime = ?, rr = ?, entry = ?, sl = ?, tp = ?, state = 'PENDING'
-                 WHERE symbol = ? AND ts = ?
-            """, (timeframe, side, regime, float(rr), float(entry), float(sl), float(tp), symbol, int(ts)))
+                   SET regime = ?, rr = ?, entry = ?, sl = ?, tp = ?, state = 'PENDING'
+                 WHERE symbol = ? AND side = ? AND timeframe = ? AND ts = ?
+            """, (str(regime), float(rr), float(entry), float(sl), float(tp),
+                  str(symbol), str(side).lower(), str(timeframe), int(ts)))
+
             if cur.rowcount == 0:
+                # INSERT si absent
                 cur.execute("""
-                    INSERT INTO signals(symbol, timeframe, ts, side, regime, rr, entry, sl, tp, state)
+                    INSERT INTO signals(symbol, side, timeframe, regime, entry, sl, tp, rr, ts, state)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-                """, (symbol, timeframe, int(ts), side, regime, float(rr), float(entry), float(sl), float(tp)))
+                """, (str(symbol), str(side).lower(), str(timeframe), str(regime),
+                      float(entry), float(sl), float(tp), float(rr), int(ts)))
         finally:
             conn.commit()
 
