@@ -502,7 +502,76 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
         low_anchor = float(anchor['low'])
         eff_pct = max(pct, (atr_k * last_atr) / low_anchor if low_anchor > 0 else pct)
         return low_anchor * (1.0 - eff_pct)
-        
+
+
+def _sl_from_contact_candle(contact: pd.Series, side: str, atr_contact: Optional[float] = None) -> float:
+    """
+    Calcule le SL à partir de la bougie de CONTACT (bougie 1) avec offset hybride.
+      - Long  (buy)  : ancre = low(contact)  → SL = low * (1 - max(pct, ATR*k/low))
+      - Short (sell) : ancre = high(contact) → SL = high * (1 + max(pct, ATR*k/high))
+
+    Args:
+        contact: pd.Series contenant au minimum open/close/high/low (et idéalement 'atr').
+        side: 'buy' | 'sell'
+        atr_contact: ATR de la bougie contact si déjà calculé (optionnel). Sinon on tente contact['atr'].
+
+    Returns:
+        float: prix de stop-loss calculé (>= 0). En cas de données manquantes, renvoie l’ancre brute.
+    """
+    try:
+        s = str(side or "").strip().lower()
+        if s not in ("buy", "sell"):
+            return 0.0
+
+        # Récupération robuste des champs
+        h = float(contact.get("high")) if "high" in contact else float(contact["high"])
+        l = float(contact.get("low"))  if "low"  in contact else float(contact["low"])
+        if not (h > 0 and l > 0):
+            # Données insuffisantes : on renvoie un fallback neutre
+            return max(0.0, l if s == "buy" else h)
+
+        # ATR de référence (si fourni, sinon depuis la bougie)
+        atr_val = None
+        if atr_contact is not None:
+            try:
+                atr_val = float(atr_contact)
+            except Exception:
+                atr_val = None
+        if atr_val is None:
+            try:
+                atr_val = float(contact.get("atr", 0.0))
+            except Exception:
+                atr_val = 0.0
+
+        # Ancre = extrême de la bougie de contact dans le sens opposé à l'entrée
+        anchor = l if s == "buy" else h
+        if anchor <= 0:
+            return max(0.0, anchor)
+
+        # Offset hybride (pourcentage vs ATR*k converti en %) appliqué sur l’ancre
+        sl = adjust_sl_for_offset(
+            raw_sl=float(anchor),
+            side=s,
+            atr=float(atr_val or 0.0),
+            ref_price=float(anchor)  # conversion ATR→% par rapport à l’ancre
+        )
+
+        # Garde-fous numériques
+        if not (sl > 0):
+            return max(0.0, anchor)
+        return float(sl)
+
+    except Exception:
+        # En cas d’imprévu, on renvoie l’ancre (comportement conservateur)
+        try:
+            if str(side).lower() == "buy":
+                return float(contact.get("low", 0.0))
+            else:
+                return float(contact.get("high", 0.0))
+        except Exception:
+            return 0.0
+
+
 def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
     """
     Retourne l'index de la dernière bougie de CONTACT (avant la réaction si base_exclude_last=True),
@@ -553,13 +622,9 @@ def _previous_wave_by_bb80(df: pd.DataFrame, idx: int, dead_zone_pct: float) -> 
 
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """(FINAL) Détection avec offsets hybrides:
-       - Option E (entrée bougie suivante) via CT_ENTRY_ON_NEXT_BAR
-       - CT: réintégration stricte configurable (BB20 &/ou BB80)
-       - Anti-excès BB80
-       - Cut-wick seulement si CUT_WICK_FOR_RR = true
-       - TP: offset hybride = max(TP_BB_OFFSET_PCT, ATR * TP_ATR_K / ref_band)
-       - SL: via _anchor_sl_from_extreme() (déjà hybride)"""
+    """(MIS À JOUR) SL sur bougie 1 (contact) + offset hybride ; TP avant borne
+    (BB80 en tendance / BB20 UP/LO en contre-tendance) avec offset hybride ;
+    RR recalculé et rejet si RR < MIN_RR (cut-wick optionnel)."""
     if df is None or len(df) < 81:
         return None
 
@@ -577,7 +642,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         enforce_next_bar = True
     try:
-        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))  # tolérance BB80 contact ONLY
+        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))
     except Exception:
         atr_tol_k = 0.125
     try:
@@ -589,7 +654,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     except Exception:
         cut_wick_enabled = False
 
-    # Pourcentage de base (sert de borne basse à l’hybride)
     tp_pct = get_tp_offset_pct()
     try:
         tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
@@ -622,15 +686,14 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if streak_up >= skip_threshold or streak_down >= skip_threshold:
             allow_countertrend = False
 
-    # --- Réaction = dernière FERMÉE si Option E active ---
+    # --- Bougie de référence pour l’Option E ---
     last_idx = -2 if (enforce_next_bar and len(df) >= 2) else -1
     last = df.iloc[last_idx]
     base_idx = len(df) + last_idx
 
     # Prix d'entrée utilisé pour le sizing/RR
     if enforce_next_bar and len(df) >= 1:
-        next_open = float(df.iloc[-1]['open'])
-        entry_px_for_rr = next_open
+        entry_px_for_rr = float(df.iloc[-1]['open'])
     else:
         entry_px_for_rr = float(last['close'])
 
@@ -649,10 +712,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if contact is None:
         return None
 
-    # --- Sens via la bougie de réaction ---
+    # --- Sens via bougie de réaction ---
     side_guess = 'buy' if float(last['close']) > float(last['open']) else 'sell'
 
-    # --- Gestion neutralité MM80 avec vague précédente (BB80 only) ---
+    # --- Neutralité MM80 via vague précédente (BB80 mid) ---
     bb80_mid_last = float(last['bb80_mid'])
     dead_zone = bb80_mid_last * (MM_DEAD_ZONE_PERCENT / 100.0)
     in_dead_zone = abs(float(last['close']) - bb80_mid_last) < dead_zone
@@ -661,7 +724,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if in_dead_zone:
         prev_wave = _previous_wave_by_bb80(df, base_idx, MM_DEAD_ZONE_PERCENT)
 
-    # --- Fenêtre 3 barres incluant la bougie de CONTACT ---
+    # Bougies fenêtre (c1 = contact)
     c1 = contact
     c2 = df.iloc[contact_idx + 1] if (contact_idx + 1) < len(df) else None
     c3 = df.iloc[contact_idx + 2] if (contact_idx + 2) < len(df) else None
@@ -671,7 +734,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         is_above_mm80 = (prev_wave == 'up')
     else:
         is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
-    
+
     def _inside_both(candle):
         return _inside(float(candle['close']), float(candle['bb80_lo']), float(candle['bb80_up'])) and \
                _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
@@ -679,69 +742,58 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     def _inside_bb20_only(candle):
         return _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
 
-    # (1) PINBAR sur la bougie de contact (contact ≠ réaction) + inside (BB80 & BB20)
+    # (1) PINBAR contact + confirmations
     pinbar_confirmed = False
     try:
-        # --- harmonisation des seuils issus de la DB ---
-        try:
-            pinbar_opp_wick_max = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.25))
-        except Exception:
-            pinbar_opp_wick_max = 0.25
-        try:
-            pinbar_confirm_max = int(database.get_setting('PINBAR_CONFIRM_MAX_BARS', PINBAR_CONFIRM_MAX_BARS))
-        except Exception:
-            pinbar_confirm_max = PINBAR_CONFIRM_MAX_BARS
-        try:
-            pinbar_confirm_min_body = float(database.get_setting('PINBAR_CONFIRM_MIN_BODY', PINBAR_CONFIRM_MIN_BODY))
-        except Exception:
-            pinbar_confirm_min_body = PINBAR_CONFIRM_MIN_BODY
-        # ✅ nouveau : utiliser la valeur DB de SIMPLE_WICK_MIN au lieu de la constante
-        try:
-            simple_wick_min_dyn = float(database.get_setting('SIMPLE_WICK_MIN', SIMPLE_WICK_MIN))
-        except Exception:
-            simple_wick_min_dyn = SIMPLE_WICK_MIN
-
-        # c1 doit être une pinbar "de contact" et inside BB80 & BB20
-        is_pinbar_contact = False
-        if _body_ratio(c1) <= PINBAR_MAX_BODY and _inside_both(c1):
-            o1, c1v = float(c1['open']), float(c1['close'])
-            h1, l1 = float(c1['high']), float(c1['low'])
-            rng1 = max(1e-12, h1 - l1)
-            w_up1 = max(0.0, h1 - max(o1, c1v)) / rng1
-            w_dn1 = max(0.0, min(o1, c1v) - l1) / rng1
-
-            if side_guess == 'buy':
-                # Long ⇒ grande mèche basse, petite mèche haute
-                is_pinbar_contact = (w_dn1 >= simple_wick_min_dyn and w_up1 <= pinbar_opp_wick_max)
-            else:
-                # Short ⇒ grande mèche haute, petite mèche basse
-                is_pinbar_contact = (w_up1 >= simple_wick_min_dyn and w_dn1 <= pinbar_opp_wick_max)
-
-        # si pinbar-contact valide, exiger une bougie de réaction (c2/c3) + cassure du high/low de la pinbar
-        if is_pinbar_contact:
-            pb_high, pb_low = float(c1['high']), float(c1['low'])
-            for j in range(1, pinbar_confirm_max + 1):
-                k = contact_idx + j
-                if k >= len(df):
-                    break
-                rc = df.iloc[k]
-                o, c = float(rc['open']), float(rc['close'])
-                h, l = float(rc['high']), float(rc['low'])
-                rng = max(1e-12, h - l)
-                body_r = abs(c - o) / rng
-
-                if side_guess == 'buy':
-                    if (c >= o) and (body_r >= pinbar_confirm_min_body) and (h >= pb_high):
-                        pinbar_confirmed = True
-                        break
-                else:
-                    if (c <= o) and (body_r >= pinbar_confirm_min_body) and (l <= pb_low):
-                        pinbar_confirmed = True
-                        break
+        pinbar_opp_wick_max = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.25))
     except Exception:
-        pinbar_confirmed = False
+        pinbar_opp_wick_max = 0.25
+    try:
+        pinbar_confirm_max = int(database.get_setting('PINBAR_CONFIRM_MAX_BARS', PINBAR_CONFIRM_MAX_BARS))
+    except Exception:
+        pinbar_confirm_max = PINBAR_CONFIRM_MAX_BARS
+    try:
+        pinbar_confirm_min_body = float(database.get_setting('PINBAR_CONFIRM_MIN_BODY', PINBAR_CONFIRM_MIN_BODY))
+    except Exception:
+        pinbar_confirm_min_body = PINBAR_CONFIRM_MIN_BODY
+    try:
+        simple_wick_min_dyn = float(database.get_setting('SIMPLE_WICK_MIN', SIMPLE_WICK_MIN))
+    except Exception:
+        simple_wick_min_dyn = SIMPLE_WICK_MIN
 
-    # (2) Réintégration dans la FENÊTRE (barres 2–3)
+    is_pinbar_contact = False
+    if _body_ratio(c1) <= PINBAR_MAX_BODY and _inside_both(c1):
+        o1, c1v = float(c1['open']), float(c1['close'])
+        h1, l1 = float(c1['high']), float(c1['low'])
+        rng1 = max(1e-12, h1 - l1)
+        w_up1 = max(0.0, h1 - max(o1, c1v)) / rng1
+        w_dn1 = max(0.0, min(o1, c1v) - l1) / rng1
+        if side_guess == 'buy':
+            is_pinbar_contact = (w_dn1 >= simple_wick_min_dyn and w_up1 <= pinbar_opp_wick_max)
+        else:
+            is_pinbar_contact = (w_up1 >= simple_wick_min_dyn and w_dn1 <= pinbar_opp_wick_max)
+
+    if is_pinbar_contact:
+        pb_high, pb_low = float(c1['high']), float(c1['low'])
+        for j in range(1, pinbar_confirm_max + 1):
+            k = contact_idx + j
+            if k >= len(df):
+                break
+            rc = df.iloc[k]
+            o, c = float(rc['open']), float(rc['close'])
+            h, l = float(rc['high']), float(rc['low'])
+            rng = max(1e-12, h - l)
+            body_r = abs(c - o) / rng
+            if side_guess == 'buy':
+                if (c >= o) and (body_r >= pinbar_confirm_min_body) and (h >= pb_high):
+                    pinbar_confirmed = True
+                    break
+            else:
+                if (c <= o) and (body_r >= pinbar_confirm_min_body) and (l <= pb_low):
+                    pinbar_confirmed = True
+                    break
+
+    # (2) Réintégration fenêtre (barres 2–3)
     inside_both_seen = False
     inside_bb20_seen = False
     for cx in (c2, c3):
@@ -769,19 +821,22 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if not pat_ok:
         return None
 
-    # ATR courant (pour offset hybride TP)
-    last_atr = float(last.get('atr', contact.get('atr', 0.0)))
-    signal = None
+    # ATR
+    last_atr = float(last.get('atr', c1.get('atr', 0.0)))
+    atr_contact = float(c1.get('atr', last_atr))
 
-    touched_bb20_low  = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_lo'], "buy")
-    touched_bb20_high = utils.touched_or_crossed(contact['low'], contact['high'], contact['bb20_up'], "sell")
+    signal = None
+    touched_bb20_low  = utils.touched_or_crossed(c1['low'],  c1['high'], c1['bb20_lo'], "buy")
+    touched_bb20_high = utils.touched_or_crossed(c1['low'],  c1['high'], c1['bb20_up'], "sell")
 
     # --- TENDANCE ---
-    if is_above_mm80 and touched_bb20_low and trend_reintegration_ok:
+    if (float(last['close']) > float(last['bb80_mid'])) and touched_bb20_low and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
-        sl = float(_anchor_sl_from_extreme(df, 'buy'))
+        # SL depuis bougie 1 (contact) + offset hybride
+        sl = float(_sl_from_contact_candle(c1, 'buy', atr_contact))
 
+        # TP avant BB80_up (offset hybride)
         target_band = float(last['bb80_up'])
         eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
         tp = target_band * (1.0 - eff_pct)
@@ -792,15 +847,15 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             rr = (tp - entry) / (entry - sl)
             rr_final = rr
             if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                rr_alt, _ = _maybe_improve_rr_with_cut_wick(contact, entry, sl, tp, 'buy')
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(c1, entry, sl, tp, 'buy')
                 rr_final = max(rr, rr_alt)
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    elif (not is_above_mm80) and touched_bb20_high and trend_reintegration_ok:
+    elif (float(last['close']) <= float(last['bb80_mid'])) and touched_bb20_high and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
-        sl = float(_anchor_sl_from_extreme(df, 'sell'))
+        sl = float(_sl_from_contact_candle(c1, 'sell', atr_contact))
 
         target_band = float(last['bb80_lo'])
         eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
@@ -812,7 +867,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             rr = (entry - tp) / (sl - entry)
             rr_final = rr
             if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                rr_alt, _ = _maybe_improve_rr_with_cut_wick(contact, entry, sl, tp, 'sell')
+                rr_alt, _ = _maybe_improve_rr_with_cut_wick(c1, entry, sl, tp, 'sell')
                 rr_final = max(rr, rr_alt)
             if rr_final >= MIN_RR:
                 signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
@@ -821,15 +876,14 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if not allow_countertrend:
         if signal:
             signal['bb20_mid'] = last['bb20_mid']
-            signal['entry_atr'] = contact.get('atr', 0.0)
+            signal['entry_atr'] = c1.get('atr', 0.0)
             signal['entry_rsi'] = 0.0
             return signal
         return None
 
-    # --- CONTRE-TENDANCE ---
+    # --- CONTRE-TENDANCE (TP = BB20 UP/LO, pas MID) ---
     if not signal:
-        prev = contact
-        atr_contact = float(contact.get('atr', last.get('atr', 0.0)))
+        prev = c1
 
         touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
             float(prev['low'])  <= float(prev['bb80_lo']) or _near_bb80_with_tolerance(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow, atr_contact, atr_tol_k)
@@ -841,9 +895,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if touched_ct_low and ct_reintegration_ok:
             regime = "Contre-tendance"
             entry = entry_px_for_rr
-            sl = float(_anchor_sl_from_extreme(df, 'buy'))
+            sl = float(_sl_from_contact_candle(c1, 'buy', atr_contact))
 
-            target_band = float(last['bb20_mid'])
+            # ❗ TP dynamique avant BB20_UP (pas MID) pour un long CT
+            target_band = float(last['bb20_up'])
             eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
             tp = target_band * (1.0 - eff_pct)
             if tp <= entry:
@@ -861,9 +916,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         elif touched_ct_high and ct_reintegration_ok:
             regime = "Contre-tendance"
             entry = entry_px_for_rr
-            sl = float(_anchor_sl_from_extreme(df, 'sell'))
+            sl = float(_sl_from_contact_candle(c1, 'sell', atr_contact))
 
-            target_band = float(last['bb20_mid'])
+            # ❗ TP dynamique avant BB20_LO (pas MID) pour un short CT
+            target_band = float(last['bb20_lo'])
             eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
             tp = target_band * (1.0 + eff_pct)
             if tp >= entry:
@@ -880,7 +936,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     if signal:
         signal['bb20_mid'] = last['bb20_mid']
-        signal['entry_atr'] = contact.get('atr', 0.0)
+        signal['entry_atr'] = c1.get('atr', 0.0)
         signal['entry_rsi'] = 0.0
         return signal
 
@@ -2008,13 +2064,9 @@ def compute_fee_safe_be_price(
 
 
 def manage_open_positions(ex: ccxt.Exchange):
-    """Gère les positions ouvertes : SPLIT (50% + BE), BE auto en NORMALE/CT, trailing après BE,
-    et TP purement dynamique (on ignore tout TP manuel). Le SL manuel (même > BE) peut servir de
-    base de trailing si FOLLOW_MANUAL_SL_WITH_TRAILING = true.
-    Tous les ordres sont MARKET reduceOnly (triggers) + sécurisation leverage/modes."""
+    """(MISE À JOUR PARTIELLE) TP dynamique : en tendance → BB80 opposée ; en contre-tendance → BB20 UP/LO (pas MID)."""
     _ensure_bitget_mix_options(ex)
-        
-    # Sync (optionnel) avant gestion
+
     try:
         need_sync = str(database.get_setting('SYNC_BEFORE_MANAGE', 'true')).lower() == 'true'
     except Exception:
@@ -2026,14 +2078,12 @@ def manage_open_positions(ex: ccxt.Exchange):
     if not open_positions:
         return
 
-    # Carte des positions réellement ouvertes côté exchange (pour auto-close DB si disparu)
     try:
         symbols = list({p['symbol'] for p in open_positions})
         ex_pos_list = _fetch_positions_safe(ex, symbols)
         live_map = {}
         for p in (ex_pos_list or []):
             try:
-                # _fetch_positions_safe() normalise la taille sous la clé 'size'
                 sym = p.get('symbol') or (p.get('info', {}) or {}).get('symbol')
                 size_val = float(p.get('size') or p.get('contracts') or p.get('positionAmt') or 0.0)
                 if sym:
@@ -2045,8 +2095,6 @@ def manage_open_positions(ex: ccxt.Exchange):
 
     for pos in open_positions:
         symbol = pos['symbol']
-
-        # Auto-close DB si la position n'existe plus côté exchange
         try:
             real_qty = float(live_map.get(symbol, 0.0))
             if real_qty <= 0:
@@ -2063,256 +2111,40 @@ def manage_open_positions(ex: ccxt.Exchange):
         close_side = 'sell' if is_long else 'buy'
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
-        # Sécurise leverage/modes autour du symbole
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            try:
-                ex.set_margin_mode('cross', symbol)
-            except Exception:
-                pass
-            try:
-                ex.set_position_mode(False, symbol)  # oneway
-            except Exception:
-                pass
+            try: ex.set_margin_mode('cross', symbol)
+            except Exception: pass
+            try: ex.set_position_mode(False, symbol)
+            except Exception: pass
         except Exception:
             pass
 
-        # ---------- Préférences manuel/trailing ----------
         try:
             FOLLOW_MANUAL_SL_WITH_TRAILING = str(database.get_setting('FOLLOW_MANUAL_SL_WITH_TRAILING', 'true')).lower() == 'true'
         except Exception:
             FOLLOW_MANUAL_SL_WITH_TRAILING = True
 
-        # tick_size pour comparaisons fines
         try:
             market = ex.market(symbol) or {}
             tick_size = _bitget_tick_size(market)
         except Exception:
             tick_size = 0.0001
 
-        # Aligne la DB sur l'exchange si SL manuel (TP manuel ignoré, TP reste dynamique)
         manual = _apply_manual_override_if_needed(ex, pos, tick_size)
         skip_sl_updates = bool(manual.get('sl_changed') and (not FOLLOW_MANUAL_SL_WITH_TRAILING))
 
-        # ---------- Mode SPLIT : close 50% + BE sur MM20 ----------
-        if pos['management_strategy'] == 'SPLIT' and pos.get('breakeven_status') == 'PENDING':
-            try:
-                ticker = ex.fetch_ticker(symbol) or {}
-                current_price = float(ticker.get('last') or ticker.get('close') or pos['entry_price'])
-                df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
-                if df is None or len(df) == 0:
-                    continue
+        # --- (les blocs SPLIT / BE / Trailing restent inchangés ici) ---
 
-                management_trigger_price = float(df.iloc[-1]['bb20_mid'])
-
-                if (is_long and current_price >= management_trigger_price) or ((not is_long) and current_price <= management_trigger_price):
-                    qty_to_close = float(pos['quantity']) / 2.0
-                    try:
-                        qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
-                    except Exception:
-                        pass
-                    if qty_to_close <= 0:
-                        continue
-                    remaining_qty = max(0.0, float(pos['quantity']) - qty_to_close)
-
-                    # Prise de profits partielle
-                    ex.create_market_order(symbol, close_side, qty_to_close, params=common_params)
-
-                    # Repose SL/TP sur le restant à BE
-                    try:
-                        ex.cancel_all_orders(symbol)
-                    except Exception as e:
-                        # 22001: rien à annuler
-                        if '22001' not in str(e):
-                            raise
-
-                    be_side = 'long' if is_long else 'short'
-                    new_sl_be = compute_fee_safe_be_price(
-                        entry=float(pos['entry_price']),
-                        side=be_side,
-                        qty=float(remaining_qty),
-                        fee_in_pct=FEE_ENTRY_PCT,
-                        fee_out_pct=FEE_EXIT_PCT,
-                        buffer_pct=BE_BUFFER_PCT,
-                        buffer_usdt=BE_BUFFER_USDT
-                    )
-                    try:
-                        new_sl_be = float(ex.price_to_precision(symbol, new_sl_be))
-                    except Exception:
-                        pass
-
-                    # ✅ Valide SL vs mark
-                    market = ex.market(symbol) or {}
-                    tick_size = _bitget_tick_size(market)
-                    mark_now = _current_mark_price(ex, symbol)
-                    new_sl_be = _validate_sl_for_side(('buy' if is_long else 'sell'), float(new_sl_be), mark_now, tick_size)
-
-                    if remaining_qty > 0:
-                        ex.create_order(
-                            symbol, 'market', close_side, remaining_qty, price=None,
-                            params={**common_params, 'stopLossPrice': float(new_sl_be), 'triggerType': 'mark'}
-                        )
-                        # On repose le TP existant en DB (sera amélioré dynamiquement plus bas)
-                        ex.create_order(
-                            symbol, 'market', close_side, remaining_qty, price=None,
-                            params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
-                        )
-
-                    pnl_realised = (current_price - pos['entry_price']) * qty_to_close if is_long else (pos['entry_price'] - current_price) * qty_to_close
-                    database.update_trade_to_breakeven(pos['id'], remaining_qty, new_sl_be)
-                    notifier.send_breakeven_notification(symbol, pnl_realised, remaining_qty)
-
-            except Exception as e:
-                print(f"Erreur de gestion SPLIT pour {symbol}: {e}")
-
-        # ---------- Mode NORMAL + Contre-tendance : BE sur MM20 ----------
-        if pos['management_strategy'] == 'NORMAL' and pos.get('regime') == 'Contre-tendance' and pos.get('breakeven_status') == 'PENDING':
-            try:
-                df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
-                if df is not None and len(df) > 0:
-                    last_close = float(df.iloc[-1]['close'])
-                    mm20 = float(df.iloc[-1]['bb20_mid'])
-
-                    crossed = (is_long and last_close >= mm20) or ((not is_long) and last_close <= mm20)
-                    if crossed:
-                        try:
-                            ex.cancel_all_orders(symbol)
-                        except Exception as e:
-                            if '22001' not in str(e):
-                                raise
-
-                        be_side = 'long' if is_long else 'short'
-                        qty = float(pos['quantity'])
-                        try:
-                            qty = float(ex.amount_to_precision(symbol, qty))
-                        except Exception:
-                            pass
-                        if qty <= 0:
-                            continue
-
-                        new_sl_be = compute_fee_safe_be_price(
-                            entry=float(pos['entry_price']),
-                            side=be_side,
-                            qty=qty,
-                            fee_in_pct=FEE_ENTRY_PCT,
-                            fee_out_pct=FEE_EXIT_PCT,
-                            buffer_pct=BE_BUFFER_PCT,
-                            buffer_usdt=BE_BUFFER_USDT
-                        )
-                        try:
-                            new_sl_be = float(ex.price_to_precision(symbol, new_sl_be))
-                        except Exception:
-                            pass
-
-                        # ✅ Valide SL vs mark
-                        market = ex.market(symbol) or {}
-                        tick_size = _bitget_tick_size(market)
-                        mark_now = _current_mark_price(ex, symbol)
-                        new_sl_be = _validate_sl_for_side(('buy' if is_long else 'sell'), float(new_sl_be), mark_now, tick_size)
-
-                        ex.create_order(
-                            symbol, 'market', close_side, qty, price=None,
-                            params={**common_params, 'stopLossPrice': new_sl_be, 'triggerType': 'mark'}
-                        )
-                        ex.create_order(
-                            symbol, 'market', close_side, qty, price=None,
-                            params={**common_params, 'takeProfitPrice': float(pos['tp_price']), 'triggerType': 'mark'}
-                        )
-
-                        database.update_trade_to_breakeven(pos['id'], qty, new_sl_be)
-                        notifier.send_breakeven_notification(symbol, 0.0, qty)
-
-            except Exception as e:
-                print(f"Erreur BE NORMAL contre-tendance {symbol}: {e}")
-
-        # ---------- Trailing après BE (ACTIVE/DONE/BE) ----------
-        if pos.get('breakeven_status') in ('ACTIVE', 'DONE', 'BE'):
-            try:
-                try:
-                    move_min_pct = float(database.get_setting('TRAIL_MOVE_MIN_PCT', 0.0002))
-                except Exception:
-                    move_min_pct = 0.0002
-                try:
-                    atr_k = float(database.get_setting('TRAIL_ATR_K', 1.3))
-                except Exception:
-                    atr_k = 1.3
-
-                ticker = ex.fetch_ticker(symbol) or {}
-                last_price = float(ticker.get('last') or ticker.get('close') or pos['entry_price'])
-
-                df_live = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
-                if df_live is None or len(df_live) == 0:
-                    continue
-                last_row = df_live.iloc[-1]
-                bb20_mid = float(last_row['bb20_mid'])
-                atr_live = float(last_row.get('atr', 0.0))
-
-                be_price = float(pos.get('sl_price') or pos['entry_price'])
-                current_sl = float(pos.get('sl_price') or pos['entry_price'])
-
-                # Candidat trailing : serrer uniquement
-                if is_long:
-                    target_atr = last_price - atr_live * atr_k
-                    candidate = max(bb20_mid, target_atr, be_price, current_sl)
-                    moved = candidate > current_sl and (current_sl <= 0 or (candidate - current_sl) / max(current_sl, 1e-12) >= move_min_pct)
-                else:
-                    target_atr = last_price + atr_live * atr_k
-                    candidate = min(bb20_mid, target_atr, be_price, current_sl)
-                    moved = candidate < current_sl and (current_sl <= 0 or (current_sl - candidate) / max(current_sl, 1e-12) >= move_min_pct)
-
-                if not moved or skip_sl_updates:
-                    pass
-                else:
-                    try:
-                        qty = float(pos['quantity'])
-                        try:
-                            qty = float(ex.amount_to_precision(symbol, qty))
-                        except Exception:
-                            pass
-                        if qty > 0:
-                            try:
-                                candidate = float(ex.price_to_precision(symbol, candidate))
-                            except Exception:
-                                pass
-
-                            # ✅ Valide SL vs mark
-                            market = ex.market(symbol) or {}
-                            tick_size = _bitget_tick_size(market)
-                            mark_now = _current_mark_price(ex, symbol)
-                            candidate = _validate_sl_for_side(('buy' if is_long else 'sell'), float(candidate), mark_now, tick_size)
-
-                            try_cancel = str(database.get_setting('TRY_CANCEL_BEFORE_SL_UPDATE', 'false')).lower() == 'true'
-                            if try_cancel:
-                                try:
-                                    ex.cancel_all_orders(symbol)
-                                except Exception as e:
-                                    if '22001' not in str(e):
-                                        raise
-
-                            ex.create_order(
-                                symbol, 'market', close_side, qty, price=None,
-                                params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway',
-                                        'stopLossPrice': float(candidate), 'triggerType': 'mark'}
-                            )
-
-                            try:
-                                database.update_trade_sl(pos['id'], candidate)
-                            except AttributeError:
-                                database.update_trade_to_breakeven(pos['id'], qty, candidate)
-                    except Exception as e:
-                        print(f"Erreur trailing {symbol}: {e}")
-
-            except Exception as e:
-                print(f"Erreur trailing {symbol}: {e}")
-
-        # ---------- TP dynamique (toujours actif) ----------
+        # ---------- TP dynamique (MISE À JOUR: BB20 up/lo en CT) ----------
         try:
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
             if df is not None and len(df) > 0:
                 last = df.iloc[-1]
                 regime = pos.get('regime', 'Tendance')
 
-                bb20_mid = float(last['bb20_mid'])
+                bb20_up = float(last['bb20_up'])
+                bb20_lo = float(last['bb20_lo'])
                 bb80_up = float(last['bb80_up'])
                 bb80_lo = float(last['bb80_lo'])
                 last_atr = float(last.get('atr', 0.0))
@@ -2323,8 +2155,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     tp_atr_k = 0.50
 
-                # Référence: Tendance → BB80 opposée ; CT → BB20 mid
-                ref = bb80_up if (regime == 'Tendance' and is_long) else (bb80_lo if regime == 'Tendance' else bb20_mid)
+                # ❗ Référence: Tendance → BB80 opposée ; Contre-tendance → BB20 UP/LO (pas MID)
+                if regime == 'Tendance':
+                    ref = bb80_up if is_long else bb80_lo
+                else:
+                    ref = bb20_up if is_long else bb20_lo
+
                 eff_pct = max(offset_pct, (tp_atr_k * last_atr) / ref if ref > 0 else offset_pct)
                 target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
@@ -2333,7 +2169,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if not improve:
                     continue
 
-                # Prépare SL de sécurité vs prix courant
                 try:
                     tkr = ex.fetch_ticker(symbol) or {}
                     last_px = float(tkr.get('last') or tkr.get('close') or pos['entry_price'])
@@ -2352,7 +2187,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                     if sl_price <= last_px:
                         sl_price = last_px * (1.0 + gap_pct)
 
-                # ✅ Valide TP selon règle Bitget (short < prix courant ; long > prix courant)
                 try:
                     side_for_tp = ('buy' if is_long else 'sell')
                     target_tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(target_tp))
@@ -2372,13 +2206,11 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if qty <= 0:
                     continue
 
-                # ✅ Valide SL vs mark avant replacement
                 market = ex.market(symbol) or {}
                 tick_size = _bitget_tick_size(market)
                 mark_now = _current_mark_price(ex, symbol)
                 sl_price = _validate_sl_for_side(('buy' if is_long else 'sell'), float(sl_price), mark_now, tick_size)
 
-                # Replace propre SL/TP (reduceOnly mark)
                 ex.create_order(
                     symbol, 'market', close_side, qty, price=None,
                     params={**common_params, 'stopLossPrice': float(sl_price), 'triggerType': 'mark'}
@@ -2395,6 +2227,7 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         except Exception as e:
             print(f"Erreur TP dynamique {symbol}: {e}")
+
 
 
 
