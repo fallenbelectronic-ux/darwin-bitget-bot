@@ -675,7 +675,6 @@ def try_handle_inline_callback(event: Any) -> bool:
     Route Offset/Signaux/Restart/Stats.
     Accepte soit un objet 'callback_query', soit un update complet, soit une LISTE d'updates.
     """
-    # Si on reçoit une liste d'updates, traiter chaque élément
     if isinstance(event, list):
         handled = False
         for it in event:
@@ -683,11 +682,9 @@ def try_handle_inline_callback(event: Any) -> bool:
                 handled = True
         return handled
 
-    # Doit être un dict
     if not isinstance(event, dict):
         return False
 
-    # Supporte update Telegram brut {"callback_query": {...}} ou l'objet callback lui-même
     data = event.get("callback_query") if "callback_query" in event else event
     if not isinstance(data, dict):
         return False
@@ -696,6 +693,46 @@ def try_handle_inline_callback(event: Any) -> bool:
         cmd = data.get("data")
         if not cmd:
             return False
+
+        # ----- MENU PRINCIPAL -----
+        if cmd == "main_menu":
+            try:
+                is_paused = str(database.get_setting('PAUSED', 'false')).lower() == 'true'
+            except Exception:
+                is_paused = False
+            send_main_menu(is_paused)
+            cq_id = data.get("id")
+            if cq_id:
+                tg_answer_callback_query(cq_id)
+            return True
+
+        # ----- MENU CONFIGURATION -----
+        if cmd == "menu_config":
+            send_config_menu()
+            cq_id = data.get("id")
+            if cq_id:
+                tg_answer_callback_query(cq_id)
+            return True
+
+        # ----- MENUS SIGNAUX -----
+        if cmd == "menu_signals":
+            send_signals_menu()
+            cq_id = data.get("id")
+            if cq_id:
+                tg_answer_callback_query(cq_id)
+            return True
+        if cmd == "signals_pending":
+            tg_show_signals_pending(); return True
+        if cmd == "signals_6h":
+            tg_show_signals_6h(); return True
+
+        # ----- POSITIONS -----
+        if cmd == "list_positions":
+            tg_show_positions()
+            cq_id = data.get("id")
+            if cq_id:
+                tg_answer_callback_query(cq_id)
+            return True
 
         # ----- OFFSETS -----
         if isinstance(cmd, str) and cmd.startswith("OFS:"):
@@ -707,17 +744,13 @@ def try_handle_inline_callback(event: Any) -> bool:
             handle_offset_callback(cmd, chat_id=chat_id, message_id=message_id, callback_query_id=cq_id)
             return True
 
-        # ----- MENUS SIGNaux -----
-        if cmd == "menu_signals":
-            send_signals_menu(); return True
-        if cmd == "signals_pending":
-            tg_show_signals_pending(); return True
-        if cmd == "signals_6h":
-            tg_show_signals_6h(); return True
-
         # ----- STATS -----
         if cmd == "get_stats":
-            tg_show_stats("24h"); return True
+            tg_show_stats("24h")
+            cq_id = data.get("id")
+            if cq_id:
+                tg_answer_callback_query(cq_id)
+            return True
         if isinstance(cmd, str) and cmd.startswith("stats:"):
             period = cmd.split(":", 1)[1] if ":" in cmd else "24h"
             tg_show_stats(period)
@@ -739,19 +772,6 @@ def try_handle_inline_callback(event: Any) -> bool:
         tg_send_error("Callback routing", e)
         return False
 
-def send_commands_help(chat_id: Optional[str] = None):
-    """
-    Affiche le bloc 'Commandes' dans Telegram, même format/emoji que setuniverse & setmaxpos,
-    avec ajout de /offset pour ouvrir le panneau TP/SL.
-    """
-    lines = [
-        "🛠️ <b>Commandes</b>",
-        "",
-        "/setuniverse &lt;nombre&gt;  — 🌐 Taille du scan",
-        "/setmaxpos &lt;nombre&gt;    — 🧮 Nb max de trades",
-        "/offset                     — ⚙️ Offset TP/SL (panneau)"
-    ]
-    tg_send("\n".join(lines), chat_id=chat_id)
 
 def _format_signal_row(sig: dict) -> str:
     """Format compact d'un signal (sans la raison), horodaté Europe/Lisbon.
@@ -1095,12 +1115,10 @@ def _load_balance_optional() -> Optional[float]:
 def _render_stats_period(period: str) -> str:
     """
     Construit le message Stats pour 24h / 7d / 30d / all à partir des TRADES fermés.
-    -> Récupère les trades sur la fenêtre, calcule les stats via reporting,
-       puis formate avec reporting.format_report_message (comme send_report).
+    Tolère DB en secondes OU millisecondes pour les timestamps.
     """
     period = (period or "24h").lower()
 
-    # Fenêtre & titre
     if period == "7d":
         seconds = 7 * 24 * 60 * 60
         title = "Bilan Hebdomadaire (7 jours)"
@@ -1114,14 +1132,20 @@ def _render_stats_period(period: str) -> str:
         seconds = 24 * 60 * 60
         title = "Bilan Quotidien (24h)"
 
-    # Récupération trades fermés dans la fenêtre
+    # Fenêtre temporelle
     try:
         since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
+    except Exception:
+        since_ts = 0
+
+    # Lecture DB robuste: tente en secondes puis en millisecondes si vide
+    try:
         trades = database.get_closed_trades_since(since_ts)
+        if seconds is not None and not trades:
+            trades = database.get_closed_trades_since(since_ts * 1000)
     except Exception:
         trades = []
 
-    # Calcul stats + formatage
     stats = reporting.calculate_performance_stats(trades)
     balance = _load_balance_optional()
     return reporting.format_report_message(title, stats, balance)
@@ -1143,6 +1167,20 @@ def tg_show_stats(period: str = "24h"):
     text = _render_stats_period(period)
     kb = _stats_keyboard(period)
     edit_main(text, kb)
+
+def tg_show_positions():
+    """
+    Affiche les positions ouvertes depuis la DB dans le message principal.
+    (Routé par le bouton '📊 Positions')
+    """
+    try:
+        positions = database.get_open_positions() or []
+    except Exception as e:
+        edit_main(f"⚠️ Erreur lecture positions : <code>{_escape(e)}</code>",
+                  {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]})
+        return
+
+    format_open_positions(positions)
 
 def format_open_positions(positions: List[Dict[str, Any]]):
     """Affiche les positions ouvertes dans le message principal (pas de spam) avec PNL si prix courant dispo
@@ -1421,12 +1459,13 @@ def edit_main(text: str, reply_markup: Optional[Dict] = None) -> bool:
 
     return False
 
-def tg_send_error(title: str, error: Any):
-    """Envoie un message d'erreur formaté sur Telegram (canal principal)."""
-    try:
-        err_txt = str(error)
-    except Exception:
-        err_txt = repr(error)
-    tg_send(f"❌ <b>Erreur: {_escape(title)}</b>\n<code>{_escape(err_txt)}</code>")
+def tg_send_error(text: str, ex: Optional[BaseException] = None, chat_id: Optional[str] = None) -> None:
+    """Envoie un message d'erreur vers le canal d’alertes s’il est configuré, sinon vers le chat par défaut."""
+    prefix = "⚠️ Erreur"
+    details = f" ({type(ex).__name__}: {ex})" if ex else ""
+    target_chat = (os.getenv("TELEGRAM_ALERTS_CHAT_ID", "") or chat_id or TG_ALERTS_CHAT_ID or TG_CHAT_ID)
+    if not target_chat:
+        return
+    tg_send(f"{prefix} : {_escape(text)}{_escape(details)}", chat_id=target_chat)
 
 
