@@ -62,52 +62,92 @@ def tg_answer_callback_query(callback_query_id: str, text: str = ""):
         print(f"Erreur answerCallbackQuery: {e}")
 
 def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
-    """Envoie un rapport de signal validé, avec le statut d'exécution."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    side_text = "LONG" if signal['side'] == 'buy' else "SHORT"
-    status_icon = "✅" if is_taken else "❌"
-    status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
+    """Rapport de validation + mise à jour DB (VALID_TAKEN / VALID_SKIPPED)."""
+    try:
+        side = str(signal.get('side', '')).lower()
+        regime = str(signal.get('regime', '') or '')
+        rr = float(signal.get('rr', 0.0) or 0.0)
+        entry = float(signal.get('entry', 0.0) or 0.0)
+        sl = float(signal.get('sl', 0.0) or 0.0)
+        tp = float(signal.get('tp', 0.0) or 0.0)
+        timeframe = str(signal.get('timeframe') or database.get_setting('TIMEFRAME', '1h'))
+        ts = int(signal.get('ts') or int(time.time() * 1000))
 
-    message = (
-        f"<b>{status_icon} Signal {side_icon} {side_text} {'Pris' if is_taken else 'Rejeté'}</b>\n\n"
-        f" paire: <code>{html.escape(symbol)}</code>\n"
-        f" Type: <b>{html.escape(signal['regime'].capitalize())}</b>\n\n"
-        f" Entrée: <code>{signal['entry']:.5f}</code>\n"
-        f" SL: <code>{signal['sl']:.5f}</code>\n"
-        f" TP: <code>{signal['tp']:.5f}</code>\n"
-        f" RR: <b>x{signal['rr']:.2f}</b>\n\n"
-        f"{status_text}"
-    )
+        # --- Persist VALID_* state
+        try:
+            payload = {
+                "side": side, "regime": regime, "rr": rr, "entry": entry, "sl": sl, "tp": tp,
+                "timeframe": timeframe, "signal": dict(signal or {})
+            }
+            database.mark_signal_validated(symbol, ts, payload, taken=is_taken)
+        except Exception:
+            pass
 
-    target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
-    tg_send(message, chat_id=target_chat_id)
+        side_icon = "📈" if side == 'buy' else "📉"
+        side_text = "LONG" if side == 'buy' else "SHORT"
+        status_icon = "✅" if is_taken else "❌"
+        status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
+
+        message = (
+            f"<b>{status_icon} Signal {side_icon} {side_text} {'Pris' if is_taken else 'Rejeté'}</b>\n\n"
+            f" paire: <code>{html.escape(symbol)}</code>\n"
+            f" Type: <b>{html.escape(regime.capitalize())}</b>\n\n"
+            f" Entrée: <code>{entry:.5f}</code>\n"
+            f" SL: <code>{sl:.5f}</code>\n"
+            f" TP: <code>{tp:.5f}</code>\n"
+            f" RR: <b>x{rr:.2f}</b>\n\n"
+            f"{status_text}"
+        )
+
+        target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
+        tg_send(message, chat_id=target_chat_id)
+    except Exception:
+        pass
+
+    
 def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]) -> None:
     """
-    Message Telegram propre pour un signal détecté (sans impacter le reste).
+    Message Telegram propre pour un signal détecté (sans impacter le reste) + UPSERT en DB (state=PENDING).
     Envoie une image si charting renvoie un buffer, sinon texte seul.
     """
     try:
-        side = signal.get("side", "").upper()
+        side = str(signal.get("side", "")).lower()
         regime = signal.get("regime", "-")
-        entry = signal.get("entry", None)
-        tp = signal.get("tp", None)
-        sl = signal.get("sl", None)
-        rr = signal.get("rr", None)
+        entry = signal.get("entry")
+        tp = signal.get("tp")
+        sl = signal.get("sl")
+        rr = signal.get("rr")
+        ts = int(signal.get("ts") or int(time.time() * 1000))
+
+        # --- Persist PENDING in DB (clé logique: symbol/side/timeframe/ts)
+        try:
+            if side in ("buy", "sell"):
+                database.upsert_signal_pending(
+                    symbol=symbol,
+                    timeframe=str(timeframe or signal.get("timeframe") or database.get_setting('TIMEFRAME', '1h')),
+                    ts=ts,
+                    side=side,
+                    regime=str(regime or ""),
+                    rr=float(rr or 0.0),
+                    entry=float(entry or 0.0),
+                    sl=float(sl or 0.0),
+                    tp=float(tp or 0.0),
+                )
+        except Exception:
+            pass
 
         lines = [
             f"🔔 <b>SIGNAL</b> {symbol} • {timeframe}",
-            f"• Sens: <b>{side}</b> • Régime: <b>{regime}</b>",
+            f"• Sens: <b>{side.upper()}</b> • Régime: <b>{regime}</b>",
         ]
         if entry is not None: lines.append(f"• Entrée: <code>{float(entry):.6f}</code>")
         if tp is not None:    lines.append(f"• TP: <code>{float(tp):.6f}</code>")
         if sl is not None:    lines.append(f"• SL: <code>{float(sl):.6f}</code>")
-        if rr is not None:    lines.append(f"• RR: <b>{float(rr):.2f}</b>")
+        if rr is not None:    lines.append(f"• RR: <b>x{float(rr):.2f}</b>")
 
         msg = "\n".join(lines)
 
-        # Essai d’image “signal” si dispo, sinon texte
         try:
-            # Si tu as déjà une fonction dédiée, remplace par charting.generate_trade_chart(...)
             img = charting.generate_trade_chart(symbol, None, signal)
         except Exception:
             img = None
@@ -117,8 +157,8 @@ def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]
         else:
             tg_send(msg)
     except Exception:
-        # Ne bloque jamais le flux si la notif échoue
         pass
+
 
 # ==============================================================================
 # FONCTIONS DE COMMUNICATION DE BASE
@@ -702,36 +742,40 @@ def try_handle_inline_callback(event: Any) -> bool:
                 is_paused = False
             send_main_menu(is_paused)
             cq_id = data.get("id")
-            if cq_id:
-                tg_answer_callback_query(cq_id)
+            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- MENU CONFIGURATION -----
         if cmd == "menu_config":
             send_config_menu()
             cq_id = data.get("id")
-            if cq_id:
-                tg_answer_callback_query(cq_id)
+            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- MENUS SIGNAUX -----
         if cmd == "menu_signals":
             send_signals_menu()
             cq_id = data.get("id")
-            if cq_id:
-                tg_answer_callback_query(cq_id)
+            if cq_id: tg_answer_callback_query(cq_id)
             return True
+
         if cmd == "signals_pending":
-            tg_show_signals_pending(); return True
+            tg_show_signals_pending()
+            cq_id = data.get("id")
+            if cq_id: tg_answer_callback_query(cq_id)
+            return True
+
         if cmd == "signals_6h":
-            tg_show_signals_6h(); return True
+            tg_show_signals_6h()
+            cq_id = data.get("id")
+            if cq_id: tg_answer_callback_query(cq_id)
+            return True
 
         # ----- POSITIONS -----
         if cmd == "list_positions":
             tg_show_positions()
             cq_id = data.get("id")
-            if cq_id:
-                tg_answer_callback_query(cq_id)
+            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- OFFSETS -----
@@ -748,15 +792,14 @@ def try_handle_inline_callback(event: Any) -> bool:
         if cmd == "get_stats":
             tg_show_stats("24h")
             cq_id = data.get("id")
-            if cq_id:
-                tg_answer_callback_query(cq_id)
+            if cq_id: tg_answer_callback_query(cq_id)
             return True
+
         if isinstance(cmd, str) and cmd.startswith("stats:"):
             period = cmd.split(":", 1)[1] if ":" in cmd else "24h"
             tg_show_stats(period)
             cq_id = data.get("id")
-            if cq_id:
-                tg_answer_callback_query(cq_id)
+            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- RESTART -----
@@ -771,7 +814,7 @@ def try_handle_inline_callback(event: Any) -> bool:
     except Exception as e:
         tg_send_error("Callback routing", e)
         return False
-
+        
 
 def _format_signal_row(sig: dict) -> str:
     """Format compact d'un signal (sans la raison), horodaté Europe/Lisbon.
@@ -1418,16 +1461,35 @@ def send_confirmed_signal_notification(symbol: str, signal: Dict, total_found: i
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID)
 
 def send_pending_signal_notification(symbol: str, signal: Dict):
-    """Notifie qu'un signal a été détecté et est en attente."""
-    side_icon = "📈" if signal['side'] == 'buy' else "📉"
-    message = (
-        f"⏱️ <b>Signal en attente {side_icon}</b>\n\n"
-        f"Paire: <code>{_escape(symbol)}</code>\n"
-        f"Type: {_escape(signal['regime'])}\n"
-        f"RR Potentiel: x{signal['rr']:.2f}\n\n"
-        f"<i>En attente de la clôture de la bougie pour validation finale.</i>"
-    )
-    tg_send(message, chat_id=TG_ALERTS_CHAT_ID)
+    """Notifie qu'un signal est en attente ET l’enregistre en DB (state=PENDING)."""
+    try:
+        side = str(signal.get('side', '')).lower()
+        regime = str(signal.get('regime', '') or '')
+        rr = float(signal.get('rr', 0.0) or 0.0)
+        entry = float(signal.get('entry', 0.0) or 0.0)
+        sl = float(signal.get('sl', 0.0) or 0.0)
+        tp = float(signal.get('tp', 0.0) or 0.0)
+        timeframe = str(signal.get('timeframe') or database.get_setting('TIMEFRAME', '1h'))
+        ts = int(signal.get('ts') or int(time.time() * 1000))
+
+        # --- Persist PENDING
+        try:
+            if side in ("buy", "sell"):
+                database.upsert_signal_pending(symbol, timeframe, ts, side, regime, rr, entry, sl, tp)
+        except Exception:
+            pass
+
+        side_icon = "📈" if side == 'buy' else "📉"
+        message = (
+            f"⏱️ <b>Signal en attente {side_icon}</b>\n\n"
+            f"Paire: <code>{_escape(symbol)}</code>\n"
+            f"Type: {_escape(regime)}\n"
+            f"RR Potentiel: x{rr:.2f}\n\n"
+            f"<i>En attente de la clôture de la bougie pour validation finale.</i>"
+        )
+        tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
+    except Exception:
+        pass
 
 def edit_main(text: str, reply_markup: Optional[Dict] = None) -> bool:
     """Édite le message principal (épinglé). Envoie un nouveau message si l'id n'existe pas encore."""
