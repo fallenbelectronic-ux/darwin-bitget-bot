@@ -310,7 +310,7 @@ def _telegram_command_handlers() -> Dict[str, Any]:
 
 
 def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
-    """Sélectionne le meilleur signal en attente (RR max) et l'exécute."""
+    """Sélectionne le meilleur signal en attente (RR max), marque en DB (pris / non pris) et exécute le meilleur."""
     from state import get_pending_signals, clear_pending_signals
     pendings = list(get_pending_signals().values())
     if not pendings:
@@ -322,9 +322,9 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         try:
             symbol = pending['symbol']
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+            # Re-valide si on a une bougie close postérieure à la bougie du signal
             if df is None or df.index[-1] <= pending.get('candle_timestamp'):
                 continue
-            # Re-validation légère (bougie close passée)
             validated.append({**pending, 'df': df})
         except Exception:
             continue
@@ -335,11 +335,33 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         print("   -> Aucun signal n'a été re-validé.")
         return
 
+    # Choix du meilleur par RR
     best = sorted(validated, key=lambda x: x['signal']['rr'], reverse=True)[0]
     print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f})")
 
-    notifier.send_confirmed_signal_notification(best['symbol'], best['signal'], len(validated))
-    trader.execute_trade(ex, best['symbol'], best['signal'], best['df'], best['signal']['entry'])
+    # Marquage DB pour TOUS les validés (non pris)
+    for v in validated:
+        try:
+            ts = int(pd.Timestamp(v.get('candle_timestamp')).value // 10**6)
+        except Exception:
+            ts = int(time.time() * 1000)
+        database.mark_signal_validated(v['symbol'], ts, {**v['signal'], "timeframe": TIMEFRAME}, taken=False)
+
+    # Exécute le meilleur et marque 'pris'
+    try:
+        symbol = best['symbol']
+        sig    = best['signal']
+        df     = best['df']
+        entry  = sig['entry']
+        trader.execute_trade(ex, symbol, sig, df, entry)
+        try:
+            ts = int(pd.Timestamp(best.get('candle_timestamp')).value // 10**6)
+        except Exception:
+            ts = int(time.time() * 1000)
+        database.mark_signal_validated(symbol, ts, {**sig, "timeframe": TIMEFRAME}, taken=True)
+    except Exception as e:
+        notifier.tg_send_error("Exécution du meilleur signal", e)
+
 
 
 def process_callback_query(callback_query: Dict):
@@ -347,7 +369,6 @@ def process_callback_query(callback_query: Dict):
     global _paused
     data = callback_query.get('data', '')
 
-    # Accusé de réception immédiat pour éviter les “spinners” Telegram
     try:
         notifier.tg_answer_callback_query(callback_query.get('id'), "")
     except Exception:
@@ -373,13 +394,22 @@ def process_callback_query(callback_query: Dict):
             try:
                 ex = create_exchange()
                 trader.sync_positions_with_exchange(ex)
+                try:
+                    exchange_positions = ex.fetch_positions()
+                except Exception:
+                    exchange_positions = []
+                db_positions = database.get_open_positions()
+                notifier.format_synced_open_positions(exchange_positions, db_positions)
             except Exception as e:
                 notifier.tg_send_error("Sync positions (manual view)", e)
-            notifier.format_open_positions(database.get_open_positions())
 
         elif data == 'get_stats':
             ex = create_exchange()
             balance = trader.get_usdt_balance(ex)
+            try:
+                database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
+            except Exception:
+                pass
             trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)
             notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
 
@@ -402,8 +432,6 @@ def process_callback_query(callback_query: Dict):
 
         elif data == 'menu_signals':
             notifier.send_signals_menu()
-
-        # ⚠️ SUPPRIMÉ: le bloc 'signals_6h' ici (déjà géré par notifier.try_handle_inline_callback)
 
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
@@ -443,6 +471,7 @@ def process_callback_query(callback_query: Dict):
         print(f"Erreur lors du traitement du callback '{data}': {e}")
         notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
 
+
         
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
@@ -469,7 +498,6 @@ def process_message(message: Dict):
                 if size > 0:
                     database.set_setting('UNIVERSE_SIZE', str(size))
                     notifier.tg_send(f"✅ Taille de l'univers mise à <b>{size}</b> (prise en compte immédiate).")
-                    # rafraîchit l’affichage du menu pour refléter la nouvelle valeur
                     notifier.send_main_menu(_paused)
                 else:
                     notifier.tg_send("❌ Le nombre doit être > 0.")
@@ -490,6 +518,10 @@ def process_message(message: Dict):
     elif command == "/stats":
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
+        try:
+            database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
+        except Exception:
+            pass
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
 
@@ -642,7 +674,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             curr_hour = now_utc.hour
             curr_day = now_utc.day
 
-            # Application IMMÉDIATE d’un changement de taille d’univers (/setuniverse)
             try:
                 desired_size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
             except Exception:
@@ -658,7 +689,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                     except Exception:
                         pass
 
-            # Refresh univers 1×/jour (recalcule la composition à taille identique)
             if curr_day != last_day:
                 try:
                     new_universe = trader.get_universe_by_market_cap(ex, current_size)
@@ -685,26 +715,47 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
 
                 signal = trader.detect_signal(symbol, df)
                 if signal:
-                    with _lock:
-                        if symbol not in get_pending_signals():
-                            print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
-                            set_pending_signal(symbol, {
-                                'signal': signal,
-                                'symbol': symbol,
-                                'candle_timestamp': df.index[-1],
-                                'df': df
-                            })
-                            if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
-                                notifier.send_pending_signal_notification(symbol, signal)
+                    # Timestamp ms de la bougie courante
+                    try:
+                        ts_ms = int(pd.Timestamp(df.index[-1]).value // 10**6)
+                    except Exception:
+                        ts_ms = int(time.time() * 1000)
 
-                        if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
-                            _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
+                    # Mémoire en RAM
+                    if symbol not in get_pending_signals():
+                        print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
+                        set_pending_signal(symbol, {
+                            'signal': signal,
+                            'symbol': symbol,
+                            'candle_timestamp': df.index[-1],
+                            'df': df
+                        })
+                        # Persistance DB immédiate
+                        try:
+                            database.upsert_signal_pending(
+                                symbol=symbol, timeframe=TIMEFRAME, ts=ts_ms,
+                                side=signal.get('side',''), regime=signal.get('regime',''),
+                                rr=float(signal.get('rr', 0.0)),
+                                entry=float(signal.get('entry', 0.0)),
+                                sl=float(signal.get('sl', 0.0)),
+                                tp=float(signal.get('tp', 0.0))
+                            )
+                        except Exception as e:
+                            notifier.tg_send_error("Upsert PENDING signal", e)
+
+                        if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
+                            notifier.send_pending_signal_notification(symbol, signal)
+
+                    # Historique court des signaux récents (affichage 6h bouton)
+                    if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
+                        _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
 
             time.sleep(LOOP_DELAY)
 
         except Exception:
             err = traceback.format_exc()
             print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
+
 
 def main():
     database.setup_database()
