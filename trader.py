@@ -2211,6 +2211,56 @@ def _compute_trailing_sl(mark_price: float, side: str, atr: float) -> float:
     else:
         return max(0.0, mark + dist)
 
+def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Wrapper d’exécution attendu par le reste du projet.
+    - Charge le DF préparé
+    - Détermine un prix d’entrée « live » robuste
+    - Délègue à execute_signal_with_gates (recalc SL/TP/RR + envoi ordres + persistance)
+    """
+    try:
+        df = utils.fetch_and_prepare_df(ex, symbol, timeframe)
+        if df is None or len(df) < 3:
+            return False, "DF indisponible ou trop court pour exécuter."
+
+        # Prix d’entrée live (ticker), fallback sur le dernier close/open du DF
+        try:
+            t = ex.fetch_ticker(symbol) or {}
+            entry_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
+        except Exception:
+            entry_price = 0.0
+        if not entry_price or entry_price <= 0:
+            try:
+                entry_price = float(df.iloc[-1].get('close') or df.iloc[-1].get('open') or 0.0)
+            except Exception:
+                entry_price = 0.0
+        if entry_price <= 0:
+            return False, "Impossible d’estimer un prix d’entrée."
+
+        # Horodatage / normalisation minimale si besoin
+        if not signal.get("ts"):
+            signal["ts"] = int(time.time() * 1000)
+        if not signal.get("side"):
+            last = df.iloc[-1]
+            signal["side"] = "buy" if float(last["close"]) >= float(last["open"]) else "sell"
+        if not signal.get("regime"):
+            signal["regime"] = "Tendance"
+
+        return execute_signal_with_gates(
+            ex=ex,
+            symbol=symbol,
+            timeframe=timeframe,
+            df=df,
+            signal=signal,
+            entry_price=float(entry_price),
+        )
+    except Exception as e:
+        try:
+            notifier.tg_send(f"❌ execute_trade({symbol}) a échoué: {e}")
+        except Exception:
+            pass
+        return False, f"Erreur interne execute_trade: {e}"
+
 
 def manage_open_positions(ex: ccxt.Exchange):
     """TP dynamique (tendance→BB80 opposée ; CT→BB20 up/lo) + Break-Even + Trailing live après BE.
