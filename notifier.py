@@ -842,25 +842,32 @@ def tg_show_signals_pending(limit: int = 50):
 
 def tg_show_signals_6h(limit: int = 50):
     """
-    Affiche 'Signaux des 6 dernières heures' : state=VALID_SKIPPED, fenêtre = 360 min.
+    Affiche 'Signaux des 6 dernières heures' :
+    inclut VALID_SKIPPED et VALID_TAKEN sur une fenêtre = 360 min.
     Tri décroissant par ts (les plus récents en premier).
-    Met à jour le message principal avec un bouton Retour.
     """
     keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
     try:
-        signals = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit)
+        s_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit) or []
+        s_taken   = database.get_signals(state="VALID_TAKEN",   since_minutes=360, limit=limit) or []
+        signals = s_skipped + s_taken
     except Exception as e:
         edit_main(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
-    signals = sorted(signals or [], key=lambda s: int(s.get("ts", 0)), reverse=True)
+    signals = sorted(signals, key=lambda s: int(s.get("ts", 0)), reverse=True)
 
     if not signals:
-        edit_main("<b>⏱️ Signaux valides non exécutés (6h)</b>\n\nAucun signal valide non exécuté sur les 6 dernières heures.", keyboard)
+        edit_main("<b>⏱️ Signaux validés (6h)</b>\n\nAucun signal validé sur les 6 dernières heures.", keyboard)
         return
 
-    lines = ["<b>⏱️ Signaux valides non exécutés (6h)</b>", ""]
-    lines.extend(_format_signal_row(s) for s in signals)
+    def _badge(st: str) -> str:
+        return "✅ Pris" if (st or "").upper() == "VALID_TAKEN" else "❌ Non pris"
+
+    lines = ["<b>⏱️ Signaux validés (6h)</b>", ""]
+    for s in signals:
+        row = _format_signal_row(s)
+        lines.append(f"{row}  —  {_badge(s.get('state',''))}")
     edit_main("\n".join(lines), keyboard)
 
 
