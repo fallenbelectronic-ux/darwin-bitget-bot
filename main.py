@@ -351,18 +351,17 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     try:
         symbol = best['symbol']
         sig    = best['signal']
-        df     = best['df']
-        entry  = sig['entry']
-        trader.execute_trade(ex, symbol, sig, df, entry)
+        # Appel corrigé: (ex, symbol, timeframe, signal)
+        ok, msg = trader.execute_trade(ex, symbol, TIMEFRAME, sig)
         try:
             ts = int(pd.Timestamp(best.get('candle_timestamp')).value // 10**6)
         except Exception:
             ts = int(time.time() * 1000)
         database.mark_signal_validated(symbol, ts, {**sig, "timeframe": TIMEFRAME}, taken=True)
+        if not ok:
+            notifier.tg_send(f"⚠️ Exécution du meilleur signal non aboutie: {msg}")
     except Exception as e:
         notifier.tg_send_error("Exécution du meilleur signal", e)
-
-
 
 def process_callback_query(callback_query: Dict):
     """Gère les clics sur les boutons interactifs de manière robuste et lisible."""
