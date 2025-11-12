@@ -104,20 +104,138 @@ def create_exchange():
     return ex
 
 def build_universe(ex: ccxt.Exchange) -> List[str]:
-    """Construit la liste des paires à trader STRICTEMENT par market cap (Bitget USDT futures)."""
-    print("Construction de l'univers de trading (market cap STRICT)...")
-    size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
+    """Construit la liste des paires à trader (Bitget USDT futures) avec garde-fous pour ne jamais retourner [].
+    1) Tentative principale via utils.get_universe_by_market_cap(ex, size)
+    2) Si vide: reload des marchés + second essai
+    3) Si encore vide: fallback 'core set' filtré par marchés disponibles
+    4) Persistance optionnelle pour diagnostic: settings.LAST_UNIVERSE_JSON
+    """
+    import json
+
+    print("Construction de l'univers de trading (market cap, robuste)…")
     try:
-        syms = trader.get_universe_by_market_cap(ex, size)
-        if not syms:
-            print("⚠️ get_universe_by_market_cap a renvoyé une liste vide.")
-            return []
-        if len(syms) < size:
-            print(f"⚠️ Market cap a renvoyé {len(syms)} paires (< {size}). Univers limité à ce résultat (strict).")
-        return syms[:size]
+        size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
+    except Exception:
+        size = UNIVERSE_SIZE
+    size = max(1, int(size))
+
+    def _persist_and_log(symbols: List[str], note: str) -> List[str]:
+        try:
+            database.set_setting('LAST_UNIVERSE_JSON', json.dumps(symbols))
+            database.set_setting('LAST_UNIVERSE_NOTE', note)
+        except Exception:
+            pass
+        return symbols[:size]
+
+    # --- 1) Tentative principale
+    try:
+        syms = utils.get_universe_by_market_cap(ex, size)
     except Exception as e:
-        print(f"Erreur univers (market cap strict): {e}")
-        return []
+        syms = []
+        try:
+            notifier.tg_send_error("build_universe(get_universe_by_market_cap)", e)
+        except Exception:
+            pass
+
+    if syms:
+        if len(syms) < size:
+            print(f"⚠️ Univers partiel: {len(syms)}/{size}.")
+        return _persist_and_log(syms, "primary_ok")
+
+    # --- 2) Reload + second essai
+    try:
+        ex.options = ex.options or {}
+        ex.options["defaultType"] = "swap"  # s’assure que les perp sont correctement tagués
+    except Exception:
+        pass
+    try:
+        ex.load_markets(reload=True)
+    except Exception:
+        pass
+
+    try:
+        syms2 = utils.get_universe_by_market_cap(ex, size)
+    except Exception:
+        syms2 = []
+
+    if syms2:
+        print(f"✅ Univers obtenu après reload: {len(syms2)}.")
+        return _persist_and_log(syms2, "after_reload_ok")
+
+    # --- 3) Fallback 'core set' (filtré par marchés dispo)
+    core_set = [
+        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+        "BNB/USDT:USDT", "XRP/USDT:USDT", "ADA/USDT:USDT",
+        "DOGE/USDT:USDT", "LINK/USDT:USDT"
+    ]
+    try:
+        markets = getattr(ex, "markets", {}) or {}
+        available = []
+        for sym in core_set:
+            if sym in markets:
+                available.append(sym)
+            else:
+                # tolère variante spot si perp absente (ultime secours)
+                spot = sym.replace(":USDT", "")
+                if spot in markets:
+                    available.append(spot)
+        if not available:
+            available = core_set[:]  # dernier recours: on renvoie le core set brut
+    except Exception:
+        available = core_set[:]
+
+    try:
+        notifier.tg_send("⚠️ Univers principal indisponible — utilisation d’un core set de secours.")
+    except Exception:
+        pass
+
+    return _persist_and_log(available, "fallback_core_set")
+
+
+def get_or_build_universe(ex: ccxt.Exchange, desired_size: Optional[int] = None) -> List[str]:
+    """Récupère ou reconstruit l’univers sans jamais casser la boucle:
+    - Essai build_universe()
+    - Si vide, reload + re-essai
+    - Si encore vide, retourne un core set (≥ 1 symbole)
+    - Notifie proprement l’état
+    """
+    try:
+        size = int(desired_size) if desired_size is not None else int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
+    except Exception:
+        size = UNIVERSE_SIZE
+    size = max(1, int(size))
+
+    syms = build_universe(ex)
+    if syms:
+        return syms[:size]
+
+    # Second essai avec reload (au cas où build_universe aurait été court-circuité avant)
+    try:
+        ex.options = ex.options or {}
+        ex.options["defaultType"] = "swap"
+    except Exception:
+        pass
+    try:
+        ex.load_markets(reload=True)
+    except Exception:
+        pass
+
+    syms2 = build_universe(ex)
+    if syms2:
+        try:
+            notifier.tg_send(f"✅ Univers reconstruit après reload ({len(syms2)} paires).")
+        except Exception:
+            pass
+        return syms2[:size]
+
+    # Dernier recours: petit core set minimal
+    core_min = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+    try:
+        notifier.tg_send("⚠️ Univers toujours vide après 2 essais — bascule sur core set minimal.")
+    except Exception:
+        pass
+    return core_min
+
 
 def start_live_sync(ex):
     t = threading.Thread(target=_live_sync_worker, args=(ex,), daemon=True)
@@ -690,7 +808,7 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
 
             if curr_day != last_day:
                 try:
-                    new_universe = trader.get_universe_by_market_cap(ex, current_size)
+                    new_universe = utils.get_universe_by_market_cap(ex, current_size)
                     if new_universe:
                         universe = new_universe[:current_size]
                         print(f"🔁 Univers rafraîchi ({len(universe)} paires).")
@@ -755,7 +873,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             err = traceback.format_exc()
             print(err); notifier.tg_send_error("Erreur Trading", err); time.sleep(15)
 
-
 def main():
     database.setup_database()
     startup_checks()
@@ -769,7 +886,7 @@ def main():
     start_live_sync(ex)
     
     if not database.get_setting('STRATEGY_MODE'):
-        database.set_setting('STRATEGY_MODE', 'SPLIT')
+        database.set_setting('STRATEGY_MODE', 'NORMAL')
         
     # Restaure l'état Pause/Reprise depuis la DB
     global _paused
@@ -785,10 +902,16 @@ def main():
     current_paper_mode = str(paper_mode_setting).lower() == 'true'
     notifier.send_main_menu(_paused)
     
-    universe = build_universe(ex)
+    # ✅ Univers robuste (ne casse pas le démarrage)
+    universe = get_or_build_universe(ex)
     if not universe:
-        notifier.tg_send("❌ **ERREUR CRITIQUE:** Impossible de construire l'univers de trading.")
-        return
+        # Ce cas ne devrait pas survenir grâce aux garde-fous,
+        # mais on sécurise malgré tout avec 1 symbole.
+        universe = ["BTC/USDT:USDT"]
+        try:
+            notifier.tg_send("⚠️ Démarrage sécurisé avec univers minimal ['BTC/USDT:USDT'].")
+        except Exception:
+            pass
 
     print(f"Univers de trading chargé avec {len(universe)} paires.")
 
@@ -803,6 +926,3 @@ def main():
     except KeyboardInterrupt:
         print("Arrêt demandé.")
         notifier.tg_send("⛔ Arrêt manuel.")
-
-if __name__ == "__main__":
-    main()
