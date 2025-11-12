@@ -82,7 +82,40 @@ def setup_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
         conn.commit()
-        
+
+def update_trade_core(trade_id: int,
+                      side: Optional[str] = None,
+                      entry_price: Optional[float] = None,
+                      quantity: Optional[float] = None,
+                      regime: Optional[str] = None) -> None:
+    """
+    Met à jour des champs de base d'un trade existant.
+    Champs supportés: side, entry_price, quantity, regime.
+    Ignore proprement les None. Ne lève pas si aucun champ n'est fourni.
+    """
+    sets = []
+    params = []
+    if side is not None:
+        sets.append("side = ?")
+        params.append(str(side))
+    if entry_price is not None:
+        sets.append("entry_price = ?")
+        params.append(float(entry_price))
+    if quantity is not None:
+        sets.append("quantity = ?")
+        params.append(float(quantity))
+    if regime is not None:
+        sets.append("regime = ?")
+        params.append(str(regime))
+    if not sets:
+        return
+    params.append(int(trade_id))
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id = ?", params)
+        conn.commit()
+
+
 def _store():
     """Singleton mémoire (léger) pour éviter toute dépendance externe."""
     st = getattr(_store, "_st", None)
