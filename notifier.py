@@ -946,6 +946,22 @@ def send_main_menu(is_paused: bool):
     except Exception:
         universe_size = int(os.getenv("UNIVERSE_SIZE", "500"))
 
+    # 🔹 Solde USDT (live si possible, sinon cache)
+    balance_line = ""
+    try:
+        ex = getattr(trader, "create_exchange", None) and trader.create_exchange()
+        if ex and hasattr(trader, "get_account_balance_usdt"):
+            bal = trader.get_account_balance_usdt(ex)
+        else:
+            bal = None
+        if bal is None:
+            cached = database.get_setting('CURRENT_BALANCE_USDT', None)
+            bal = float(cached) if cached not in (None, "", "None") else None
+        if isinstance(bal, (int, float)):
+            balance_line = f"💼 Solde USDT : <code>{bal:.2f}</code>\n"
+    except Exception:
+        pass
+
     # Stratégie actuelle
     current_strategy = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
     cw = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
@@ -956,6 +972,7 @@ def send_main_menu(is_paused: bool):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{mode_chip} • {status_chip}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{balance_line}"
         f"<b>🔧 Configuration</b>\n"
         f"🌐 Univers scanné : <code>{universe_size}</code>\n"
         f"🟩 Risque/Trade : <code>{risk:.1f}%</code>\n"
@@ -997,6 +1014,7 @@ def send_main_menu(is_paused: bool):
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (menu): {e}")
+
 
 
 def send_config_menu():
