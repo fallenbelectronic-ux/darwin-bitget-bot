@@ -1122,16 +1122,34 @@ def send_config_message(config: Dict):
     tg_send("\n".join(lines))
 
 def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[float]):
-    """Calcule les stats et affiche le rapport dans le même message épinglé (pas de spam)."""
-    stats = reporting.calculate_performance_stats(trades)
-    text = reporting.format_report_message(title, stats, balance)
+    """Calcule les stats et affiche le rapport dans le même message épinglé (pas de spam).
+    Ajout: résolution robuste du solde si `balance` est None (fallback DB CURRENT_BALANCE_USDT).
+    """
+    # 1) Résoudre le solde actuel
+    resolved_balance: Optional[float] = None
+    if isinstance(balance, (int, float)):
+        try:
+            resolved_balance = float(balance)
+        except Exception:
+            resolved_balance = None
+    if resolved_balance is None:
+        try:
+            raw = database.get_setting('CURRENT_BALANCE_USDT', None)
+            if raw is not None and str(raw).strip() != "":
+                resolved_balance = float(raw)
+        except Exception:
+            resolved_balance = None
 
-    # petit clavier avec un bouton retour vers le menu principal
+    # 2) Construire le texte du rapport via reporting (inchangé)
+    stats = reporting.calculate_performance_stats(trades)
+    text = reporting.format_report_message(title, stats, resolved_balance)
+
+    # 3) Clavier (inchangé)
     keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
 
     msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
 
-    # 1) Essayer d'éditer le message existant
+    # 4) Essayer d'éditer le message existant
     if TG_TOKEN and TG_CHAT_ID and msg_id:
         try:
             payload_edit = {
@@ -1148,7 +1166,7 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
         except Exception as e:
             print(f"Erreur editMessageText (report): {e}")
 
-    # 2) Sinon, envoyer puis mémoriser le nouvel id (premier lancement)
+    # 5) Sinon, envoyer puis mémoriser le nouvel id
     try:
         payload_send = {
             "chat_id": TG_CHAT_ID,
@@ -1162,6 +1180,7 @@ def send_report(title: str, trades: List[Dict[str, Any]], balance: Optional[floa
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (report): {e}")
+
 
 # ===== Stats persistées (depuis database.trades) =====
 
