@@ -1172,13 +1172,47 @@ def _fmt_pf(x):
         return "–"
 
 def _load_balance_optional() -> Optional[float]:
+    """
+    Tente d'abord un solde LIVE via trader (portfolio equity ou balance USDT),
+    puis retombe sur le cache en base (CURRENT_BALANCE_USDT / LAST_BALANCE_USDT).
+    Met à jour le cache si une valeur live est trouvée.
+    """
+    # 1) Tentative LIVE via trader
+    try:
+        ex = getattr(trader, "create_exchange", None) and trader.create_exchange()
+        if ex:
+            bal = None
+            get_pf = getattr(trader, "get_portfolio_equity_usdt", None)
+            if callable(get_pf):
+                try:
+                    bal = float(get_pf(ex))
+                except Exception:
+                    bal = None
+            if bal is None:
+                get_bal = getattr(trader, "get_account_balance_usdt", None)
+                if callable(get_bal):
+                    try:
+                        bal = float(get_bal(ex))
+                    except Exception:
+                        bal = None
+            if isinstance(bal, (int, float)):
+                try:
+                    database.set_setting('CURRENT_BALANCE_USDT', f"{bal:.2f}")
+                except Exception:
+                    pass
+                return float(bal)
+    except Exception:
+        pass
+
+    # 2) Fallback: cache DB
     try:
         b = database.get_setting('CURRENT_BALANCE_USDT', None)
-        if b is None: 
+        if b in (None, "", "None"):
             b = database.get_setting('LAST_BALANCE_USDT', None)
-        return float(b) if b is not None and str(b) != "" else None
+        return float(b) if b not in (None, "", "None") else None
     except Exception:
         return None
+
 
 def _render_stats_period(period: str) -> str:
     """
