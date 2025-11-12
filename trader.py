@@ -1067,6 +1067,67 @@ def record_signal_from_trader(
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
+def get_account_balance_usdt(ex=None) -> Optional[float]:
+    """
+    Retourne le solde total en USDT (et le met en cache dans settings.CURRENT_BALANCE_USDT).
+    Supporte Bybit/Bitget via ccxt.fetchBalance().
+    """
+    try:
+        if ex is None and hasattr(globals(), "create_exchange"):
+            ex = create_exchange()
+        if ex is None:
+            return None
+
+        bal = ex.fetch_balance()  # ccxt unified
+        total = None
+
+        # Essais robustes
+        for key in ("USDT", "usdT", "usdt"):
+            try:
+                wallet = bal.get(key) or {}
+                total = wallet.get("total") or wallet.get("free") or wallet.get("used")
+                if total is not None:
+                    total = float(total)
+                    break
+            except Exception:
+                continue
+
+        # Bitget Bybit dérivés: parfois balance['info'] contient la valeur
+        if total is None:
+            info = bal.get("info") or {}
+            # Bybit v5: list
+            try:
+                if isinstance(info, dict) and "result" in info:
+                    result = info["result"]
+                    if isinstance(result, dict) and "list" in result:
+                        for acc in result["list"]:
+                            if str(acc.get("coin", "")).upper() == "USDT":
+                                total = float(acc.get("walletBalance"))
+                                break
+            except Exception:
+                pass
+            # Bitget: data list
+            if total is None:
+                try:
+                    data = info.get("data") if isinstance(info, dict) else None
+                    if isinstance(data, list):
+                        for acc in data:
+                            if str(acc.get("marginCoin", "")).upper() == "USDT":
+                                total = float(acc.get("available")) + float(acc.get("frozen", 0))
+                                break
+                except Exception:
+                    pass
+
+        if total is None:
+            return None
+
+        try:
+            database.set_setting('CURRENT_BALANCE_USDT', f"{total:.6f}")
+        except Exception:
+            pass
+        return float(total)
+    except Exception:
+        return None
 
 def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, quantity: float, entry_px: float) -> None:
     """
@@ -1103,85 +1164,124 @@ def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, q
     except Exception as e:
         notifier.tg_send_error(f"Import position {symbol} -> DB", e)
 
-def sync_positions_with_exchange(ex: ccxt.Exchange) -> None:
+def sync_positions_with_exchange(ex) -> None:
     """
-    Synchronise les positions ouvertes depuis l'exchange vers la base locale.
-    - Tolère les exchanges où `fetch_positions()` n'est pas complet.
-    - Met à jour/insère les positions ouvertes et retire celles qui n'existent plus côté exchange.
+    Synchronise la table trades(status='OPEN') avec les positions réelles de l'exchange.
+    - Crée en DB les positions ouvertes détectées sur l'exchange si absentes.
+    - Ferme en DB les positions OPEN inexistantes côté exchange.
     """
     try:
-        # 1) Récupération robuste des positions
+        if ex is None and hasattr(globals(), "create_exchange"):
+            ex = create_exchange()
+        if ex is None:
+            return
+
+        # 1) Récupération positions exchange (ccxt unified)
         positions = []
-        if hasattr(ex, "fetch_positions"):
+        try:
+            positions = ex.fetch_positions()
+        except Exception:
+            # fallback par marchés si nécessaire
             try:
-                positions = ex.fetch_positions()
+                positions = [p for p in ex.fetch_positions_risk() or []]
             except Exception:
                 positions = []
 
-        open_symbols = []
-
-        # 2) Parcours des positions valides (contrats != 0)
+        # Normaliser: garder celles avec exposition > 0
+        open_ex_symbols = set()
+        norm_positions = []
         for p in positions or []:
             try:
-                amt = float(p.get("contracts") or p.get("amount") or 0.0)
+                contracts = float(p.get("contracts") or p.get("contractSize") or 0.0)
             except Exception:
-                amt = 0.0
-            if abs(amt) < 1e-9:
+                contracts = 0.0
+            try:
+                notional = float(p.get("notional") or 0.0)
+            except Exception:
+                notional = 0.0
+
+            # Certaines bourses renvoient amount/size au lieu de contracts
+            if contracts <= 0:
+                try:
+                    contracts = abs(float(p.get("amount") or p.get("size") or 0.0))
+                except Exception:
+                    pass
+
+            if max(contracts, abs(notional)) <= 0.0:
                 continue
 
-            symbol    = p.get("symbol")
-            entry     = float(p.get("entryPrice") or p.get("entry_price") or 0.0)
-            mark      = float(p.get("markPrice") or p.get("mark_price") or entry or 0.0)
-            leverage  = float(p.get("leverage") or 0.0)
-            upnl      = float(p.get("unrealizedPnl") or p.get("unrealized_pnl") or 0.0)
-            side_raw  = p.get("side")
-            side      = side_raw if side_raw in ("long", "short") else ("long" if amt > 0 else "short")
-            notional  = abs(amt) * (mark if mark > 0 else entry)
+            # symbole unifié ccxt
+            sym = p.get("symbol")
+            if not sym:
+                market_id = (p.get("info") or {}).get("symbol") or (p.get("info") or {}).get("instId")
+                try:
+                    if market_id and hasattr(ex, "markets_by_id") and market_id in getattr(ex, "markets_by_id", {}):
+                        sym = ex.markets_by_id[market_id]["symbol"]
+                except Exception:
+                    pass
+            if not sym:
+                continue
 
-            rec = {
-                "symbol": symbol,
-                "side": side,
-                "amount": abs(amt),
-                "entry_price": entry,
-                "mark_price": mark,
-                "leverage": leverage,
-                "unrealized_pnl": upnl,
-                "notional": notional,
-            }
+            open_ex_symbols.add(sym.replace("/", "").replace(":USDT", ""))  # clé de comparaison
 
-            # 3) Upsert tolérant selon les fonctions disponibles dans database.py
-            if hasattr(database, "upsert_open_position"):
-                database.upsert_open_position(rec)
-            elif hasattr(database, "save_open_position"):
-                database.save_open_position(rec)
-            elif hasattr(database, "save_or_update_position"):
-                database.save_or_update_position(rec)
-
-            if symbol:
-                open_symbols.append(symbol)
-
-        # 4) Retirer côté DB les positions qui n'existent plus sur l'exchange
-        if hasattr(database, "get_open_positions") and callable(database.get_open_positions):
+            # sens
+            side = "buy"
             try:
-                db_positions = database.get_open_positions() or []
+                amt = float(p.get("contracts") or p.get("amount") or p.get("size") or 0.0)
+                side = "buy" if amt > 0 else "sell"
             except Exception:
-                db_positions = []
-            for dbp in db_positions:
-                sym = (dbp or {}).get("symbol")
-                if sym and sym not in open_symbols:
-                    for fn in ("remove_open_position", "close_position", "mark_position_closed", "delete_open_position"):
-                        if hasattr(database, fn):
-                            try:
-                                getattr(database, fn)(sym)
-                                break
-                            except Exception:
-                                pass
+                pass
 
+            entry = None
+            try:
+                entry = float(p.get("entryPrice") or p.get("entry_price") or (p.get("info") or {}).get("avgEntryPrice") or 0.0)
+            except Exception:
+                entry = 0.0
+
+            norm_positions.append({"symbol": sym, "side": side, "entry": entry, "contracts": contracts})
+
+        # 2) DB: positions ouvertes
+        db_open = database.get_open_positions() or []
+        db_keys = {(pos.get("symbol", "").replace("/", "").replace(":USDT", "")) for pos in db_open}
+
+        # 3) Créer en DB celles présentes sur l'exchange mais absentes en DB
+        for np in norm_positions:
+            key = np["symbol"].replace("/", "").replace(":USDT", "")
+            if key in db_keys:
+                continue
+            # Création d'un trade minimal pour permettre l’affichage
+            try:
+                entry_price = float(np.get("entry") or 0.0)
+                qty = float(np.get("contracts") or 0.0)
+                side = np.get("side", "buy")
+                # SL/TP inconnus -> 0.0 (affichage “N/A” géré)
+                database.create_trade(
+                    symbol=np["symbol"],
+                    side=side,
+                    regime="EXTERNAL",
+                    entry_price=entry_price if entry_price > 0 else 0.0,
+                    sl_price=0.0,
+                    tp_price=0.0,
+                    quantity=qty,
+                    risk_percent=0.0,
+                    management_strategy=str(database.get_setting('STRATEGY_MODE', 'NORMAL') or 'NORMAL'),
+                    entry_atr=0.0,
+                    entry_rsi=0.0
+                )
+            except Exception as e:
+                print(f"[sync_positions_with_exchange] create_trade failed for {np.get('symbol')}: {e}")
+
+        # 4) Fermer en DB celles absentes côté exchange
+        for pos in db_open:
+            key = (pos.get("symbol") or "").replace("/", "").replace(":USDT", "")
+            if key not in open_ex_symbols:
+                try:
+                    database.remove_open_position(pos.get("symbol") or "")
+                except Exception:
+                    pass
     except Exception as e:
-        try:
-            notifier.tg_send_error(f"Sync positions error: {e}")
-        except Exception:
-            print(f"sync_positions_with_exchange error: {e}")
+        print(f"[sync_positions_with_exchange] error: {e}")
+
 
 
 def _validate_tp_for_side(side: str, tp_price: float, current_price: float, tick_size: float) -> float:
