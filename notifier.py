@@ -62,7 +62,7 @@ def tg_answer_callback_query(callback_query_id: str, text: str = ""):
         print(f"Erreur answerCallbackQuery: {e}")
 
 def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reason: str, is_control_only: bool = False):
-    """Rapport de validation + mise à jour DB (VALID_TAKEN / VALID_SKIPPED)."""
+    """Rapport de validation + mise à jour DB (VALID_TAKEN / VALID_SKIPPED) avec persistance de la raison."""
     try:
         side = str(signal.get('side', '')).lower()
         regime = str(signal.get('regime', '') or '')
@@ -73,11 +73,18 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
         timeframe = str(signal.get('timeframe') or database.get_setting('TIMEFRAME', '1h'))
         ts = int(signal.get('ts') or int(time.time() * 1000))
 
-        # --- Persist VALID_* state
+        # --- Persist VALID_* state (+ reason)
         try:
             payload = {
-                "side": side, "regime": regime, "rr": rr, "entry": entry, "sl": sl, "tp": tp,
-                "timeframe": timeframe, "signal": dict(signal or {})
+                "side": side,
+                "regime": regime,
+                "rr": rr,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "timeframe": timeframe,
+                "signal": dict(signal or {}),
+                "reason": str(reason or "")
             }
             database.mark_signal_validated(symbol, ts, payload, taken=is_taken)
         except Exception:
@@ -86,23 +93,30 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
         side_icon = "📈" if side == 'buy' else "📉"
         side_text = "LONG" if side == 'buy' else "SHORT"
         status_icon = "✅" if is_taken else "❌"
-        status_text = "<b>Position Ouverte</b>" if is_taken else f"<b>Position NON Ouverte</b>\n   - Raison: <i>{html.escape(reason)}</i>"
+        status_text = "Pris" if is_taken else "Rejeté"
+
+        # Détails + raison quand rejeté
+        detail_lines = [
+            f"paire: <code>{html.escape(symbol)}</code>",
+            f"Type: <b>{html.escape(regime.capitalize())}</b>",
+            f"Entrée: <code>{entry:.5f}</code>",
+            f"SL: <code>{sl:.5f}</code>",
+            f"TP: <code>{tp:.5f}</code>",
+            f"RR: <b>x{rr:.2f}</b>"
+        ]
+        if not is_taken and reason:
+            detail_lines.append(f"Raison: <i>{html.escape(reason)}</i>")
 
         message = (
-            f"<b>{status_icon} Signal {side_icon} {side_text} {'Pris' if is_taken else 'Rejeté'}</b>\n\n"
-            f" paire: <code>{html.escape(symbol)}</code>\n"
-            f" Type: <b>{html.escape(regime.capitalize())}</b>\n\n"
-            f" Entrée: <code>{entry:.5f}</code>\n"
-            f" SL: <code>{sl:.5f}</code>\n"
-            f" TP: <code>{tp:.5f}</code>\n"
-            f" RR: <b>x{rr:.2f}</b>\n\n"
-            f"{status_text}"
+            f"<b>{status_icon} Signal {side_icon} {side_text} {status_text}</b>\n\n"
+            + "\n".join(detail_lines)
         )
 
         target_chat_id = TG_CHAT_ID if is_control_only else (TG_ALERTS_CHAT_ID or TG_CHAT_ID)
         tg_send(message, chat_id=target_chat_id)
     except Exception:
         pass
+
 
     
 def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]) -> None:
@@ -888,8 +902,29 @@ def tg_show_signals_6h(limit: int = 50):
     Affiche 'Signaux des 6 dernières heures' :
     inclut VALID_SKIPPED et VALID_TAKEN sur une fenêtre = 360 min.
     Tri décroissant par ts (les plus récents en premier).
+
+    Règles d'affichage:
+      - CUT_WICK_FOR_RR = false  -> masquer VALID_TAKEN si RR < MIN_RR
+      - CUT_WICK_FOR_RR = true   -> masquer VALID_TAKEN si RR < 2.8
     """
     keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
+
+    # Paramètres
+    try:
+        min_rr = float(database.get_setting('MIN_RR', os.getenv("MIN_RR", "3.0")))
+    except Exception:
+        min_rr = 3.0
+    try:
+        cut_wick = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
+    except Exception:
+        cut_wick = False
+    # Seuil spécifique cut-wick (configurable sinon défaut 2.8)
+    try:
+        cw_min_rr = float(database.get_setting('CUT_WICK_MIN_RR', '2.8'))
+    except Exception:
+        cw_min_rr = 2.8
+
+    # Lecture DB
     try:
         s_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit) or []
         s_taken   = database.get_signals(state="VALID_TAKEN",   since_minutes=360, limit=limit) or []
@@ -898,20 +933,56 @@ def tg_show_signals_6h(limit: int = 50):
         edit_main(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
+    # Filtrage selon la règle
+    filtered = []
+    for s in signals:
+        try:
+            st = str(s.get("state", "")).upper()
+            rr_val = float(s.get("rr", 0) or 0.0)
+            if st == "VALID_TAKEN":
+                if cut_wick:
+                    # cut-wick actif -> masquer si RR < 2.8
+                    if rr_val < cw_min_rr:
+                        continue
+                else:
+                    # cut-wick inactif -> masquer si RR < MIN_RR
+                    if rr_val < min_rr:
+                        continue
+        except Exception:
+            pass
+        filtered.append(s)
+    signals = filtered
+
     signals = sorted(signals, key=lambda s: int(s.get("ts", 0)), reverse=True)
 
     if not signals:
         edit_main("<b>⏱️ Signaux validés (6h)</b>\n\nAucun signal validé sur les 6 dernières heures.", keyboard)
         return
 
-    def _badge(st: str) -> str:
-        return "✅ Pris" if (st or "").upper() == "VALID_TAKEN" else "❌ Non pris"
+    def _badge(s: dict) -> str:
+        st = str(s.get('state', '')).upper()
+        return "✅ Pris" if st == "VALID_TAKEN" else "❌ Non pris"
+
+    def _reason(s: dict) -> str:
+        payload = s.get("payload") or s.get("data") or {}
+        reason = s.get("reason") or (payload.get("reason") if isinstance(payload, dict) else "")
+        return f"  (raison: {html.escape(str(reason))})" if reason else ""
 
     lines = ["<b>⏱️ Signaux validés (6h)</b>", ""]
     for s in signals:
         row = _format_signal_row(s)
-        lines.append(f"{row}  —  {_badge(s.get('state',''))}")
+        note = ""
+        try:
+            rr_val = float(s.get("rr", 0) or 0.0)
+            # Si cut-wick ON et RR entre [2.8 ; MIN_RR[, on l’affiche mais on tag l’écart vs MIN_RR
+            if cut_wick and rr_val < min_rr and rr_val >= cw_min_rr:
+                note = "  ⚠ RR<MIN_RR (cut-wick)"
+        except Exception:
+            pass
+        lines.append(f"{row}  —  {_badge(s)}{note}{_reason(s)}")
+
     edit_main("\n".join(lines), keyboard)
+
 
 
 # ==============================================================================
