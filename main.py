@@ -926,3 +926,6 @@ def main():
     except KeyboardInterrupt:
         print("Arrêt demandé.")
         notifier.tg_send("⛔ Arrêt manuel.")
+
+if __name__ == "__main__":
+    main()
