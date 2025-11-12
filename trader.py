@@ -1166,9 +1166,12 @@ def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, q
 
 def sync_positions_with_exchange(ex) -> None:
     """
-    Synchronise la table trades(status='OPEN') avec les positions réelles de l'exchange.
-    - Crée en DB les positions ouvertes détectées sur l'exchange si absentes.
-    - Ferme en DB les positions OPEN inexistantes côté exchange.
+    Synchronise la table trades avec L’EXCHANGE COMME SOURCE DE VÉRITÉ (agrégation par symbole).
+    - 1 seul trade OPEN par symbole côté DB (on agrège et on ferme les doublons).
+    - Si exchange est flat pour un symbole ⇒ on ferme en DB (CLOSED_BY_EXCHANGE).
+    - Si exchange a une position et DB n’en a pas ⇒ on crée (regime='Importé').
+    - On met à jour side/quantity/entry_price pour refléter l’exchange.
+    - On recopie TP/SL depuis les ordres ouverts exchange si disponibles (sans créer/modifier les ordres ici).
     """
     try:
         if ex is None and hasattr(globals(), "create_exchange"):
@@ -1176,112 +1179,134 @@ def sync_positions_with_exchange(ex) -> None:
         if ex is None:
             return
 
-        # 1) Récupération positions exchange (ccxt unified)
-        positions = []
-        try:
-            positions = ex.fetch_positions()
-        except Exception:
-            # fallback par marchés si nécessaire
-            try:
-                positions = [p for p in ex.fetch_positions_risk() or []]
-            except Exception:
-                positions = []
-
-        # Normaliser: garder celles avec exposition > 0
-        open_ex_symbols = set()
-        norm_positions = []
-        for p in positions or []:
-            try:
-                contracts = float(p.get("contracts") or p.get("contractSize") or 0.0)
-            except Exception:
-                contracts = 0.0
-            try:
-                notional = float(p.get("notional") or 0.0)
-            except Exception:
-                notional = 0.0
-
-            # Certaines bourses renvoient amount/size au lieu de contracts
-            if contracts <= 0:
-                try:
-                    contracts = abs(float(p.get("amount") or p.get("size") or 0.0))
-                except Exception:
-                    pass
-
-            if max(contracts, abs(notional)) <= 0.0:
-                continue
-
-            # symbole unifié ccxt
+        # --- Positions réelles exchange (nettes) ---
+        ex_positions = _fetch_positions_safe(ex, None) or []
+        # Normalise par symbole → une seule entrée par symbole avec side/qty/entry
+        ex_map: Dict[str, Dict[str, Any]] = {}
+        for p in ex_positions:
             sym = p.get("symbol")
             if not sym:
-                market_id = (p.get("info") or {}).get("symbol") or (p.get("info") or {}).get("instId")
-                try:
-                    if market_id and hasattr(ex, "markets_by_id") and market_id in getattr(ex, "markets_by_id", {}):
-                        sym = ex.markets_by_id[market_id]["symbol"]
-                except Exception:
-                    pass
-            if not sym:
                 continue
+            raw_size = float(p.get("size") or p.get("contracts") or p.get("positionAmt") or 0.0)
+            if raw_size == 0:
+                continue
+            side = p.get("side") or ("long" if raw_size > 0 else "short")
+            qty = abs(raw_size)
+            entry = float(p.get("entryPrice") or 0.0)
+            # Canonise side pour notre DB: 'buy'/'sell'
+            side_db = "buy" if str(side).lower() in ("long", "buy") else "sell"
+            ex_map[sym] = {"symbol": sym, "side": side_db, "qty": qty, "entry": entry}
 
-            open_ex_symbols.add(sym.replace("/", "").replace(":USDT", ""))  # clé de comparaison
-
-            # sens
-            side = "buy"
-            try:
-                amt = float(p.get("contracts") or p.get("amount") or p.get("size") or 0.0)
-                side = "buy" if amt > 0 else "sell"
-            except Exception:
-                pass
-
-            entry = None
-            try:
-                entry = float(p.get("entryPrice") or p.get("entry_price") or (p.get("info") or {}).get("avgEntryPrice") or 0.0)
-            except Exception:
-                entry = 0.0
-
-            norm_positions.append({"symbol": sym, "side": side, "entry": entry, "contracts": contracts})
-
-        # 2) DB: positions ouvertes
+        # --- DB: liste des OPEN ---
         db_open = database.get_open_positions() or []
-        db_keys = {(pos.get("symbol", "").replace("/", "").replace(":USDT", "")) for pos in db_open}
+        # Grouper par symbole
+        db_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for r in db_open:
+            db_by_symbol.setdefault(r.get("symbol", ""), []).append(r)
 
-        # 3) Créer en DB celles présentes sur l'exchange mais absentes en DB
-        for np in norm_positions:
-            key = np["symbol"].replace("/", "").replace(":USDT", "")
-            if key in db_keys:
+        # Ensemble des symboles impliqués
+        symbols_all = set(db_by_symbol.keys()) | set(ex_map.keys())
+
+        for sym in symbols_all:
+            ex_info = ex_map.get(sym)          # None si flat côté exchange
+            db_list = db_by_symbol.get(sym, [])  # [] si pas de trade DB
+
+            # --- Cas A: exchange FLAT, DB a des OPEN → fermer tous en DB
+            if ex_info is None and db_list:
+                for row in db_list:
+                    try:
+                        database.close_trade(int(row["id"]), status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                    except Exception:
+                        pass
                 continue
-            # Création d'un trade minimal pour permettre l’affichage
-            try:
-                entry_price = float(np.get("entry") or 0.0)
-                qty = float(np.get("contracts") or 0.0)
-                side = np.get("side", "buy")
-                # SL/TP inconnus -> 0.0 (affichage “N/A” géré)
-                database.create_trade(
-                    symbol=np["symbol"],
-                    side=side,
-                    regime="EXTERNAL",
-                    entry_price=entry_price if entry_price > 0 else 0.0,
-                    sl_price=0.0,
-                    tp_price=0.0,
-                    quantity=qty,
-                    risk_percent=0.0,
-                    management_strategy=str(database.get_setting('STRATEGY_MODE', 'NORMAL') or 'NORMAL'),
-                    entry_atr=0.0,
-                    entry_rsi=0.0
-                )
-            except Exception as e:
-                print(f"[sync_positions_with_exchange] create_trade failed for {np.get('symbol')}: {e}")
 
-        # 4) Fermer en DB celles absentes côté exchange
-        for pos in db_open:
-            key = (pos.get("symbol") or "").replace("/", "").replace(":USDT", "")
-            if key not in open_ex_symbols:
+            # --- Cas B: exchange a une position, DB n’a rien → créer + recopie TP/SL si trouvés
+            if ex_info is not None and not db_list:
                 try:
-                    database.remove_open_position(pos.get("symbol") or "")
+                    # Crée un trade importé
+                    database.create_trade(
+                        symbol=sym,
+                        side=ex_info["side"],
+                        regime="Importé",
+                        entry_price=float(ex_info["entry"] or 0.0),
+                        sl_price=float(ex_info["entry"] or 0.0),
+                        tp_price=float(ex_info["entry"] or 0.0),
+                        quantity=float(ex_info["qty"] or 0.0),
+                        risk_percent=RISK_PER_TRADE_PERCENT,
+                        management_strategy=str(database.get_setting('STRATEGY_MODE', 'NORMAL') or 'NORMAL'),
+                        entry_atr=0.0,
+                        entry_rsi=0.0,
+                    )
                 except Exception:
                     pass
+                # Recopie TP/SL éventuels depuis les ordres
+                try:
+                    tp_ex, sl_ex = _fetch_existing_tp_sl(ex, sym)
+                    if tp_ex or sl_ex:
+                        # retrouver le trade nouvellement créé (le plus récent pour ce symbole)
+                        fresh = [t for t in database.get_open_positions() if t.get("symbol") == sym]
+                        if fresh:
+                            keep = max(fresh, key=lambda x: int(x.get("open_timestamp") or 0))
+                            if tp_ex:
+                                database.update_trade_tp(int(keep["id"]), float(tp_ex))
+                            if sl_ex:
+                                try:
+                                    database.update_trade_sl(int(keep["id"]), float(sl_ex))
+                                except AttributeError:
+                                    database.update_trade_to_breakeven(int(keep["id"]), float(keep.get("quantity") or 0.0), float(sl_ex))
+                except Exception:
+                    pass
+                continue
+
+            # --- Cas C: exchange a une position, DB a ≥1 OPEN → agrège: on garde 1, on ferme les autres
+            if ex_info is not None and db_list:
+                # Sélectionne le "keeper": le plus récent (open_timestamp) puis id
+                try:
+                    keeper = max(db_list, key=lambda x: (int(x.get("open_timestamp") or 0), int(x.get("id") or 0)))
+                except Exception:
+                    keeper = db_list[0]
+                keep_id = int(keeper["id"])
+
+                # Ferme les doublons
+                for row in db_list:
+                    rid = int(row["id"])
+                    if rid == keep_id:
+                        continue
+                    try:
+                        database.close_trade(rid, status='MERGED_BY_SYNC', pnl=0.0)
+                    except Exception:
+                        pass
+
+                # Met à jour le trade conservé pour refléter l’exchange (side/qty/entry)
+                try:
+                    database.update_trade_core(
+                        trade_id=keep_id,
+                        side=str(ex_info["side"]),
+                        entry_price=float(ex_info["entry"] or 0.0),
+                        quantity=float(ex_info["qty"] or 0.0),
+                        regime=keeper.get("regime") or "Importé"
+                    )
+                except Exception:
+                    pass
+
+                # Recopie TP/SL si présents sur l’exchange
+                try:
+                    tp_ex, sl_ex = _fetch_existing_tp_sl(ex, sym)
+                    if tp_ex:
+                        database.update_trade_tp(keep_id, float(tp_ex))
+                    if sl_ex:
+                        try:
+                            database.update_trade_sl(keep_id, float(sl_ex))
+                        except AttributeError:
+                            database.update_trade_to_breakeven(keep_id, float(ex_info["qty"] or 0.0), float(sl_ex))
+                except Exception:
+                    pass
+
+        # Optionnel: fermer des artefacts si la symbolisation diverge (ex_map clés nettoyées)
+        # -> Déjà couvert via clés exactes 'symbol' normalisées par ccxt.
+
     except Exception as e:
         print(f"[sync_positions_with_exchange] error: {e}")
-
 
 
 def _validate_tp_for_side(side: str, tp_price: float, current_price: float, tick_size: float) -> float:
