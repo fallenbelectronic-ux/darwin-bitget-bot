@@ -2314,38 +2314,67 @@ def _compute_trailing_sl(mark_price: float, side: str, atr: float) -> float:
 def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Wrapper d’exécution attendu par le reste du projet.
+    - (Option) Sync positions avant exécution si SYNC_BEFORE_EXECUTE = true
     - Charge le DF préparé
-    - Détermine un prix d’entrée « live » robuste
+    - Détermine un prix d’entrée « live » robuste (respecte CT_ENTRY_ON_NEXT_BAR si activé)
     - Délègue à execute_signal_with_gates (recalc SL/TP/RR + envoi ordres + persistance)
     """
     try:
+        # 1) Sync optionnelle avant exécution
+        try:
+            if str(database.get_setting('SYNC_BEFORE_EXECUTE', 'true')).lower() == 'true':
+                sync_positions_with_exchange(ex)
+        except Exception:
+            pass
+
+        # 2) Données marché
         df = utils.fetch_and_prepare_df(ex, symbol, timeframe)
         if df is None or len(df) < 3:
             return False, "DF indisponible ou trop court pour exécuter."
 
-        # Prix d’entrée live (ticker), fallback sur le dernier close/open du DF
+        # 3) Politique d’entrée (next bar vs live ticker)
         try:
-            t = ex.fetch_ticker(symbol) or {}
-            entry_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
+            enforce_next_bar = str(database.get_setting('CT_ENTRY_ON_NEXT_BAR', 'true')).lower() == 'true'
         except Exception:
-            entry_price = 0.0
-        if not entry_price or entry_price <= 0:
+            enforce_next_bar = True
+
+        entry_price: float = 0.0
+        if enforce_next_bar:
+            # Entrée stricte: OPEN de la bougie courante (proxy du “next bar open” en live)
             try:
-                entry_price = float(df.iloc[-1].get('close') or df.iloc[-1].get('open') or 0.0)
+                entry_price = float(df.iloc[-1].get('open', 0.0))
             except Exception:
                 entry_price = 0.0
-        if entry_price <= 0:
+
+        # Fallback sur ticker si nécessaire
+        if not entry_price or entry_price <= 0.0:
+            try:
+                t = ex.fetch_ticker(symbol) or {}
+                entry_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
+            except Exception:
+                entry_price = 0.0
+
+        # Dernier fallback: close/open du DF
+        if not entry_price or entry_price <= 0.0:
+            try:
+                last_row = df.iloc[-1]
+                entry_price = float(last_row.get('close') or last_row.get('open') or 0.0)
+            except Exception:
+                entry_price = 0.0
+
+        if entry_price <= 0.0:
             return False, "Impossible d’estimer un prix d’entrée."
 
-        # Horodatage / normalisation minimale si besoin
+        # 4) Normalisations minimales du signal
         if not signal.get("ts"):
             signal["ts"] = int(time.time() * 1000)
         if not signal.get("side"):
             last = df.iloc[-1]
-            signal["side"] = "buy" if float(last["close"]) >= float(last["open"]) else "sell"
+            signal["side"] = "buy" if float(last.get("close", 0.0)) >= float(last.get("open", 0.0)) else "sell"
         if not signal.get("regime"):
             signal["regime"] = "Tendance"
 
+        # 5) Délégation à l’exécuteur avec garde-fous RR/SL/TP
         return execute_signal_with_gates(
             ex=ex,
             symbol=symbol,
@@ -2354,13 +2383,13 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[s
             signal=signal,
             entry_price=float(entry_price),
         )
+
     except Exception as e:
         try:
             notifier.tg_send(f"❌ execute_trade({symbol}) a échoué: {e}")
         except Exception:
             pass
         return False, f"Erreur interne execute_trade: {e}"
-
 
 def manage_open_positions(ex: ccxt.Exchange):
     """TP dynamique (tendance→BB80 opposée ; CT→BB20 up/lo) + Break-Even + Trailing live après BE.
@@ -2701,7 +2730,7 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
-    """(MODIFIÉ) Clôture manuelle robuste : utilise create_market_order_smart() pour BUY (close short)."""
+    """(MODIFIÉ) Clôture manuelle robuste : utilise create_market_order_smart() pour BUY et SELL."""
     _ensure_bitget_mix_options(ex)
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     trade = database.get_trade_by_id(trade_id)
@@ -2713,6 +2742,7 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     qty_db = float(trade['quantity'])
 
     try:
+        # Contexte marge/levier/position
         try:
             ex.set_leverage(LEVERAGE, symbol)
             try: ex.set_margin_mode('cross', symbol)
@@ -2722,6 +2752,7 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         except Exception:
             pass
 
+        # Quantité réelle côté exchange (sécurise si DB désync)
         real_qty = 0.0
         market = None
         try:
@@ -2746,8 +2777,10 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             return notifier.tg_send(f"ℹ️ Aucune position ouverte détectée pour {symbol}. Trade #{trade_id} marqué fermé.")
 
         qty_to_close = min(qty_db, real_qty)
-        try: qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
-        except Exception: pass
+        try:
+            qty_to_close = float(ex.amount_to_precision(symbol, qty_to_close))
+        except Exception:
+            pass
         if qty_to_close <= 0:
             database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
             return notifier.tg_send(f"ℹ️ Quantité nulle à clôturer sur {symbol}. Trade #{trade_id} marqué fermé.")
@@ -2755,19 +2788,22 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         if not is_paper_mode:
             close_side = 'sell' if side == 'buy' else 'buy'
             params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
-            # ✅ BUY Bitget (fermeture d'un short) → utiliser le helper
-            if close_side == 'buy':
-                try:
-                    t = ex.fetch_ticker(symbol) or {}
-                    ref_px = float(t.get('last') or t.get('close') or 0.0)
-                except Exception:
-                    ref_px = 0.0
-                create_market_order_smart(ex, symbol, 'buy', qty_to_close, ref_price=ref_px, params=params)
-            else:
-                ex.create_market_order(symbol, 'sell', qty_to_close, params=params)
+
+            # Prix de référence pour conversion qty→cost si nécessaire (Bitget BUY)
+            try:
+                t = ex.fetch_ticker(symbol) or {}
+                ref_px = float(t.get('last') or t.get('close') or t.get('bid') or t.get('ask') or 0.0)
+            except Exception:
+                ref_px = 0.0
+
+            # ✅ Unifie le chemin: toujours via create_market_order_smart (BUY & SELL)
+            create_market_order_smart(
+                ex, symbol, close_side, qty_to_close, ref_price=ref_px, params=params
+            )
 
         database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
         notifier.tg_send(f"✅ Position sur {symbol} (Trade #{trade_id}) fermée manuellement (qty={qty_to_close}).")
 
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
+
