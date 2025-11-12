@@ -2674,53 +2674,80 @@ def manage_open_positions(ex: ccxt.Exchange):
                 pass
 
 
-
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
-    """Solde USDT/équity robuste (Bitget v2 compatible, évite 'Parameter productType error')."""
+    """
+    Retourne le solde USDT (compte swap) en float.
+    - Tente d'abord balance['total']['USDT'] puis 'free' puis objet-clé direct.
+    - Garde None si introuvable (pour laisser l'appelant afficher “non disponible”).
+    """
     try:
-        bal = _fetch_balance_safe(ex)
-        if not bal:
-            return 0.0
-
-        # Bitget: prioriser l'équity USDT native renvoyée par l'API v2
-        if getattr(ex, "id", "") == "bitget":
-            try:
-                info = bal.get("info", {})
-                data = info.get("data", None)
-                total_usdt_equity = 0.0
-                if isinstance(data, list):
-                    for acc in data:
-                        v = acc.get("usdtEquity") or acc.get("equity") or "0"
-                        total_usdt_equity += float(v)
-                    if total_usdt_equity > 0:
-                        return float(total_usdt_equity)
-                elif isinstance(data, dict):
-                    v = data.get("usdtEquity") or data.get("equity") or "0"
-                    return float(v)
-            except Exception:
-                pass  # fallback générique juste dessous
-
-        # Fallback générique CCXT: lire USDT normalisé
+        bal = ex.fetch_balance({"type": "swap"})  # Bitget: type=swap pour les perp USDT
+    except Exception:
         try:
-            usdt = bal.get("USDT")
-            if isinstance(usdt, dict):
-                return float(usdt.get("total") or usdt.get("free") or 0.0)
+            bal = ex.fetch_balance()
+        except Exception:
+            return None
+
+    candidates: List[Optional[float]] = []
+
+    # 1) Sections normalisées ccxt
+    for section in ("total", "free", "used"):
+        try:
+            sec = bal.get(section) or {}
+            for k in ("USDT", "USDT:USDT"):
+                v = sec.get(k)
+                if v is not None:
+                    try:
+                        candidates.append(float(v))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
-        # Dernier recours: agrégat 'total'
+    # 2) Entrée directe par devise (certaines implémentations)
+    for k in ("USDT", "USDT:USDT"):
         try:
-            total = bal.get("total", {})
-            if isinstance(total, dict) and "USDT" in total:
-                return float(total["USDT"])
+            coin = bal.get(k)
+            if isinstance(coin, dict):
+                for sub in ("total", "free"):
+                    v = coin.get(sub)
+                    if v is not None:
+                        try:
+                            candidates.append(float(v))
+                        except Exception:
+                            pass
         except Exception:
             pass
 
-        return 0.0
+    # 3) Fallback info brute (non bloquant)
+    try:
+        info = bal.get("info") or {}
+        for path in (
+            ("USDT", "available"),
+            ("USDT", "total"),
+            ("USDT:USDT", "available"),
+            ("USDT:USDT", "total"),
+        ):
+            cur = info
+            for key in path:
+                if isinstance(cur, dict):
+                    cur = cur.get(key)
+                else:
+                    cur = None
+                    break
+            if cur is not None:
+                try:
+                    candidates.append(float(cur))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-    except Exception as e:
-        notifier.tg_send_error("Récupération du solde", e)
+    # Choix du meilleur candidat
+    candidates = [c for c in candidates if isinstance(c, (int, float))]
+    if not candidates:
         return None
+    return float(max(candidates))
 
 def calculate_position_size(balance: float, risk_percent: float, entry_price: float, sl_price: float) -> float:
     """Calcule la quantité d'actifs à trader."""
