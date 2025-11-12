@@ -1221,9 +1221,22 @@ def tg_show_stats(period: str = "24h"):
 def tg_show_positions():
     """
     Affiche les positions ouvertes depuis la DB dans le message principal.
-    (Routé par le bouton '📊 Positions')
+    (Routé par le bouton '📊 Positions') — tente d'abord une sync avec l'exchange.
     """
     try:
+        # 🔄 Sync on-demand avec l'exchange pour remonter une position ouverte ailleurs (ex: Bybit)
+        ex = None
+        try:
+            ex = getattr(trader, "create_exchange", None) and trader.create_exchange()
+        except Exception:
+            ex = None
+        try:
+            if ex and hasattr(trader, "sync_positions_with_exchange"):
+                trader.sync_positions_with_exchange(ex)
+        except Exception as _sync_err:
+            # On ne bloque pas l’affichage si la sync échoue
+            print(f"[notifier.tg_show_positions] Sync positions warning: {_sync_err}")
+
         positions = database.get_open_positions() or []
     except Exception as e:
         edit_main(f"⚠️ Erreur lecture positions : <code>{_escape(e)}</code>",
