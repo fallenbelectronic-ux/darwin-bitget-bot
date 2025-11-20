@@ -2128,12 +2128,52 @@ def execute_signal_with_gates(
     except Exception:
         pass
 
-    if len(database.get_open_positions()) >= max_pos:
+    # --- RÉCUP OPEN POS DB UNE FOIS ---
+    open_positions = database.get_open_positions() or []
+
+    # Limite globale de positions
+    if len(open_positions) >= max_pos:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"max_positions({max_pos})")
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
-    if database.is_position_open(symbol):
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="already_open_in_db")
-        return False, "Rejeté: Position déjà ouverte (DB)."
+
+    # --- LOGIQUE RENFORCÉE 'POSITION DÉJÀ OUVERTE' ---
+    # On ne se fie plus uniquement à la DB : on recoupe avec l'exchange.
+    symbol_open_db = [
+        p for p in open_positions
+        if str(p.get('symbol')) == str(symbol) and str(p.get('status', '')).upper() == 'OPEN'
+    ]
+
+    if symbol_open_db:
+        # Vérification live côté exchange
+        live_open = False
+        try:
+            live_positions = _fetch_positions_safe(ex, [symbol])
+            for lp in (live_positions or []):
+                try:
+                    size_val = float(lp.get("size") or lp.get("contracts") or lp.get("positionAmt") or 0.0)
+                except Exception:
+                    size_val = 0.0
+                if abs(size_val) > 0.0:
+                    live_open = True
+                    break
+        except Exception:
+            # En cas d'erreur API, on reste conservateur: on considère qu'il peut y avoir une pos.
+            live_open = True
+
+        if not live_open:
+            # Désync : DB croit à une pos, mais l'exchange est flat → on nettoie la DB et on laisse passer.
+            try:
+                for row in symbol_open_db:
+                    try:
+                        database.close_trade(int(row["id"]), status='CLOSED_BY_SYNC_DESYNC', pnl=0.0)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            # Vraie position ouverte (DB + exchange) → on bloque ce signal comme avant.
+            _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="already_open_in_db")
+            return False, "Rejeté: Position déjà ouverte (DB)."
 
     balance = get_usdt_balance(ex)
     if balance is None or balance <= 10:
@@ -2316,6 +2356,7 @@ def execute_signal_with_gates(
         pass
 
     return True, "Position ouverte avec succès."
+
 
 
 def get_tp_offset_pct() -> float:
