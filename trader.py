@@ -692,6 +692,106 @@ def _previous_wave_by_bb80(df: pd.DataFrame, idx: int, dead_zone_pct: float) -> 
             return 'up' if close_k > mid_k else 'down'
     return None
 
+def _is_inside_both_bb(row, is_long: bool) -> bool:
+    """
+    Retourne True si la clôture est à l'intérieur des DEUX bandes :
+      - BB20 (bb20_lo / bb20_up)
+      - BB80 (bb80_lo / bb80_up)
+    C'est notre définition de "réintégration claire" pour la CT.
+    """
+    try:
+        c = float(row['close'])
+        bb20_up = float(row['bb20_up'])
+        bb20_lo = float(row['bb20_lo'])
+        bb80_up = float(row['bb80_up'])
+        bb80_lo = float(row['bb80_lo'])
+    except Exception:
+        return False
+
+    return (bb20_lo <= c <= bb20_up) and (bb80_lo <= c <= bb80_up)
+
+
+def _check_ct_reintegration_window(df: pd.DataFrame, is_long: bool, max_window: int = 3) -> bool:
+    """
+    Gate spécifique CONTRE-TENDANCE.
+
+    Vérifie, dans les (max_window+1) dernières bougies clôturées avant l'entrée :
+      1) présence d'un CONTACT BB80 (haut pour un short, bas pour un long),
+      2) une RÉINTÉGRATION en clôture à l'intérieur des DEUX BB (20 et 80),
+      3) aucune "ressortie" en clôture des BB20/BB80 entre cette réintégration
+         et la bougie de réaction.
+
+    Si la séquence n'est pas respectée → False (on rejette le signal CT).
+    """
+    try:
+        if df is None:
+            return False
+        # Besoin d'au moins (max_window + 2) bougies :
+        #  - 1 bougie courante (open d'entrée)
+        #  - 1 bougie de réaction
+        #  - max_window bougies de contexte.
+        if len(df) < max_window + 2:
+            return False
+
+        # On travaille sur les bougies clôturées : on exclut la dernière,
+        # qui sert d'open d'entrée (CT_ENTRY_ON_NEXT_BAR).
+        # Exemple max_window=3 → on regarde les 4 dernières bougies clôturées
+        # (dont la bougie de réaction).
+        window = df.iloc[-(max_window + 1):-1]
+    except Exception:
+        return False
+
+    if window is None or len(window) == 0:
+        return False
+
+    # 1) Recherche du contact BB80 dans la fenêtre (on prend le DERNIER contact trouvé).
+    contact_idx = None
+    for idx, row in window.iterrows():
+        try:
+            if is_long:
+                touched = float(row['low']) <= float(row['bb80_lo'])
+            else:
+                touched = float(row['high']) >= float(row['bb80_up'])
+        except Exception:
+            touched = False
+
+        if touched:
+            contact_idx = idx
+
+    if contact_idx is None:
+        # Pas de contact BB80 → séquence CT invalide
+        return False
+
+    # 2) Recherche de la première bougie de réintégration (clôture dans BB20 ET BB80)
+    reintegration_idx = None
+    idxs = list(window.index)
+    start_found = False
+    for idx in idxs:
+        if idx == contact_idx:
+            start_found = True
+        if not start_found:
+            continue
+
+        row = window.loc[idx]
+        if _is_inside_both_bb(row, is_long):
+            reintegration_idx = idx
+            break
+
+    if reintegration_idx is None:
+        # Pas de réintégration claire après le contact
+        return False
+
+    # 3) Vérifier qu'entre la réintégration et la bougie de réaction
+    #    on ne ressort pas des BB20/BB80 en clôture.
+    start_pos = idxs.index(reintegration_idx)
+    for idx in idxs[start_pos:]:
+        row = window.loc[idx]
+        if not _is_inside_both_bb(row, is_long):
+            # Ressortie → séquence CT invalide
+            return False
+
+    return True
+
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """(MIS À JOUR) SL sur bougie 1 (contact) + offset hybride ; TP avant borne
@@ -2092,6 +2192,31 @@ def execute_signal_with_gates(
         eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
         tp_live = target_band * (1.0 - eff_pct) if is_long else target_band * (1.0 + eff_pct)
 
+    # ---- Gate spécifique CONTRE-TENDANCE : séquence BB80 + réintégration BB20/BB80 sans ressortie ----
+    if regime != "Tendance":
+        ok_ct_bb = _check_ct_reintegration_window(df, is_long, max_window=REACTION_WINDOW_BARS)
+        if not ok_ct_bb:
+            signal['entry'] = entry_px
+            signal['sl'] = float(sl_live)
+            signal['tp'] = float(tp_live)
+            try:
+                current_rr = float(signal.get('rr', 0.0) or 0.0)
+            except Exception:
+                current_rr = 0.0
+            signal['rr'] = current_rr
+            _update_signal_state(
+                symbol,
+                timeframe,
+                signal,
+                entry_px,
+                "SKIPPED",
+                reason="ct_bb_reintegration_failed",
+                tp=float(tp_live),
+                sl=float(sl_live),
+            )
+            return False, "Rejeté: séquence contre-tendance BB20+BB80 non conforme."
+
+    # ---- RR et éventuel cut-wick ----
     rr = 0.0
     if is_long:
         if (entry_px > sl_live) and (tp_live > entry_px):
@@ -2122,58 +2247,38 @@ def execute_signal_with_gates(
     is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
 
+    # Sync eventuelle avant exécution
     try:
         if str(database.get_setting('SYNC_BEFORE_EXECUTE', 'true')).lower() == 'true':
             sync_positions_with_exchange(ex)
     except Exception:
         pass
 
-    # --- RÉCUP OPEN POS DB UNE FOIS ---
-    open_positions = database.get_open_positions() or []
+    # ---- Fermeture obligatoire sur signal inverse ----
+    try:
+        open_positions = database.get_open_positions()
+        for pos_open in open_positions:
+            try:
+                if pos_open.get('symbol') != symbol:
+                    continue
+                pos_side = str(pos_open.get('side', '')).lower()
+                if not pos_side or pos_side == side:
+                    # même sens ou inconnu → on ne ferme pas ici
+                    continue
+                # sens inverse sur le même symbole → on ferme avant d'envisager le nouveau trade
+                close_position_manually(ex, int(pos_open['id']))
+            except Exception:
+                continue
+    except Exception:
+        pass
 
-    # Limite globale de positions
-    if len(open_positions) >= max_pos:
+    # Slots & position déjà ouverte (même sens)
+    if len(database.get_open_positions()) >= max_pos:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"max_positions({max_pos})")
         return False, f"Rejeté: Max positions ({max_pos}) atteint."
-
-    # --- LOGIQUE RENFORCÉE 'POSITION DÉJÀ OUVERTE' ---
-    # On ne se fie plus uniquement à la DB : on recoupe avec l'exchange.
-    symbol_open_db = [
-        p for p in open_positions
-        if str(p.get('symbol')) == str(symbol) and str(p.get('status', '')).upper() == 'OPEN'
-    ]
-
-    if symbol_open_db:
-        # Vérification live côté exchange
-        live_open = False
-        try:
-            live_positions = _fetch_positions_safe(ex, [symbol])
-            for lp in (live_positions or []):
-                try:
-                    size_val = float(lp.get("size") or lp.get("contracts") or lp.get("positionAmt") or 0.0)
-                except Exception:
-                    size_val = 0.0
-                if abs(size_val) > 0.0:
-                    live_open = True
-                    break
-        except Exception:
-            # En cas d'erreur API, on reste conservateur: on considère qu'il peut y avoir une pos.
-            live_open = True
-
-        if not live_open:
-            # Désync : DB croit à une pos, mais l'exchange est flat → on nettoie la DB et on laisse passer.
-            try:
-                for row in symbol_open_db:
-                    try:
-                        database.close_trade(int(row["id"]), status='CLOSED_BY_SYNC_DESYNC', pnl=0.0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        else:
-            # Vraie position ouverte (DB + exchange) → on bloque ce signal comme avant.
-            _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="already_open_in_db")
-            return False, "Rejeté: Position déjà ouverte (DB)."
+    if database.is_position_open(symbol):
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="already_open_in_db")
+        return False, "Rejeté: Position déjà ouverte (DB)."
 
     balance = get_usdt_balance(ex)
     if balance is None or balance <= 10:
@@ -2356,6 +2461,7 @@ def execute_signal_with_gates(
         pass
 
     return True, "Position ouverte avec succès."
+
 
 
 
