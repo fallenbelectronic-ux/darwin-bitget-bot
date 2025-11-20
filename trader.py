@@ -503,6 +503,78 @@ def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
         eff_pct = max(pct, (atr_k * last_atr) / low_anchor if low_anchor > 0 else pct)
         return low_anchor * (1.0 - eff_pct)
 
+def _is_valid_reaction(df: pd.DataFrame, i: int, direction: str) -> bool:
+    """
+    Valide la 'bougie de réaction' selon le preset Balanced, pour LONG et SHORT.
+    Exigences :
+      1) Close À L’INTÉRIEUR de la BB20 (entre bb20_low et bb20_high).
+      2) Structure directionnelle OBLIGATOIRE :
+         - impulse (corps >= IMPULSE_MIN_BODY) dans le sens du trade
+           OU
+         - pin-bar (mèche dominante >= SIMPLE_WICK_MIN, corps <= PINBAR_MAX_BODY)
+           avec la mèche opposée <= PINBAR_OPP_WICK_MAX dans le sens du trade.
+    Args:
+        df: DataFrame avec colonnes ['open','high','low','close','bb20_low','bb20_high'].
+        i: index (int) de la bougie candidate.
+        direction: 'long' ou 'short'.
+    Returns:
+        bool
+    """
+    row = df.iloc[i]
+    o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+    bb_low = float(row["bb20_low"])
+    bb_high = float(row["bb20_high"])
+
+    # 1) Réintégration BB20 obligatoire
+    if not (bb_low <= c <= bb_high):
+        return False
+
+    # Mesures de bougie
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    body_pct = body / rng
+    up_wick = h - max(o, c)
+    dn_wick = min(o, c) - l
+    up_wick_pct = up_wick / rng
+    dn_wick_pct = dn_wick / rng
+
+    # Tolérances (fallback si non définies plus haut dans le fichier)
+    pinbar_opp_max = globals().get("PINBAR_OPP_WICK_MAX", 0.24)
+
+    # 2) Structure directionnelle
+    if direction == "long":
+        impulse_ok = (c > o) and (body_pct >= IMPULSE_MIN_BODY)
+        pinbar_ok = (dn_wick_pct >= SIMPLE_WICK_MIN) and (body_pct <= PINBAR_MAX_BODY) and (up_wick_pct <= pinbar_opp_max)
+        return bool(impulse_ok or pinbar_ok)
+
+    if direction == "short":
+        impulse_ok = (c < o) and (body_pct >= IMPULSE_MIN_BODY)
+        pinbar_ok = (up_wick_pct >= SIMPLE_WICK_MIN) and (body_pct <= PINBAR_MAX_BODY) and (dn_wick_pct <= pinbar_opp_max)
+        return bool(impulse_ok or pinbar_ok)
+
+    return False
+
+def _reaction_trigger_levels(df: pd.DataFrame, i: int, direction: str) -> Optional[Dict[str, float]]:
+    """
+    Donne les niveaux d'EXÉCUTION issus de la bougie de réaction validée :
+      - entrée uniquement sur CASSURE du high (long) / low (short) de la réaction
+      - SL de référence = low (long) / high (short) de la réaction (les coussins %/ATR sont ajoutés ailleurs)
+    Args:
+        df: DataFrame OHLC avec index i existant.
+        i: index (int) de la bougie de réaction (déjà validée par _is_valid_reaction).
+        direction: 'long' ou 'short'.
+    Returns:
+        dict avec {'entry_trigger','sl_ref'} ou None si direction invalide.
+    """
+    row = df.iloc[i]
+    h, l = float(row["high"]), float(row["low"])
+
+    if direction == "long":
+        return {"entry_trigger": h, "sl_ref": l}
+    if direction == "short":
+        return {"entry_trigger": l, "sl_ref": h}
+    return None
+
 
 def _sl_from_contact_candle(contact: pd.Series, side: str, atr_contact: Optional[float] = None) -> float:
     """
