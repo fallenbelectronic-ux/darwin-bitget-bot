@@ -3107,16 +3107,17 @@ def manage_open_positions(ex: ccxt.Exchange):
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
     Retourne le solde USDT (compte swap) en float.
+    Utilise _fetch_balance_safe() (Bitget/Bybit) pour éviter les erreurs
+    de type 'productType cannot be empty'.
     - Tente d'abord balance['total']['USDT'] puis 'free' puis objet-clé direct.
     - Garde None si introuvable (pour laisser l'appelant afficher “non disponible”).
     """
     try:
-        bal = ex.fetch_balance({"type": "swap"})  # Bitget: type=swap pour les perp USDT
-    except Exception:
-        try:
-            bal = ex.fetch_balance()
-        except Exception:
+        bal = _fetch_balance_safe(ex)
+        if not bal:
             return None
+    except Exception:
+        return None
 
     candidates: List[Optional[float]] = []
 
