@@ -10,14 +10,27 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     if total_trades < 1:
         return {"total_trades": 0}
 
-    # Récupération des séries (inclut les 0 pour bien traiter les BE)
-    pnls = np.array([float(t.get('pnl', 0.0)) for t in trades if t.get('pnl') is not None], dtype=float)
-    pnl_percents = np.array([float(t.get('pnl_percent', 0.0)) for t in trades if t.get('pnl_percent') is not None], dtype=float)
+    # Récupération des séries
+    # - on NE filtre PLUS sur 'is not None' : les valeurs manquantes sont traitées comme 0.0
+    pnls = np.array(
+        [
+            float(t.get('pnl') if t.get('pnl') is not None else 0.0)
+            for t in trades
+        ],
+        dtype=float
+    )
+    pnl_percents = np.array(
+        [
+            float(t.get('pnl_percent') if t.get('pnl_percent') is not None else 0.0)
+            for t in trades
+        ],
+        dtype=float
+    )
 
-    if pnls.size == 0:
+    effective_trades = int(pnls.size)  # doit être == total_trades
+    if effective_trades < 1:
+        # sécurité au cas où, mais normalement on ne passe ici que si trades == []
         return {"total_trades": 0, "nb_wins": 0, "nb_losses": 0}
-
-    effective_trades = int(pnls.size)
 
     wins = pnls[pnls > 0.0]
     losses = pnls[pnls < 0.0]
@@ -74,6 +87,7 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "sharpe_ratio": round(sharpe_ratio, 2),
         "max_drawdown_percent": round(max_drawdown_percent, 2),
     }
+
 
 def _compute_upnl_rpnl(pos: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     """
