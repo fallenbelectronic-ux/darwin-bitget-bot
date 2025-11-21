@@ -4,17 +4,30 @@ import sqlite3
 import time
 from typing import List, Dict, Any, Optional, Tuple
 
-DB_FILE = 'darwin_bot.db'
+DB_BASE_DIR = os.getenv("DB_BASE_DIR", "/var/data")
+DB_FILENAME = os.getenv("DB_FILENAME", "darwin_bot.db")
+DB_PATH = os.path.join(DB_BASE_DIR, DB_FILENAME)
+
+# S'assurer que le répertoire existe (utile en local / premier run)
+try:
+    os.makedirs(DB_BASE_DIR, exist_ok=True)
+except Exception:
+    pass
 
 # -------- Connexion + pragmas sécu/perf --------
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    """
+    Connexion unique vers la base SQLite, stockée sur disque persistant
+    (par défaut /var/data/darwin_bot.db sur Render).
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     with conn:  # appliquer des pragmas sûrs
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
 
 # -------- Création / Migrations idempotentes --------
 def setup_database():
