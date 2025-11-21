@@ -183,20 +183,58 @@ def format_position_row(idx: int, pos: Dict[str, Any]) -> str:
 
 def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[float]) -> str:
     """Met en forme le message de rapport pour Telegram.
-    Si balance est None, tente de le récupérer automatiquement depuis la DB
-    (setting CURRENT_BALANCE_USDT).
-    """
-    # Tentative de récupération du solde en DB si non fourni
+    Si balance est None ou invalide, tente de le récupérer automatiquement (exchange puis DB)."""
+    # Normalisation de la valeur reçue
+    try:
+        if balance is not None:
+            balance = float(balance)
+    except Exception:
+        balance = None
+
+    # Tentative de récupération automatique du solde si non fourni / invalide
     if balance is None:
         try:
+            import trader
             import database
-            raw = database.get_setting("CURRENT_BALANCE_USDT", None)
-            if raw is not None and str(raw).strip() != "":
+
+            ex = None
+            live_balance: Optional[float] = None
+
+            # 1) Créer un exchange via main.create_exchange (pas dans trader)
+            try:
+                from main import create_exchange as _create_ex  # type: ignore
+                ex = _create_ex()
+            except Exception:
+                ex = None
+
+            # 2) Lire le solde actuel depuis l'exchange
+            if ex is not None:
                 try:
-                    balance = float(raw)
+                    if hasattr(trader, "get_portfolio_equity_usdt"):
+                        live_balance = float(trader.get_portfolio_equity_usdt(ex))  # type: ignore[attr-defined]
+                    else:
+                        live_balance = float(trader.get_usdt_balance(ex))  # type: ignore[attr-defined]
                 except Exception:
-                    balance = None
+                    live_balance = None
+
+            # 3) Fallback : dernière valeur connue en DB (CURRENT_BALANCE_USDT)
+            if live_balance is None:
+                try:
+                    raw = database.get_setting("CURRENT_BALANCE_USDT", None)
+                    if raw is not None:
+                        live_balance = float(raw)
+                except Exception:
+                    live_balance = None
+
+            if live_balance is not None:
+                balance = live_balance
+                # On mémorise au passage la dernière valeur correcte
+                try:
+                    database.set_setting("CURRENT_BALANCE_USDT", f"{balance:.2f}")
+                except Exception:
+                    pass
         except Exception:
+            # En cas de problème, on laisse balance à None pour afficher "non disponible"
             balance = None
 
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
