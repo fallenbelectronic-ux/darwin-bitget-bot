@@ -183,16 +183,20 @@ def format_position_row(idx: int, pos: Dict[str, Any]) -> str:
 
 def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[float]) -> str:
     """Met en forme le message de rapport pour Telegram.
-    Si balance est None, tente de la récupérer depuis la DB (CURRENT_BALANCE_USDT)."""
-    # Fallback DB si aucun solde fourni
+    Si balance est None, tente de le récupérer automatiquement depuis la DB
+    (setting CURRENT_BALANCE_USDT).
+    """
+    # Tentative de récupération du solde en DB si non fourni
     if balance is None:
         try:
             import database
             raw = database.get_setting("CURRENT_BALANCE_USDT", None)
-            if raw is not None:
-                balance = float(raw)
+            if raw is not None and str(raw).strip() != "":
+                try:
+                    balance = float(raw)
+                except Exception:
+                    balance = None
         except Exception:
-            # En cas de problème, on laisse balance à None pour afficher "non disponible"
             balance = None
 
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
