@@ -1,4 +1,4 @@
-    # Fichier: trader.py
+# Fichier: trader.py
 import os
 import time
 import ccxt
@@ -3103,82 +3103,26 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception:
                 pass
 
-
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
-    Retourne le solde USDT (compte swap) en float.
-    Utilise _fetch_balance_safe() (Bitget/Bybit) pour éviter les erreurs
-    de type 'productType cannot be empty'.
-    - Tente d'abord balance['total']['USDT'] puis 'free' puis objet-clé direct.
-    - Garde None si introuvable (pour laisser l'appelant afficher “non disponible”).
+    Retourne le solde / l'équity en USDT pour l'affichage des stats.
+    Utilise get_portfolio_equity_usdt(ex), qui est la même source
+    que celle utilisée pour les rapports programmés (quotidien/hebdo).
+    
+    Renvoie :
+      - float : equity USDT si disponible
+      - None  : en cas d'erreur, pour permettre l'affichage
+                “(non disponible)” côté interface.
     """
     try:
-        bal = _fetch_balance_safe(ex)
-        if not bal:
-            return None
+        equity = get_portfolio_equity_usdt(ex)
     except Exception:
         return None
 
-    candidates: List[Optional[float]] = []
-
-    # 1) Sections normalisées ccxt
-    for section in ("total", "free", "used"):
-        try:
-            sec = bal.get(section) or {}
-            for k in ("USDT", "USDT:USDT"):
-                v = sec.get(k)
-                if v is not None:
-                    try:
-                        candidates.append(float(v))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    # 2) Entrée directe par devise (certaines implémentations)
-    for k in ("USDT", "USDT:USDT"):
-        try:
-            coin = bal.get(k)
-            if isinstance(coin, dict):
-                for sub in ("total", "free"):
-                    v = coin.get(sub)
-                    if v is not None:
-                        try:
-                            candidates.append(float(v))
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    # 3) Fallback info brute (non bloquant)
     try:
-        info = bal.get("info") or {}
-        for path in (
-            ("USDT", "available"),
-            ("USDT", "total"),
-            ("USDT:USDT", "available"),
-            ("USDT:USDT", "total"),
-        ):
-            cur = info
-            for key in path:
-                if isinstance(cur, dict):
-                    cur = cur.get(key)
-                else:
-                    cur = None
-                    break
-            if cur is not None:
-                try:
-                    candidates.append(float(cur))
-                except Exception:
-                    pass
+        return float(equity)
     except Exception:
-        pass
-
-    # Choix du meilleur candidat
-    candidates = [c for c in candidates if isinstance(c, (int, float))]
-    if not candidates:
         return None
-    return float(max(candidates))
 
 def calculate_position_size(balance: float, risk_percent: float, entry_price: float, sl_price: float) -> float:
     """Calcule la quantité d'actifs à trader."""
