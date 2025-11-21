@@ -179,20 +179,26 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
             ex = None
             live_balance: Optional[float] = None
 
-            # 1) Essayer de créer une instance d'exchange et lire l'équity USDT
+            # 1) Essayer de créer une instance d'exchange
             try:
                 if hasattr(trader, "create_exchange"):
                     ex = trader.create_exchange()  # type: ignore[attr-defined]
             except Exception:
                 ex = None
 
-            if ex is not None and hasattr(trader, "get_portfolio_equity_usdt"):
+            # 2) Lire le solde via les helpers dispo dans trader
+            if ex is not None:
                 try:
-                    live_balance = float(trader.get_portfolio_equity_usdt(ex))  # type: ignore[attr-defined]
+                    if hasattr(trader, "get_portfolio_equity_usdt"):
+                        # Helper d'équity globale si présent
+                        live_balance = float(trader.get_portfolio_equity_usdt(ex))  # type: ignore[attr-defined]
+                    elif hasattr(trader, "get_usdt_balance"):
+                        # Fallback sur la fonction de solde USDT que tu utilises déjà
+                        live_balance = float(trader.get_usdt_balance(ex))  # type: ignore[attr-defined]
                 except Exception:
                     live_balance = None
 
-            # 2) Fallback : dernière valeur connue en DB (CURRENT_BALANCE_USDT)
+            # 3) Fallback : dernière valeur connue en DB (CURRENT_BALANCE_USDT)
             if live_balance is None:
                 try:
                     raw = database.get_setting("CURRENT_BALANCE_USDT", None)
@@ -201,6 +207,7 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
                 except Exception:
                     live_balance = None
 
+            # 4) Si on a réussi à récupérer quelque chose, on l'utilise
             if live_balance is not None:
                 balance = live_balance
         except Exception:
@@ -235,3 +242,4 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
     
     table = tabulate(table_data, headers=headers, tablefmt="simple")
     return f"{header}\n<pre>{table}</pre>"
+
