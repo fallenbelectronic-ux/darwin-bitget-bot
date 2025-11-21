@@ -2635,6 +2635,39 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[s
             pass
         return False, f"Erreur interne execute_trade: {e}"
 
+def _progress_to_tp(entry: float, tp: float, mark: float, is_long: bool) -> float:
+    """
+    Retourne la progression normalisée du prix entre l'entrée et le TP:
+      - 0.0  : encore loin de l'objectif
+      - 1.0+ : TP atteint ou dépassé
+    Utilisé pour activer / resserrer le trailing uniquement quand on 'accroche' le TP.
+    """
+    try:
+        entry = float(entry)
+        tp = float(tp)
+        mark = float(mark)
+    except Exception:
+        return 0.0
+
+    if entry <= 0 or tp <= 0:
+        return 0.0
+
+    if is_long:
+        # Long : progression (entry → tp)
+        if tp <= entry or mark <= entry:
+            return 0.0
+        if mark >= tp:
+            return 1.0
+        return max(0.0, min(1.0, (mark - entry) / (tp - entry)))
+    else:
+        # Short : progression (entry → tp) mais dans l'autre sens
+        if tp >= entry or mark >= entry:
+            return 0.0
+        if mark <= tp:
+            return 1.0
+        return max(0.0, min(1.0, (entry - mark) / (entry - tp)))
+
+
 def manage_open_positions(ex: ccxt.Exchange):
     """TP dynamique (tendance→BB80 opposée ; CT→BB20 up/lo) + Break-Even + Trailing live après BE.
     Règles BE:
@@ -2642,9 +2675,19 @@ def manage_open_positions(ex: ccxt.Exchange):
       • CT: BE autorisé même sans SPLIT.
       • Déclencheur BE: franchissement OU contact de la BB20_mid.
       • Prix BE: entry ajusté frais/buffer via compute_fee_safe_be_price().
-    Trailing:
-      • Actif uniquement après BE.
-      • Méthode pro mix: _compute_trailing_sl() (max(d%, k*ATR)) par rapport au mark price.
+    Trailing (MIS À JOUR):
+      • Actif uniquement APRÈS BE + lorsque le prix a déjà bien progressé vers le TP.
+      • Proximité TP mesurée par _progress_to_tp(entry, tp, mark, side).
+      • Deux zones:
+          - zone 'near TP' : trailing plus serré.
+          - zone 'ultra near TP' : trailing encore plus serré.
+      • Paramètres configurables via la DB:
+          - TRAIL_PROGRESS_ACTIVATION (def 0.60)
+          - TRAIL_PROGRESS_TIGHT      (def 0.85)
+          - TRAIL_NEAR_TP_PCT         (def 0.0020)
+          - TRAIL_NEAR_TP_ATR_K       (def 0.7)
+          - TRAIL_ULTRA_NEAR_TP_PCT   (def 0.0010)
+          - TRAIL_ULTRA_NEAR_TP_ATR_K (def 0.5)
       • Ne recule jamais le SL ; mise à jour live à chaque boucle.
       • Conserve le TP (les deux coexistent).
       • Si override manuel et FOLLOW_MANUAL_SL_WITH_TRAILING=true, on continue à suivre.
@@ -2766,7 +2809,7 @@ def manage_open_positions(ex: ccxt.Exchange):
             target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
             current_tp = float(pos['tp_price'])
-            # ✅ Correction : en LONG, un TP “qui se resserre” doit DESCENDRE ; en SHORT il doit MONTER.
+            # En LONG, un TP “qui se resserre” doit DESCENDRE ; en SHORT il doit MONTER.
             improve = (is_long and (target_tp < current_tp * (1.0 - tp_update_eps))) or \
                       ((not is_long) and (target_tp > current_tp * (1.0 + tp_update_eps)))
 
@@ -2804,8 +2847,8 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
                 if qty > 0:
-                    mark_now = _current_mark_price(ex, symbol)
-                    sl_price = _validate_sl_for_side(('buy' if is_long else 'sell'), float(sl_price), mark_now, tick_size)
+                    mark_now_tp = _current_mark_price(ex, symbol)
+                    sl_price = _validate_sl_for_side(('buy' if is_long else 'sell'), float(sl_price), mark_now_tp, tick_size)
 
                     ex.create_order(
                         symbol,
@@ -2888,11 +2931,11 @@ def manage_open_positions(ex: ccxt.Exchange):
             if improve_sl:
                 # Prix courant utilisé pour valider le SL et calculer un PnL indicatif pour la notif BE
                 try:
-                    mark_now = _current_mark_price(ex, symbol)
+                    mark_now_be = _current_mark_price(ex, symbol)
                 except Exception:
-                    mark_now = None
+                    mark_now_be = None
 
-                want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
+                want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now_be, tick_size)
                 try:
                     want_sl = float(ex.price_to_precision(symbol, want_sl))
                 except Exception:
@@ -2914,22 +2957,22 @@ def manage_open_positions(ex: ccxt.Exchange):
                     # 🔔 Notification BE au moment exact où le SL est déplacé à BE
                     try:
                         remaining_qty = float(qty)
-                        entry_price = float(pos.get('entry_price') or 0.0)
+                        entry_price_be = float(pos.get('entry_price') or 0.0)
 
-                        curr = mark_now
+                        curr = mark_now_be
                         if curr is None:
                             try:
                                 curr = _current_mark_price(ex, symbol)
                             except Exception:
                                 curr = None
 
-                        if curr is None or entry_price <= 0 or remaining_qty <= 0:
+                        if curr is None or entry_price_be <= 0 or remaining_qty <= 0:
                             pnl_realised = 0.0
                         else:
                             if is_long:
-                                pnl_realised = max(0.0, (curr - entry_price) * remaining_qty)
+                                pnl_realised = max(0.0, (curr - entry_price_be) * remaining_qty)
                             else:
-                                pnl_realised = max(0.0, (entry_price - curr) * remaining_qty)
+                                pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
 
                         notifier.send_breakeven_notification(
                             symbol=symbol,
@@ -2942,8 +2985,9 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-        # 5) Trailing après BE actif
+        # 5) Trailing après BE actif (MIS À JOUR: conditionné par la proximité du TP)
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
+            # Seuils minimums de mouvement avant mise à jour du SL
             try:
                 min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))      # 0.10%
             except Exception:
@@ -2954,17 +2998,90 @@ def manage_open_positions(ex: ccxt.Exchange):
                 min_move_atr_k = 0.25
 
             mark_now = _current_mark_price(ex, symbol)
-            want_sl = _compute_trailing_sl(mark_now, ('buy' if is_long else 'sell'), last_atr)
 
+            # Progression vers le TP (0 = loin, 1 = au TP)
+            try:
+                tp_pos = float(pos.get('tp_price') or 0.0)
+                entry_px = float(pos.get('entry_price') or 0.0)
+            except Exception:
+                tp_pos, entry_px = 0.0, 0.0
+
+            progress = _progress_to_tp(entry_px, tp_pos, mark_now, is_long)
+
+            # Seuils de progression pour activer / resserrer le trailing
+            try:
+                act_prog = float(database.get_setting('TRAIL_PROGRESS_ACTIVATION', 0.60))
+            except Exception:
+                act_prog = 0.60
+            try:
+                tight_prog = float(database.get_setting('TRAIL_PROGRESS_TIGHT', 0.85))
+            except Exception:
+                tight_prog = 0.85
+
+            # Tant qu'on est loin du TP → on laisse respirer le prix : pas de trailing
+            if progress < act_prog:
+                continue
+
+            # Paramètres de distance (base / near / ultra-near) — tous configurables
+            try:
+                base_pct = float(database.get_setting('TRAIL_PCT', 0.0035))
+            except Exception:
+                base_pct = 0.0035
+            try:
+                base_k = float(database.get_setting('TRAIL_ATR_K', 1.0))
+            except Exception:
+                base_k = 1.0
+            try:
+                near_pct = float(database.get_setting('TRAIL_NEAR_TP_PCT', 0.0020))
+            except Exception:
+                near_pct = 0.0020
+            try:
+                near_k = float(database.get_setting('TRAIL_NEAR_TP_ATR_K', 0.7))
+            except Exception:
+                near_k = 0.7
+            try:
+                ultra_pct = float(database.get_setting('TRAIL_ULTRA_NEAR_TP_PCT', 0.0010))
+            except Exception:
+                ultra_pct = 0.0010
+            try:
+                ultra_k = float(database.get_setting('TRAIL_ULTRA_NEAR_TP_ATR_K', 0.5))
+            except Exception:
+                ultra_k = 0.5
+
+            # Choix du régime de trailing selon la proximité du TP
+            d_pct = base_pct
+            k_atr = base_k
+            if progress >= tight_prog:
+                # Très proche du TP → trailing très serré
+                d_pct = ultra_pct
+                k_atr = ultra_k
+            elif progress >= act_prog:
+                # Proche du TP → trailing intermédiaire
+                d_pct = near_pct
+                k_atr = near_k
+
+            # Distance en prix = max(d% du mark, k*ATR)
+            dist_pct = abs(d_pct) * mark_now
+            dist_atr = abs(k_atr) * last_atr
+            dist = max(dist_pct, dist_atr)
+
+            if is_long:
+                want_sl = max(0.0, mark_now - dist)
+            else:
+                want_sl = max(0.0, mark_now + dist)
+
+            # Ne jamais reculer le SL
             if is_long and want_sl <= sl_current:
                 continue
             if (not is_long) and want_sl >= sl_current:
                 continue
 
+            # Filtre de mouvement minimal pour éviter les micro-ajustements
             min_move_abs = max(min_move_pct * mark_now, min_move_atr_k * last_atr)
             if abs(want_sl - sl_current) < max(min_move_abs, tick_size):
                 continue
 
+            # Validations Bitget + arrondis
             want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
             try:
                 want_sl = float(ex.price_to_precision(symbol, want_sl))
@@ -2985,7 +3102,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 pos['breakeven_status'] = 'ACTIVE'
             except Exception:
                 pass
-
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
