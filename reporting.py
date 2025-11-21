@@ -166,8 +166,47 @@ def format_position_row(idx: int, pos: Dict[str, Any]) -> str:
     return f"{header}\n{line1}\n{line2}\n{line3}"
 
 
+
 def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[float]) -> str:
-    """Met en forme le message de rapport pour Telegram."""
+    """Met en forme le message de rapport pour Telegram.
+    Si balance est None, tente de le récupérer automatiquement (exchange puis DB)."""
+    # Tentative de récupération automatique du solde si non fourni
+    if balance is None:
+        try:
+            import trader  # import local pour éviter de casser les autres modules
+            import database
+
+            ex = None
+            live_balance: Optional[float] = None
+
+            # 1) Essayer de créer une instance d'exchange et lire l'équity USDT
+            try:
+                if hasattr(trader, "create_exchange"):
+                    ex = trader.create_exchange()  # type: ignore[attr-defined]
+            except Exception:
+                ex = None
+
+            if ex is not None and hasattr(trader, "get_portfolio_equity_usdt"):
+                try:
+                    live_balance = float(trader.get_portfolio_equity_usdt(ex))  # type: ignore[attr-defined]
+                except Exception:
+                    live_balance = None
+
+            # 2) Fallback : dernière valeur connue en DB (CURRENT_BALANCE_USDT)
+            if live_balance is None:
+                try:
+                    raw = database.get_setting("CURRENT_BALANCE_USDT", None)
+                    if raw is not None:
+                        live_balance = float(raw)
+                except Exception:
+                    live_balance = None
+
+            if live_balance is not None:
+                balance = live_balance
+        except Exception:
+            # En cas de problème, on laisse balance à None pour afficher "non disponible"
+            pass
+
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
     header = f"<b>{title}</b>\n\n💰 <b>Solde Actuel:</b> {balance_str}\n"
     
