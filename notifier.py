@@ -24,13 +24,31 @@ def tg_send(text: str, reply_markup: Optional[Dict] = None, chat_id: Optional[st
     target_chat_id = chat_id or TG_CHAT_ID
     if not TG_TOKEN or not target_chat_id:
         return
+
+    # --- Filtre des alertes bruyantes à masquer ---
+    # (ex: "⚠️ Exécution du meilleur signal non aboutie: Rejeté: séquence contre-tendance BB20+BB80 non conforme.")
     try:
-        payload = {"chat_id": target_chat_id, "text": text, "parse_mode": "HTML"}
+        txt = str(text) if text is not None else ""
+    except Exception:
+        txt = "" if text is None else f"{text}"
+
+    blocked_substrings = (
+        "Exécution du meilleur signal non aboutie",
+        "séquence contre-tendance BB20+BB80 non conforme",
+    )
+    for pattern in blocked_substrings:
+        if pattern in txt:
+            # On ignore complètement ce message
+            return
+
+    try:
+        payload = {"chat_id": target_chat_id, "text": txt, "parse_mode": "HTML"}
         if reply_markup:
             payload['reply_markup'] = reply_markup
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"Erreur d'envoi Telegram: {e}")
+
 
 def tg_edit_message_text(text: str, chat_id: str, message_id: int, reply_markup: Optional[Dict] = None):
     if not TG_TOKEN or not chat_id or not message_id:
