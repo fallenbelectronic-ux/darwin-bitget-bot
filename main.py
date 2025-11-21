@@ -523,10 +523,21 @@ def process_callback_query(callback_query: Dict):
         elif data == 'get_stats':
             ex = create_exchange()
             balance = trader.get_usdt_balance(ex)
-            try:
-                database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
-            except Exception:
-                pass
+
+            # Sauvegarde si solde valide, sinon fallback sur la dernière valeur connue
+            if balance is not None:
+                try:
+                    database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    raw = database.get_setting('CURRENT_BALANCE_USDT', None)
+                    if raw is not None:
+                        balance = float(raw)
+                except Exception:
+                    balance = None
+
             trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)
             notifier.send_report("📊 Bilan Hebdomadaire (7 derniers jours)", trades, balance)
 
@@ -588,7 +599,6 @@ def process_callback_query(callback_query: Dict):
         print(f"Erreur lors du traitement du callback '{data}': {e}")
         notifier.tg_send_error(f"Commande '{data}'", "Une erreur inattendue est survenue.")
 
-
         
 def process_message(message: Dict):
     """Gère les commandes textuelles pour les actions non couvertes par les boutons."""
@@ -635,10 +645,21 @@ def process_message(message: Dict):
     elif command == "/stats":
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
-        try:
-            database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
-        except Exception:
-            pass
+
+        # Sauvegarde si solde valide, sinon fallback sur la dernière valeur connue
+        if balance is not None:
+            try:
+                database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
+            except Exception:
+                pass
+        else:
+            try:
+                raw = database.get_setting('CURRENT_BALANCE_USDT', None)
+                if raw is not None:
+                    balance = float(raw)
+            except Exception:
+                balance = None
+
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
 
@@ -657,16 +678,45 @@ def check_scheduled_reports():
         if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
             _last_daily_report_day = now.day
             trades = database.get_closed_trades_since(int(time.time()) - 86400)  # 24 heures
-            balance = trader.get_usdt_balance(create_exchange())
+
+            ex = create_exchange()
+            balance = trader.get_usdt_balance(ex)
+            if balance is not None:
+                try:
+                    database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    raw = database.get_setting('CURRENT_BALANCE_USDT', None)
+                    if raw is not None:
+                        balance = float(raw)
+                except Exception:
+                    balance = None
+
             notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
 
         # Rapport hebdomadaire (dimanche = 6 en Europe/Lisbon par défaut)
         if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
             _last_weekly_report_day = now.day
             trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)  # 7 jours
-            balance = trader.get_usdt_balance(create_exchange())
-            notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
 
+            ex = create_exchange()
+            balance = trader.get_usdt_balance(ex)
+            if balance is not None:
+                try:
+                    database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    raw = database.get_setting('CURRENT_BALANCE_USDT', None)
+                    if raw is not None:
+                        balance = float(raw)
+                except Exception:
+                    balance = None
+
+            notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
 
 # ==============================================================================
 # BOUCLES ET MAIN
