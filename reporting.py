@@ -169,50 +169,17 @@ def format_position_row(idx: int, pos: Dict[str, Any]) -> str:
 
 def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[float]) -> str:
     """Met en forme le message de rapport pour Telegram.
-    Si balance est None, tente de le récupérer automatiquement (exchange puis DB)."""
-    # Tentative de récupération automatique du solde si non fourni
+    Si balance est None, tente de la récupérer depuis la DB (CURRENT_BALANCE_USDT)."""
+    # Fallback DB si aucun solde fourni
     if balance is None:
         try:
-            import trader  # import local pour éviter de casser les autres modules
             import database
-
-            ex = None
-            live_balance: Optional[float] = None
-
-            # 1) Essayer de créer une instance d'exchange
-            try:
-                if hasattr(trader, "create_exchange"):
-                    ex = trader.create_exchange()  # type: ignore[attr-defined]
-            except Exception:
-                ex = None
-
-            # 2) Lire le solde via les helpers dispo dans trader
-            if ex is not None:
-                try:
-                    if hasattr(trader, "get_portfolio_equity_usdt"):
-                        # Helper d'équity globale si présent
-                        live_balance = float(trader.get_portfolio_equity_usdt(ex))  # type: ignore[attr-defined]
-                    elif hasattr(trader, "get_usdt_balance"):
-                        # Fallback sur la fonction de solde USDT que tu utilises déjà
-                        live_balance = float(trader.get_usdt_balance(ex))  # type: ignore[attr-defined]
-                except Exception:
-                    live_balance = None
-
-            # 3) Fallback : dernière valeur connue en DB (CURRENT_BALANCE_USDT)
-            if live_balance is None:
-                try:
-                    raw = database.get_setting("CURRENT_BALANCE_USDT", None)
-                    if raw is not None:
-                        live_balance = float(raw)
-                except Exception:
-                    live_balance = None
-
-            # 4) Si on a réussi à récupérer quelque chose, on l'utilise
-            if live_balance is not None:
-                balance = live_balance
+            raw = database.get_setting("CURRENT_BALANCE_USDT", None)
+            if raw is not None:
+                balance = float(raw)
         except Exception:
             # En cas de problème, on laisse balance à None pour afficher "non disponible"
-            pass
+            balance = None
 
     balance_str = f"<code>{balance:.2f} USDT</code>" if balance is not None else "<i>(non disponible)</i>"
     header = f"<b>{title}</b>\n\n💰 <b>Solde Actuel:</b> {balance_str}\n"
@@ -242,4 +209,3 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
     
     table = tabulate(table_data, headers=headers, tablefmt="simple")
     return f"{header}\n<pre>{table}</pre>"
-
