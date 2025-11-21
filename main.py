@@ -677,46 +677,29 @@ def check_scheduled_reports():
         # Rapport quotidien
         if now.hour == REPORT_HOUR and now.day != _last_daily_report_day:
             _last_daily_report_day = now.day
-            trades = database.get_closed_trades_since(int(time.time()) - 86400)  # 24 heures
-
             ex = create_exchange()
             balance = trader.get_usdt_balance(ex)
-            if balance is not None:
-                try:
+            try:
+                if balance is not None:
                     database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
-                except Exception:
-                    pass
-            else:
-                try:
-                    raw = database.get_setting('CURRENT_BALANCE_USDT', None)
-                    if raw is not None:
-                        balance = float(raw)
-                except Exception:
-                    balance = None
-
+            except Exception:
+                pass
+            trades = database.get_closed_trades_since(int(time.time()) - 86400)  # 24 heures
             notifier.send_report("📊 Bilan Quotidien (24h)", trades, balance)
 
         # Rapport hebdomadaire (dimanche = 6 en Europe/Lisbon par défaut)
         if now.weekday() == REPORT_WEEKDAY and now.hour == REPORT_HOUR and now.day != _last_weekly_report_day:
             _last_weekly_report_day = now.day
-            trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)  # 7 jours
-
             ex = create_exchange()
             balance = trader.get_usdt_balance(ex)
-            if balance is not None:
-                try:
+            try:
+                if balance is not None:
                     database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
-                except Exception:
-                    pass
-            else:
-                try:
-                    raw = database.get_setting('CURRENT_BALANCE_USDT', None)
-                    if raw is not None:
-                        balance = float(raw)
-                except Exception:
-                    balance = None
-
+            except Exception:
+                pass
+            trades = database.get_closed_trades_since(int(time.time()) - 7 * 86400)  # 7 jours
             notifier.send_report("🗓️ Bilan Hebdomadaire", trades, balance)
+
 
 # ==============================================================================
 # BOUCLES ET MAIN
