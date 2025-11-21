@@ -2700,10 +2700,14 @@ def manage_open_positions(ex: ccxt.Exchange):
         # Sécu context Bitget
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            try: ex.set_margin_mode('cross', symbol)
-            except Exception: pass
-            try: ex.set_position_mode(False, symbol)
-            except Exception: pass
+            try:
+                ex.set_margin_mode('cross', symbol)
+            except Exception:
+                pass
+            try:
+                ex.set_position_mode(False, symbol)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2778,15 +2782,19 @@ def manage_open_positions(ex: ccxt.Exchange):
                     gap_pct = 0.0003
 
                 sl_price = float(pos.get('sl_price') or pos['entry_price'])
-                if is_long and sl_price >= last_px: sl_price = last_px * (1.0 - gap_pct)
-                if (not is_long) and sl_price <= last_px: sl_price = last_px * (1.0 + gap_pct)
+                if is_long and sl_price >= last_px:
+                    sl_price = last_px * (1.0 - gap_pct)
+                if (not is_long) and sl_price <= last_px:
+                    sl_price = last_px * (1.0 + gap_pct)
 
                 try:
                     side_for_tp = ('buy' if is_long else 'sell')
                     target_tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(target_tp))
                 except Exception:
-                    if is_long and target_tp <= last_px: target_tp = last_px * (1.0 + gap_pct)
-                    if (not is_long) and target_tp >= last_px: target_tp = last_px * (1.0 - gap_pct)
+                    if is_long and target_tp <= last_px:
+                        target_tp = last_px * (1.0 + gap_pct)
+                    if (not is_long) and target_tp >= last_px:
+                        target_tp = last_px * (1.0 - gap_pct)
 
                 qty = float(pos['quantity'])
                 try:
@@ -2799,10 +2807,22 @@ def manage_open_positions(ex: ccxt.Exchange):
                     mark_now = _current_mark_price(ex, symbol)
                     sl_price = _validate_sl_for_side(('buy' if is_long else 'sell'), float(sl_price), mark_now, tick_size)
 
-                    ex.create_order(symbol, 'market', close_side, qty, price=None,
-                                    params={**common_params, 'stopLossPrice': float(sl_price), 'triggerType': 'mark'})
-                    ex.create_order(symbol, 'market', close_side, qty, price=None,
-                                    params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'})
+                    ex.create_order(
+                        symbol,
+                        'market',
+                        close_side,
+                        qty,
+                        price=None,
+                        params={**common_params, 'stopLossPrice': float(sl_price), 'triggerType': 'mark'}
+                    )
+                    ex.create_order(
+                        symbol,
+                        'market',
+                        close_side,
+                        qty,
+                        price=None,
+                        params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'}
+                    )
                     try:
                         database.update_trade_tp(pos['id'], float(target_tp))
                     except Exception:
@@ -2831,8 +2851,10 @@ def manage_open_positions(ex: ccxt.Exchange):
             if (not is_long) and (float(last['low']) <= bb20_mid):
                 be_trigger = True
         except Exception:
-            if is_long and last_close >= bb20_mid: be_trigger = True
-            if (not is_long) and last_close <= bb20_mid: be_trigger = True
+            if is_long and last_close >= bb20_mid:
+                be_trigger = True
+            if (not is_long) and last_close <= bb20_mid:
+                be_trigger = True
 
         # 3) Prix BE (frais + buffer)
         try:
@@ -2864,18 +2886,59 @@ def manage_open_positions(ex: ccxt.Exchange):
             want_sl = be_price_theo
             improve_sl = (is_long and want_sl > sl_current) or ((not is_long) and want_sl < sl_current)
             if improve_sl:
-                mark_now = _current_mark_price(ex, symbol)
+                # Prix courant utilisé pour valider le SL et calculer un PnL indicatif pour la notif BE
+                try:
+                    mark_now = _current_mark_price(ex, symbol)
+                except Exception:
+                    mark_now = None
+
                 want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
                 try:
                     want_sl = float(ex.price_to_precision(symbol, want_sl))
                 except Exception:
                     pass
-                ex.create_order(symbol, 'market', close_side, qty, price=None,
-                                params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'})
+
+                ex.create_order(
+                    symbol,
+                    'market',
+                    close_side,
+                    qty,
+                    price=None,
+                    params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
+                )
                 try:
                     database.update_trade_to_breakeven(pos['id'], float(qty), float(want_sl))
                     sl_current = float(want_sl)
                     be_armed = True
+
+                    # 🔔 Notification BE au moment exact où le SL est déplacé à BE
+                    try:
+                        remaining_qty = float(qty)
+                        entry_price = float(pos.get('entry_price') or 0.0)
+
+                        curr = mark_now
+                        if curr is None:
+                            try:
+                                curr = _current_mark_price(ex, symbol)
+                            except Exception:
+                                curr = None
+
+                        if curr is None or entry_price <= 0 or remaining_qty <= 0:
+                            pnl_realised = 0.0
+                        else:
+                            if is_long:
+                                pnl_realised = max(0.0, (curr - entry_price) * remaining_qty)
+                            else:
+                                pnl_realised = max(0.0, (entry_price - curr) * remaining_qty)
+
+                        notifier.send_breakeven_notification(
+                            symbol=symbol,
+                            pnl_realised=float(pnl_realised),
+                            remaining_qty=float(remaining_qty)
+                        )
+                    except Exception:
+                        # On ne bloque jamais la gestion du trade sur un problème de notification
+                        pass
                 except Exception:
                     pass
 
@@ -2893,7 +2956,7 @@ def manage_open_positions(ex: ccxt.Exchange):
             mark_now = _current_mark_price(ex, symbol)
             want_sl = _compute_trailing_sl(mark_now, ('buy' if is_long else 'sell'), last_atr)
 
-            if is_long and want_sl <= sl_current: 
+            if is_long and want_sl <= sl_current:
                 continue
             if (not is_long) and want_sl >= sl_current:
                 continue
@@ -2908,14 +2971,21 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception:
                 pass
 
-            ex.create_order(symbol, 'market', close_side, qty, price=None,
-                            params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'})
+            ex.create_order(
+                symbol,
+                'market',
+                close_side,
+                qty,
+                price=None,
+                params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
+            )
             try:
                 database.update_trade_sl(pos['id'], float(want_sl))
                 pos['sl_price'] = float(want_sl)
                 pos['breakeven_status'] = 'ACTIVE'
             except Exception:
                 pass
+
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
