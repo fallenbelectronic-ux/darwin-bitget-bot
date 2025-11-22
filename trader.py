@@ -2727,9 +2727,17 @@ def manage_open_positions(ex: ccxt.Exchange):
         try:
             real_qty = float(live_map.get(symbol, 0.0))
             if real_qty <= 0:
+                # 👉 Position réellement flat : on ferme en DB ET on annule tous les ordres restants (TP/SL/BE).
+                try:
+                    _cancel_all_orders_safe(ex, symbol)
+                except Exception:
+                    pass
                 try:
                     database.close_trade(pos['id'], status='CLOSED_BY_EXCHANGE', pnl=0.0)
-                    notifier.tg_send(f"✅ Fermeture auto (exchange) détectée sur {symbol} — Trade #{pos['id']} clôturé en DB.")
+                    notifier.tg_send(
+                        f"✅ Fermeture auto (exchange) détectée sur {symbol} — "
+                        f"Trade #{pos['id']} clôturé en DB et ordres annulés."
+                    )
                 except Exception:
                     pass
                 continue
@@ -3222,7 +3230,10 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
-    """(MODIFIÉ) Clôture manuelle robuste : utilise create_market_order_smart() pour BUY et SELL."""
+    """(MODIFIÉ) Clôture manuelle robuste :
+    - utilise create_market_order_smart() pour BUY et SELL
+    - annule tous les ordres restants (TP/SL/BE) sur le symbole après fermeture.
+    """
     _ensure_bitget_mix_options(ex)
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     trade = database.get_trade_by_id(trade_id)
@@ -3237,10 +3248,14 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         # Contexte marge/levier/position
         try:
             ex.set_leverage(LEVERAGE, symbol)
-            try: ex.set_margin_mode('cross', symbol)
-            except Exception: pass
-            try: ex.set_position_mode(False, symbol)
-            except Exception: pass
+            try:
+                ex.set_margin_mode('cross', symbol)
+            except Exception:
+                pass
+            try:
+                ex.set_position_mode(False, symbol)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -3255,9 +3270,11 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         try:
             positions = _fetch_positions_safe(ex, [symbol])
             for p in positions:
-                same = (p.get('symbol') == symbol) or (market and p.get('info', {}).get('symbol') == market.get('id'))
+                same = (p.get('symbol') == symbol) or (market and p.get('raw', {}).get('symbol') == market.get('id'))
                 if same:
-                    contracts = float(p.get('contracts') or p.get('positionAmt') or 0.0)
+                    # ⚠️ On lit d'abord 'size' (rempli par _fetch_positions_safe), puis fallback
+                    contracts = float(p.get('size') or p.get('contracts') or p.get('positionAmt') or 0.0)
+                    contracts = abs(contracts)
                     if contracts and contracts > 0:
                         real_qty = contracts
                         break
@@ -3265,8 +3282,16 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             pass
 
         if real_qty <= 0:
+            # Pas de position réelle → on ferme en DB et on nettoie les ordres éventuels par sécurité
+            try:
+                _cancel_all_orders_safe(ex, symbol)
+            except Exception:
+                pass
             database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
-            return notifier.tg_send(f"ℹ️ Aucune position ouverte détectée pour {symbol}. Trade #{trade_id} marqué fermé.")
+            return notifier.tg_send(
+                f"ℹ️ Aucune position ouverte détectée pour {symbol}. "
+                f"Trade #{trade_id} marqué fermé et ordres annulés."
+            )
 
         qty_to_close = min(qty_db, real_qty)
         try:
@@ -3274,8 +3299,15 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
         except Exception:
             pass
         if qty_to_close <= 0:
+            try:
+                _cancel_all_orders_safe(ex, symbol)
+            except Exception:
+                pass
             database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
-            return notifier.tg_send(f"ℹ️ Quantité nulle à clôturer sur {symbol}. Trade #{trade_id} marqué fermé.")
+            return notifier.tg_send(
+                f"ℹ️ Quantité nulle à clôturer sur {symbol}. "
+                f"Trade #{trade_id} marqué fermé et ordres annulés."
+            )
 
         if not is_paper_mode:
             close_side = 'sell' if side == 'buy' else 'buy'
@@ -3293,9 +3325,21 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
                 ex, symbol, close_side, qty_to_close, ref_price=ref_px, params=params
             )
 
+            # 🧹 Après fermeture de la position, on enlève tous les ordres restants (TP/SL/BE)
+            try:
+                _cancel_all_orders_safe(ex, symbol)
+            except Exception:
+                pass
+
+        else:
+            # En mode papier, on ne touche pas l'exchange, mais on peut tout de même nettoyer les ordres
+            try:
+                _cancel_all_orders_safe(ex, symbol)
+            except Exception:
+                pass
+
         database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
         notifier.tg_send(f"✅ Position sur {symbol} (Trade #{trade_id}) fermée manuellement (qty={qty_to_close}).")
 
     except Exception as e:
         notifier.tg_send_error(f"Fermeture manuelle de {symbol}", e)
-
