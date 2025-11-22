@@ -10,6 +10,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
     - Si df est None : fetch auto via utils.fetch_and_prepare_df
     - Utilise BB20 / BB80 déjà présents dans df
     - Affiche un bloc vert/rouge type 'position' (TP / SL autour de l'entrée)
+      dont la zone commence SUR la bougie d'entrée.
     - Marque les bougies de contact / réaction / entrée par des traits
       verticaux + labels (si infos présentes dans `signal`).
     """
@@ -99,7 +100,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             mpf.make_addplot(df['bb80_mid'].iloc[seg], color=col_blue, linestyle='--', width=1.2),
         ]
 
-        # Petits helpers internes
+        # Helpers pour récupérer prix et positions de bougies
         def _get_price(keys) -> Optional[float]:
             for k in keys:
                 try:
@@ -116,11 +117,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
 
         def _resolve_bar_position(base_key: str) -> Optional[int]:
             """Retourne la position (0..len(df_plot)-1) de la bougie
-            base_key (contact / reaction / entry) si possible.
-            Supporte:
-              - <base_key>_index / _idx / _bar : index sur le DF complet
-              - <base_key>_ts / _time / _timestamp : datetime ou epoch ms/s
-            """
+            base_key (contact / reaction / entry) si possible."""
             # 1) Index sur DF complet
             idx_keys = [f"{base_key}_index", f"{base_key}_idx", f"{base_key}_bar"]
             for k in idx_keys:
@@ -193,7 +190,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
         if entry_price is not None and sl_price is not None and tp_price is not None:
             xlims = ax.get_xlim()
 
-            # position de la bougie d'entrée dans df_plot (pour centrer la box)
+            # position de la bougie d'entrée dans df_plot (pour aligner le début de la box)
             entry_pos = _resolve_bar_position('entry')
             if entry_pos is not None and 0 <= entry_pos < len(df_plot):
                 entry_dt = df_plot.index[entry_pos]
@@ -203,9 +200,10 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
                 else:
                     step_days = (xlims[1] - xlims[0]) * 0.2
                 box_width = step_days * 6.0
-                x0 = entry_num - step_days * 1.5
+                # 👉 la zone commence EXACTEMENT sur la bougie d'entrée
+                x0 = entry_num
             else:
-                # fallback : box au milieu du graphe
+                # fallback : box au milieu du graphe si on ne peut pas résoudre la bougie d'entrée
                 span = xlims[1] - xlims[0]
                 x0 = xlims[0] + span * 0.3
                 box_width = span * 0.4
@@ -270,9 +268,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             if pos is None or pos < 0 or pos >= len(df_plot):
                 continue
             x_dt = df_plot.index[pos]
-            # trait vertical
             ax.axvline(x_dt, color=color, linestyle='--', linewidth=1.1, alpha=0.95)
-            # label près du haut du graphe
             y_text = y_max - 0.04 * y_range * (label_idx + 1)
             ax.text(
                 x_dt,
