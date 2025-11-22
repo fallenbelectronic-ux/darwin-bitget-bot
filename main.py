@@ -493,13 +493,15 @@ def process_callback_query(callback_query: Dict):
 
     try:
         if data == 'pause':
-            with _lock: _paused = True
+            with _lock:
+                _paused = True
             notifier.tg_send("⏸️ Bot mis en pause.")
             database.set_setting('PAUSED', 'true')
             notifier.send_main_menu(_paused)
 
         elif data == 'resume':
-            with _lock: _paused = False
+            with _lock:
+                _paused = False
             notifier.tg_send("▶️ Bot relancé.")
             database.set_setting('PAUSED', 'false')
             notifier.send_main_menu(_paused)
@@ -509,14 +511,24 @@ def process_callback_query(callback_query: Dict):
 
         elif data == 'list_positions':
             try:
-                ex = create_exchange()
-                trader.sync_positions_with_exchange(ex)
-                try:
-                    exchange_positions = ex.fetch_positions()
-                except Exception:
-                    exchange_positions = []
+                # 1) Affichage IMMÉDIAT des positions connues en DB
                 db_positions = database.get_open_positions()
-                notifier.format_synced_open_positions(exchange_positions, db_positions)
+                # On passe une liste vide pour les positions exchange : affichage centré DB, ultra rapide
+                notifier.format_synced_open_positions([], db_positions)
+
+                # 2) Rafraîchissement silencieux en arrière-plan pour la prochaine consultation
+                def _refresh_positions():
+                    try:
+                        ex_local = create_exchange()
+                        trader.sync_positions_with_exchange(ex_local)
+                    except Exception as e:
+                        try:
+                            notifier.tg_send_error("Sync positions (refresh async)", e)
+                        except Exception:
+                            pass
+
+                threading.Thread(target=_refresh_positions, daemon=True).start()
+
             except Exception as e:
                 notifier.tg_send_error("Sync positions (manual view)", e)
 
