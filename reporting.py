@@ -5,36 +5,57 @@ import numpy as np
 import math 
 
 def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Calcule les statistiques de performance à partir d'une liste de trades."""
+    """Calcule les statistiques de performance à partir d'une liste de trades.
+    - Utilise 'pnl' (USDT) et 'pnl_percent' (%).
+    - Si 'pnl_percent' est manquant, il est recalculé à la volée:
+        pnl_percent = pnl / (entry_price * quantity) * 100
+    """
     total_trades = len(trades)
     if total_trades < 1:
         return {"total_trades": 0}
 
-    # Récupération des séries
-    # - on NE filtre PLUS sur 'is not None' : les valeurs manquantes sont traitées comme 0.0
-    pnls = np.array(
-        [
-            float(t.get('pnl') if t.get('pnl') is not None else 0.0)
-            for t in trades
-        ],
-        dtype=float
-    )
-    pnl_percents = np.array(
-        [
-            float(t.get('pnl_percent') if t.get('pnl_percent') is not None else 0.0)
-            for t in trades
-        ],
-        dtype=float
-    )
+    # Série des PnL en USDT (None -> 0.0)
+    pnls_list = []
+    for t in trades:
+        try:
+            v = t.get('pnl', 0.0)
+            pnls_list.append(float(v if v is not None else 0.0))
+        except Exception:
+            pnls_list.append(0.0)
+    pnls = np.array(pnls_list, dtype=float)
 
-    effective_trades = int(pnls.size)  # doit être == total_trades
+    # Série des PnL en % (DB ou recalcul à la volée)
+    pnl_percents_list = []
+    for t in trades:
+        raw_pct = t.get('pnl_percent', None)
+
+        if raw_pct is None:
+            # Fallback: on essaie de recalculer à partir de pnl / (entry_price * quantity)
+            try:
+                pnl_val = float(t.get('pnl') or 0.0)
+                entry_price = float(t.get('entry_price') or 0.0)
+                quantity = float(t.get('quantity') or 0.0)
+                notional = abs(entry_price * quantity)
+                if notional > 0.0:
+                    raw_pct = (pnl_val / notional) * 100.0
+                else:
+                    raw_pct = 0.0
+            except Exception:
+                raw_pct = 0.0
+
+        try:
+            pnl_percents_list.append(float(raw_pct if raw_pct is not None else 0.0))
+        except Exception:
+            pnl_percents_list.append(0.0)
+
+    pnl_percents = np.array(pnl_percents_list, dtype=float)
+
+    effective_trades = int(pnls.size)
     if effective_trades < 1:
-        # sécurité au cas où, mais normalement on ne passe ici que si trades == []
         return {"total_trades": 0, "nb_wins": 0, "nb_losses": 0}
 
     wins = pnls[pnls > 0.0]
     losses = pnls[pnls < 0.0]
-    # breakeven = pnls[pnls == 0.0]
 
     nb_wins = int(wins.size)
     nb_losses = int(losses.size)
@@ -43,7 +64,7 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     gross_profit = float(np.sum(wins)) if wins.size else 0.0
     gross_loss = abs(float(np.sum(losses))) if losses.size else 0.0  # positif
 
-    # Winrate (les BE restent dans le dénominateur des trades effectivement renseignés)
+    # Winrate sur tous les trades considérés (BE inclus dans le dénominateur)
     win_rate = (nb_wins / effective_trades) * 100.0 if effective_trades else 0.0
 
     # Profit Factor robuste
@@ -54,7 +75,7 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0.0 else 0.0
 
-    # Gain moyen par trade (%)
+    # Gain moyen par trade en %
     avg_trade_pnl_percent = float(np.mean(pnl_percents)) if pnl_percents.size > 0 else 0.0
 
     # Sharpe approx par trade: mean/std * sqrt(n). Protège variance nulle et n<2.
