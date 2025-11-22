@@ -2754,6 +2754,69 @@ def manage_open_positions(ex: ccxt.Exchange):
     if not open_positions:
         return
 
+    # --- Sélection d'un trade ACTIF par symbole (le plus récent) ---
+    # Objectif: éviter que des anciens trades (ex: #10) continuent à être gérés
+    # alors qu'un nouveau trade (#14) est ouvert sur le même symbole.
+    latest_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for p in open_positions:
+        sym = p.get('symbol')
+        if not sym:
+            continue
+        try:
+            cur_ts = int(p.get('open_timestamp') or 0)
+        except Exception:
+            cur_ts = 0
+        try:
+            cur_id = int(p.get('id') or 0)
+        except Exception:
+            cur_id = 0
+        ref = latest_by_symbol.get(sym)
+        if ref is None:
+            latest_by_symbol[sym] = p
+        else:
+            try:
+                ref_ts = int(ref.get('open_timestamp') or 0)
+            except Exception:
+                ref_ts = 0
+            try:
+                ref_id = int(ref.get('id') or 0)
+            except Exception:
+                ref_id = 0
+            # On garde le trade le plus récent (timestamp puis id comme tie-breaker)
+            if (cur_ts, cur_id) > (ref_ts, ref_id):
+                latest_by_symbol[sym] = p
+
+    latest_id_by_symbol: Dict[str, int] = {}
+    for sym, row in latest_by_symbol.items():
+        try:
+            latest_id_by_symbol[sym] = int(row.get('id') or 0)
+        except Exception:
+            continue
+
+    # On filtre: on ne gère plus que le trade actif par symbole.
+    # Les éventuels doublons ouverts sont marqués fermés en DB, sans toucher aux ordres exchange.
+    filtered_positions: List[Dict[str, Any]] = []
+    for p in open_positions:
+        sym = p.get('symbol')
+        if not sym:
+            continue
+        try:
+            pid = int(p.get('id') or 0)
+        except Exception:
+            pid = 0
+        active_id = latest_id_by_symbol.get(sym)
+        if active_id is not None and pid != active_id:
+            try:
+                database.close_trade(pid, status='STALE_DUPLICATE', pnl=0.0)
+            except Exception:
+                pass
+            continue
+        filtered_positions.append(p)
+
+    open_positions = filtered_positions
+    if not open_positions:
+        return
+
     # Carte des positions réelles (pour fermer en DB si plus ouvertes)
     try:
         symbols = list({p['symbol'] for p in open_positions})
@@ -2794,6 +2857,14 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         is_long = (pos['side'] == 'buy')
         close_side = 'sell' if is_long else 'buy'
+
+        # 🔒 IMPORTANT : ne PAS gérer en automatique les positions importées / reprises manuellement
+        # Regime 'Importé' (ou variantes) = suivi uniquement informatif, sans BE, sans trailing, sans TP dynamique.
+        regime_raw = pos.get('regime', 'Tendance')
+        if isinstance(regime_raw, str) and regime_raw.lower().startswith('import'):
+            # On laisse la position telle quelle : le trader garde la main (TP/SL manuels).
+            continue
+
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
         # Sécu context Bitget
@@ -3158,6 +3229,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 pos['breakeven_status'] = 'ACTIVE'
             except Exception:
                 pass
+
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
