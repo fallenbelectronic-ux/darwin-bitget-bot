@@ -367,17 +367,65 @@ def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: 
     print(f"DB: Trade #{trade_id} mis à breakeven. Quantité restante: {remaining_quantity}")
 
 def close_trade(trade_id: int, status: str, pnl: float):
-    """Ferme un trade (status: CLOSED / CLOSED_MANUAL / ERROR...)."""
-    close_ts = int(time.time())
+    """Ferme un trade (status: CLOSED / CLOSED_MANUAL / ERROR...).
+    - Met à jour: status, pnl (USDT), pnl_percent (% sur le notional d'entrée), close_timestamp.
+    - pnl_percent est calculé comme: pnl / (entry_price * quantity) * 100.
+    """
+    import time as _t
+    close_ts = int(_t.time())
+
     with get_db_connection() as conn:
         cur = conn.cursor()
+
+        # Récupération des infos nécessaires pour calculer le % (entry_price * quantity)
+        try:
+            row = cur.execute(
+                "SELECT entry_price, quantity FROM trades WHERE id = ?",
+                (int(trade_id),)
+            ).fetchone()
+        except Exception:
+            row = None
+
+        pnl_val = float(pnl or 0.0)
+        pnl_pct = 0.0
+        if row is not None:
+            try:
+                # sqlite3.Row supporte l'accès par clé
+                entry_price = float(row["entry_price"])
+            except Exception:
+                try:
+                    entry_price = float(row[0])
+                except Exception:
+                    entry_price = 0.0
+            try:
+                quantity = float(row["quantity"])
+            except Exception:
+                try:
+                    quantity = float(row[1])
+                except Exception:
+                    quantity = 0.0
+
+            notional = abs(entry_price * quantity)
+            if notional > 0.0:
+                pnl_pct = (pnl_val / notional) * 100.0
+            else:
+                pnl_pct = 0.0
+
+        # Mise à jour du trade avec statut, pnl, pnl_percent et timestamp de clôture
         cur.execute("""
             UPDATE trades
-               SET status = ?, pnl = ?, close_timestamp = ?
+               SET status = ?,
+                   pnl = ?,
+                   pnl_percent = ?,
+                   close_timestamp = ?
              WHERE id = ?
-        """, (status, pnl, close_ts, trade_id))
+        """, (str(status), float(pnl_val), float(pnl_pct), int(close_ts), int(trade_id)))
         conn.commit()
-    print(f"DB: Trade #{trade_id} fermé avec le statut '{status}'.")
+
+    print(
+        f"DB: Trade #{trade_id} fermé avec le statut '{status}'. "
+        f"PnL={pnl_val:.4f} USDT, PnL%={pnl_pct:.4f}%."
+    )
 
 def update_trade_tp(trade_id: int, new_tp_price: float):
     """Met à jour le TP."""
