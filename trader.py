@@ -1847,19 +1847,105 @@ def _fetch_balance_safe(exchange):
 
 
 
+
 def get_portfolio_equity_usdt(exchange) -> float:
     """
-    Renvoie l'équity totale convertie en USDT pour l'affichage statistiques.
-    Actuellement, on aligne cette valeur sur ce que renvoie get_usdt_balance(),
-    afin d'éviter les écarts entre 'equity' et 'available' côté Bitget.
+    Renvoie l'équity totale convertie en USDT pour l'affichage/statistiques.
+    - Bitget: privilégie les champs usdtEquity / totalEquity / equity dans info.data.
+    - Fallback: utilise les champs normalisés CCXT (USDT total/free, etc.).
+    Met systématiquement à jour settings.CURRENT_BALANCE_USDT si une valeur cohérente est trouvée.
     """
     try:
-        val = get_usdt_balance(exchange)
-        if val is None:
-            return 0.0
-        return float(val)
+        bal = _fetch_balance_safe(exchange)
     except Exception:
         return 0.0
+
+    if not bal:
+        return 0.0
+
+    from typing import List
+    candidates: List[float] = []
+
+    # --- Cas spécifique Bitget : on privilégie l'équity portefeuille ---
+    try:
+        if getattr(exchange, "id", "") == "bitget":
+            info = bal.get("info") or {}
+            data = info.get("data") or info.get("result") or {}
+
+            # data dict: certains endpoints renvoient un seul bloc
+            if isinstance(data, dict):
+                for key in ("usdtEquity", "totalEquity", "equity"):
+                    v = data.get(key)
+                    if v is not None:
+                        try:
+                            candidates.append(float(v))
+                        except Exception:
+                            pass
+
+            # data list: plusieurs comptes / coins
+            elif isinstance(data, list):
+                total_usdt_equity = 0.0
+                for acc in data:
+                    try:
+                        mc = str(acc.get("marginCoin") or acc.get("marginCoinName") or "").upper()
+                    except Exception:
+                        mc = ""
+                    # si marginCoin est renseigné, on garde uniquement les comptes USDT
+                    if mc and "USDT" not in mc:
+                        continue
+                    v = acc.get("usdtEquity") or acc.get("totalEquity") or acc.get("equity")
+                    if v is None:
+                        continue
+                    try:
+                        total_usdt_equity += float(v)
+                    except Exception:
+                        continue
+                if total_usdt_equity > 0:
+                    candidates.append(total_usdt_equity)
+    except Exception:
+        # on ne casse jamais la fonction sur une bizarrerie de payload
+        pass
+
+    # --- Fallback générique CCXT (USDT total/free/used) ---
+    try:
+        usdt = bal.get("USDT") or bal.get("USDT:USDT")
+        if isinstance(usdt, dict):
+            for key in ("total", "free", "used", "availableBalance", "available"):
+                v = usdt.get(key)
+                if v is not None:
+                    try:
+                        candidates.append(float(v))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # total['USDT'] / total['USDT:USDT']
+    try:
+        total = bal.get("total") or {}
+        if isinstance(total, dict):
+            for k in ("USDT", "USDT:USDT"):
+                v = total.get(k)
+                if v is not None:
+                    try:
+                        candidates.append(float(v))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if not candidates:
+        return 0.0
+
+    equity = float(max(candidates))
+
+    # Mémorisation dans settings pour réutilisation (reporting, dashboard…)
+    try:
+        database.set_setting("CURRENT_BALANCE_USDT", f"{equity:.6f}")
+    except Exception:
+        pass
+
+    return equity
 
 def _cap_qty_for_margin_and_filters(exchange, symbol: str, side: str, qty: float, price: float) -> Tuple[float, Dict[str, Any]]:
     """
@@ -3075,160 +3161,71 @@ def manage_open_positions(ex: ccxt.Exchange):
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
-    Retourne le solde USDT (compte swap) en float.
-    Utilise _fetch_balance_safe() (Bitget/Bybit) pour éviter les erreurs
-    de type 'productType cannot be empty'.
-
-    Priorité des sources (pour éviter de surévaluer le solde) :
-      1) 'free' / 'available' / 'availableBalance' (ce que tu peux réellement utiliser)
-      2) 'total'
-      3) 'equity' / 'usdtEquity' (dernier recours seulement)
-
-    Met à jour settings.CURRENT_BALANCE_USDT si trouvé.
+    Retourne le solde USDT (équity portefeuille) en float.
+    - Préfère get_portfolio_equity_usdt() pour Bitget/Bybit (équity globale).
+    - Fallback sur diverses clés de fetch_balance() si nécessaire.
+    - Met à jour settings.CURRENT_BALANCE_USDT si une valeur est trouvée.
     """
+    # 1) Source principale : équity globale (Bitget/Bybit, etc.)
+    equity = 0.0
+    try:
+        equity = float(get_portfolio_equity_usdt(ex))
+    except Exception:
+        equity = 0.0
+
+    if equity > 0.0:
+        try:
+            database.set_setting("CURRENT_BALANCE_USDT", f"{equity:.6f}")
+        except Exception:
+            pass
+        return equity
+
+    # 2) Fallback direct sur la structure de balance CCXT
     try:
         bal = _fetch_balance_safe(ex)
-        if not bal:
-            return None
     except Exception:
+        bal = None
+
+    if not bal:
         return None
 
-    available_vals: List[float] = []
-    total_vals: List[float] = []
-    equity_vals: List[float] = []
+    candidates: List[float] = []
 
-    # 1) Sections normalisées ccxt (free / total / used)
-    try:
-        for section_name in ("free", "total", "used"):
-            sec = bal.get(section_name) or {}
-            if not isinstance(sec, dict):
-                continue
-            for k in ("USDT", "USDT:USDT"):
-                v = sec.get(k)
-                if v is None:
-                    continue
-                try:
-                    fv = float(v)
-                except Exception:
-                    continue
-                if section_name == "free":
-                    available_vals.append(fv)
-                elif section_name == "total":
-                    total_vals.append(fv)
-    except Exception:
-        pass
-
-    # 2) Entrée directe par devise (bal["USDT"] / bal["USDT:USDT"])
-    try:
-        for key in ("USDT", "USDT:USDT"):
-            coin = bal.get(key)
-            if not isinstance(coin, dict):
-                continue
-
-            # Disponible en priorité
-            for subkey in ("free", "availableBalance", "available"):
-                v = coin.get(subkey)
-                if v is not None:
-                    try:
-                        available_vals.append(float(v))
-                    except Exception:
-                        pass
-
-            # Total en second recours
-            v_tot = coin.get("total")
-            if v_tot is not None:
-                try:
-                    total_vals.append(float(v_tot))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 3) Fallback info brute générique (si la structure est plus exotique)
-    try:
-        info = bal.get("info") or {}
-        if isinstance(info, dict):
-            # chemins du type info["USDT"]["available"] etc.
-            for path, target_list in (
-                (("USDT", "available"),        available_vals),
-                (("USDT", "availableBalance"), available_vals),
-                (("USDT", "free"),             available_vals),
-                (("USDT", "total"),            total_vals),
-                (("USDT:USDT", "available"),        available_vals),
-                (("USDT:USDT", "availableBalance"), available_vals),
-                (("USDT:USDT", "free"),             available_vals),
-                (("USDT:USDT", "total"),            total_vals),
-            ):
-                cur = info
-                for key in path:
-                    if isinstance(cur, dict):
-                        cur = cur.get(key)
-                    else:
-                        cur = None
-                        break
-                if cur is not None:
-                    try:
-                        val = float(cur)
-                        target_list.append(val)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    # 4) Fallback spécifique Bitget : equity / usdtEquity en DERNIER recours
-    try:
-        if getattr(ex, "id", "") == "bitget":
-            info = bal.get("info") or {}
-            data = info.get("data", None)
-            if isinstance(data, list):
-                for acc in data:
-                    # equity / usdtEquity → on les place dans la liste "equity_vals"
-                    v = acc.get("usdtEquity") or acc.get("equity")
+    # Sections normalisées: total / free / used
+    for section in ("total", "free", "used"):
+        try:
+            sec = bal.get(section) or {}
+            if isinstance(sec, dict):
+                for k in ("USDT", "USDT:USDT"):
+                    v = sec.get(k)
                     if v is not None:
                         try:
-                            equity_vals.append(float(v))
+                            candidates.append(float(v))
                         except Exception:
                             pass
-                    # disponible si présent (availableBalance / available)
-                    for sk in ("availableBalance", "available", "free"):
-                        sv = acc.get(sk)
-                        if sv is not None:
-                            try:
-                                available_vals.append(float(sv))
-                            except Exception:
-                                pass
-            elif isinstance(data, dict):
-                v_eq = data.get("usdtEquity") or data.get("equity")
-                if v_eq is not None:
-                    try:
-                        equity_vals.append(float(v_eq))
-                    except Exception:
-                        pass
-                for sk in ("availableBalance", "available", "free"):
-                    sv = data.get(sk)
-                    if sv is not None:
+        except Exception:
+            pass
+
+    # Entrées directes par devise (bal['USDT'], bal['USDT:USDT'])
+    for k in ("USDT", "USDT:USDT"):
+        try:
+            coin = bal.get(k)
+            if isinstance(coin, dict):
+                for sub in ("total", "free", "availableBalance", "available"):
+                    v = coin.get(sub)
+                    if v is not None:
                         try:
-                            available_vals.append(float(sv))
+                            candidates.append(float(v))
                         except Exception:
                             pass
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # Choix du meilleur candidat suivant la priorité:
-    chosen: Optional[float] = None
-    if available_vals:
-        chosen = max(available_vals)
-    elif total_vals:
-        chosen = max(total_vals)
-    elif equity_vals:
-        chosen = max(equity_vals)
-
-    if chosen is None:
+    if not candidates:
         return None
 
-    balance_usdt = float(chosen)
+    balance_usdt = float(max(candidates))
 
-    # Mémorisation dans settings pour stats/reporting
     try:
         database.set_setting("CURRENT_BALANCE_USDT", f"{balance_usdt:.6f}")
     except Exception:
