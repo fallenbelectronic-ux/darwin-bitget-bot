@@ -820,6 +820,15 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             if is_paused:
                 print("   -> (Pause)"); time.sleep(LOOP_DELAY); continue
 
+            # 🔄 Mise à jour du solde / équity USDT à chaque boucle
+            try:
+                live_equity = float(trader.get_portfolio_equity_usdt(ex))
+                if live_equity > 0.0:
+                    database.set_setting('CURRENT_BALANCE_USDT', f"{live_equity:.6f}")
+            except Exception:
+                # On ne casse jamais la boucle de trading si la lecture du solde échoue
+                pass
+
             now_utc = datetime.now(timezone.utc)
             curr_hour = now_utc.hour
             curr_day = now_utc.day
