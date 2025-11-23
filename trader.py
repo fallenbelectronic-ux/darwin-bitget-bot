@@ -2624,19 +2624,40 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[s
         if df is None or len(df) < 3:
             return False, "DF indisponible ou trop court pour exécuter."
 
-        # 3) Politique d’entrée (next bar vs live ticker)
+        # 3) Politique d’entrée (next bar vs live ticker) + indices pour le chart
         try:
             enforce_next_bar = str(database.get_setting('CT_ENTRY_ON_NEXT_BAR', 'true')).lower() == 'true'
         except Exception:
             enforce_next_bar = True
 
+        n = len(df)
+        entry_index: Optional[int] = None
+        reaction_index: Optional[int] = None
+
+        if n >= 1:
+            if enforce_next_bar and n >= 2:
+                # Bougie d’entrée = dernière, bougie de réaction = précédante
+                entry_index = n - 1
+                reaction_index = n - 2
+            else:
+                # Entrée sur la bougie courante (pas de next-bar strict)
+                entry_index = n - 1
+                reaction_index = n - 1
+
         entry_price: float = 0.0
-        if enforce_next_bar:
-            # Entrée stricte: OPEN de la bougie courante (proxy du “next bar open” en live)
+        if enforce_next_bar and entry_index is not None:
+            # Entrée stricte: OPEN de la bougie d’entrée (proxy du “next bar open” en live)
             try:
-                entry_price = float(df.iloc[-1].get('open', 0.0))
+                entry_price = float(df.iloc[entry_index].get('open', 0.0))
             except Exception:
                 entry_price = 0.0
+        else:
+            # Entrée sur la clôture de la bougie d’entrée
+            if entry_index is not None:
+                try:
+                    entry_price = float(df.iloc[entry_index].get('close', 0.0))
+                except Exception:
+                    entry_price = 0.0
 
         # Fallback sur ticker si nécessaire
         if not entry_price or entry_price <= 0.0:
@@ -2656,6 +2677,30 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[s
 
         if entry_price <= 0.0:
             return False, "Impossible d’estimer un prix d’entrée."
+
+        # 3.bis) Indices pour le graphique : contact / réaction / entrée
+        try:
+            contact_idx = _find_contact_index(df, base_exclude_last=True, max_lookback=5)
+        except Exception:
+            contact_idx = None
+
+        try:
+            if contact_idx is not None:
+                signal["contact_index"] = int(contact_idx)
+        except Exception:
+            pass
+
+        try:
+            if reaction_index is not None:
+                signal["reaction_index"] = int(reaction_index)
+        except Exception:
+            pass
+
+        try:
+            if entry_index is not None:
+                signal["entry_index"] = int(entry_index)
+        except Exception:
+            pass
 
         # 4) Normalisations minimales du signal
         if not signal.get("ts"):
@@ -2682,6 +2727,7 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[s
         except Exception:
             pass
         return False, f"Erreur interne execute_trade: {e}"
+
 
 def _progress_to_tp(entry: float, tp: float, mark: float, is_long: bool) -> float:
     """
