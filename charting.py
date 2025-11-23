@@ -10,9 +10,9 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
     - Si df est None : fetch auto via utils.fetch_and_prepare_df
     - Utilise BB20 / BB80 déjà présents dans df
     - Affiche un bloc vert/rouge type 'position' (TP / SL autour de l'entrée)
-      dont la zone commence SUR la bougie d'entrée.
+      dont la zone commence SUR la bougie d'entrée et s'étend vers l'avant.
     - Marque les bougies de contact / réaction / entrée par des traits
-      verticaux + labels (si infos présentes dans `signal`).
+      verticaux + labels avec flèches.
     """
     try:
         import os
@@ -188,34 +188,40 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
         tp_price    = _get_price(['tp', 'tp_price', 'take_profit'])
 
         if entry_price is not None and sl_price is not None and tp_price is not None:
-            xlims = ax.get_xlim()
-
-            # position de la bougie d'entrée dans df_plot (pour aligner le début de la box)
+            # position de la bougie d'entrée dans df_plot
             entry_pos = _resolve_bar_position('entry')
+
+            # Limites X actuelles
+            x_left, x_right = ax.get_xlim()
+
+            # Largeur d’une bougie (en jours)
+            if len(df_plot) > 1:
+                step_days = (df_plot.index[1] - df_plot.index[0]).total_seconds() / 86400.0
+                if step_days <= 0:
+                    step_days = (x_right - x_left) / max(len(df_plot), 1)
+            else:
+                step_days = (x_right - x_left) / 20.0
+
+            # Bougie d’entrée → point de départ de la zone
             if entry_pos is not None and 0 <= entry_pos < len(df_plot):
-                entry_dt = df_plot.index[entry_pos]
+                entry_dt  = df_plot.index[entry_pos]
                 entry_num = mdates.date2num(entry_dt)
-                if len(df_plot) > 1:
-                    step_days = (df_plot.index[1] - df_plot.index[0]).total_seconds() / 86400.0
-                else:
-                    step_days = (xlims[1] - xlims[0]) * 0.2
-                box_width = step_days * 6.0
-                # 👉 la zone commence EXACTEMENT sur la bougie d'entrée
                 x0 = entry_num
             else:
-                # fallback : box au milieu du graphe si on ne peut pas résoudre la bougie d'entrée
-                span = xlims[1] - xlims[0]
-                x0 = xlims[0] + span * 0.3
-                box_width = span * 0.4
+                # Fallback : début à 30% du graphe
+                x0 = x_left + (x_right - x_left) * 0.3
 
+            # La zone s'étend jusqu'à la fin du graphe (+1 bougie)
+            x_end = x_right + step_days
+            box_width = x_end - x0
             if box_width <= 0:
-                box_width = (xlims[1] - xlims[0]) * 0.3
+                box_width = step_days * 5
 
             def _add_box(y1: float, y2: float, color: str, alpha: float) -> None:
                 if y1 is None or y2 is None:
                     return
                 y_bottom = min(y1, y2)
-                height = abs(y2 - y1)
+                height   = abs(y2 - y1)
                 if height <= 0:
                     return
                 rect = Rectangle(
@@ -225,31 +231,30 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
                     facecolor=color,
                     edgecolor=color,
                     alpha=alpha,
-                    linewidth=1.0
+                    linewidth=1.0,
+                    zorder=1
                 )
                 ax.add_patch(rect)
 
-            # long / short : ordre des zones
+            # Long ou short
             if tp_price > entry_price:
                 # LONG
-                _add_box(entry_price, tp_price, '#22c55e', 0.16)   # zone profit
-                _add_box(sl_price, entry_price, '#ef4444', 0.18)   # zone risque
+                _add_box(entry_price, tp_price, '#22c55e', 0.16)   # profit
+                _add_box(sl_price, entry_price, '#ef4444', 0.18)   # perte
             else:
                 # SHORT
-                _add_box(tp_price, entry_price, '#22c55e', 0.16)   # zone profit
-                _add_box(entry_price, sl_price, '#ef4444', 0.18)   # zone risque
+                _add_box(tp_price, entry_price, '#22c55e', 0.16)   # profit
+                _add_box(entry_price, sl_price, '#ef4444', 0.18)   # perte
 
-            # petites lignes internes SL / Entry / TP (limitées à la box)
-            for val, color in (
-                (sl_price, '#ef4444'),
-                (entry_price, '#60a5fa'),
-                (tp_price, '#22c55e'),
-            ):
-                if val is None:
-                    continue
-                ax.hlines(val, x0, x0 + box_width, colors=color, linewidth=1.0, alpha=0.95)
+            # Lignes SL / Entry / TP (sur toute la longueur de la zone)
+            try:
+                ax.hlines(sl_price,    x0, x_end, colors='#ef4444', linewidth=1.0)
+                ax.hlines(entry_price, x0, x_end, colors='#60a5fa', linewidth=1.0)
+                ax.hlines(tp_price,    x0, x_end, colors='#22c55e', linewidth=1.0)
+            except Exception:
+                pass
 
-        # 9) Marqueurs verticaux : bougies de contact / réaction / entrée
+        # 9) Marqueurs verticaux + flèches : bougies de contact / réaction / entrée
         y_min, y_max = ax.get_ylim()
         y_range = max(y_max - y_min, 1e-9)
 
@@ -268,16 +273,34 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             if pos is None or pos < 0 or pos >= len(df_plot):
                 continue
             x_dt = df_plot.index[pos]
+
+            # Ligne verticale
             ax.axvline(x_dt, color=color, linestyle='--', linewidth=1.1, alpha=0.95)
+
+            # Niveau de la bougie (haut de chandelier pour la flèche)
+            try:
+                row = df_plot.iloc[pos]
+                y_candle = float(row['High'])
+            except Exception:
+                y_candle = y_max - 0.2 * y_range
+
+            # Position du texte au-dessus + flèche vers la bougie
             y_text = y_max - 0.04 * y_range * (label_idx + 1)
-            ax.text(
-                x_dt,
-                y_text,
+            ax.annotate(
                 name,
+                xy=(x_dt, y_candle),
+                xytext=(x_dt, y_text),
                 color=color,
                 fontsize=9,
                 ha='center',
                 va='top',
+                arrowprops=dict(
+                    arrowstyle='->',
+                    color=color,
+                    linewidth=1.0,
+                    shrinkA=0,
+                    shrinkB=2
+                ),
                 bbox=dict(facecolor='#020617', edgecolor='none', alpha=0.7, pad=1.5)
             )
             label_idx += 1
