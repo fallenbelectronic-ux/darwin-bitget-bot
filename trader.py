@@ -901,7 +901,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     c2 = df.iloc[contact_idx + 1] if (contact_idx + 1) < len(df) else None
     c3 = df.iloc[contact_idx + 2] if (contact_idx + 2) < len(df) else None
 
-    # Détermination finale du sens MM80
+    # Détermination finale du sens MM80 (vague précédente si dead-zone)
     if in_dead_zone and prev_wave in ('up', 'down'):
         is_above_mm80 = (prev_wave == 'up')
     else:
@@ -1001,8 +1001,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     touched_bb20_low  = utils.touched_or_crossed(c1['low'],  c1['high'], c1['bb20_lo'], "buy")
     touched_bb20_high = utils.touched_or_crossed(c1['low'],  c1['high'], c1['bb20_up'], "sell")
 
-    # --- TENDANCE ---
-    if (float(last['close']) > float(last['bb80_mid'])) and touched_bb20_low and trend_reintegration_ok:
+    # --- TENDANCE (corrigé : utilise is_above_mm80 / vague précédente) ---
+    if is_above_mm80 and touched_bb20_low and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
         # SL depuis bougie 1 (contact) + offset hybride
@@ -1024,7 +1024,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if rr_final >= MIN_RR:
                 signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
 
-    elif (float(last['close']) <= float(last['bb80_mid'])) and touched_bb20_high and trend_reintegration_ok:
+    elif (not is_above_mm80) and touched_bb20_high and trend_reintegration_ok:
         regime = "Tendance"
         entry = entry_px_for_rr
         sl = float(_sl_from_contact_candle(c1, 'sell', atr_contact))
@@ -1113,6 +1113,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return signal
 
     return None
+
 
 def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
     """
