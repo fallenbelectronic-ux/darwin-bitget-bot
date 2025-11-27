@@ -3173,11 +3173,12 @@ def manage_open_positions(ex: ccxt.Exchange):
             be_price_theo = float(pos['entry_price'])
 
         sl_current = float(pos.get('sl_price') or pos['entry_price'])
-        be_armed = False
+        # ⚠️ Mémorise le statut BE actuel pour éviter de re-notifier plusieurs fois
         try:
-            be_armed = (str(pos.get('breakeven_status', '')).upper() == 'ACTIVE')
+            prev_be_status = str(pos.get('breakeven_status', '')).upper()
         except Exception:
-            be_armed = False
+            prev_be_status = ''
+        be_armed = (prev_be_status == 'ACTIVE')
 
         try:
             qty = float(ex.amount_to_precision(symbol, float(pos['quantity'])))
@@ -3214,33 +3215,35 @@ def manage_open_positions(ex: ccxt.Exchange):
                     be_armed = True
 
                     # 🔔 Notification BE au moment exact où le SL est déplacé à BE
-                    try:
-                        remaining_qty = float(qty)
-                        entry_price_be = float(pos.get('entry_price') or 0.0)
+                    #    → envoyée UNE SEULE FOIS par trade (si pas déjà en statut ACTIVE auparavant)
+                    if prev_be_status != 'ACTIVE':
+                        try:
+                            remaining_qty = float(qty)
+                            entry_price_be = float(pos.get('entry_price') or 0.0)
 
-                        curr = mark_now_be
-                        if curr is None:
-                            try:
-                                curr = _current_mark_price(ex, symbol)
-                            except Exception:
-                                curr = None
+                            curr = mark_now_be
+                            if curr is None:
+                                try:
+                                    curr = _current_mark_price(ex, symbol)
+                                except Exception:
+                                    curr = None
 
-                        if curr is None or entry_price_be <= 0 or remaining_qty <= 0:
-                            pnl_realised = 0.0
-                        else:
-                            if is_long:
-                                pnl_realised = max(0.0, (curr - entry_price_be) * remaining_qty)
+                            if curr is None or entry_price_be <= 0 or remaining_qty <= 0:
+                                pnl_realised = 0.0
                             else:
-                                pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
+                                if is_long:
+                                    pnl_realised = max(0.0, (curr - entry_price_be) * remaining_qty)
+                                else:
+                                    pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
 
-                        notifier.send_breakeven_notification(
-                            symbol=symbol,
-                            pnl_realised=float(pnl_realised),
-                            remaining_qty=float(remaining_qty)
-                        )
-                    except Exception:
-                        # On ne bloque jamais la gestion du trade sur un problème de notification
-                        pass
+                            notifier.send_breakeven_notification(
+                                symbol=symbol,
+                                pnl_realised=float(pnl_realised),
+                                remaining_qty=float(remaining_qty)
+                            )
+                        except Exception:
+                            # On ne bloque jamais la gestion du trade sur un problème de notification
+                            pass
                 except Exception:
                     pass
 
