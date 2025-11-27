@@ -1365,9 +1365,41 @@ def _stats_keyboard(active: str = "24h") -> Dict:
     }
 
 def tg_show_stats(period: str = "24h"):
+    """
+    Affiche les stats + envoie un graphique equity automatiquement.
+    """
+    # 1) texte des stats
     text = _render_stats_period(period)
     kb = _stats_keyboard(period)
     edit_main(text, kb)
+
+    # 2) Récupérer les trades fermés depuis la DB
+    try:
+        if period == "7d":
+            since = int(time.time()) - 7 * 24 * 3600
+        elif period == "30d":
+            since = int(time.time()) - 30 * 24 * 3600
+        elif period == "all":
+            since = 0
+        else:
+            since = int(time.time()) - 24 * 3600
+
+        trades = database.get_closed_trades_since(since)
+        if not trades and since > 0:
+            trades = database.get_closed_trades_since(since * 1000)
+    except Exception:
+        trades = []
+
+    # 3) Construire historique equity
+    history = reporting.build_equity_history(trades)
+
+    # 4) Générer graphique
+    img = reporting.generate_equity_chart(history)
+
+    # 5) Envoyer image si dispo
+    if img is not None:
+        tg_send_with_photo(img, caption="📈 Évolution du Portefeuille")
+
 
 def tg_show_positions():
     """
