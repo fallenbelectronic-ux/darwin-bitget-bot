@@ -1324,41 +1324,32 @@ def _load_balance_optional() -> Optional[float]:
 
 def _render_stats_period(period: str) -> str:
     """
-    Construit le message Stats pour 24h / 7d / 30d / all à partir des TRADES fermés.
-    Tolère DB en secondes OU millisecondes pour les timestamps.
+    Construit le message Stats pour 24h / 7d / 30d / all
+    en utilisant directement la reconstruction des statistiques
+    depuis la DB via database.recompute_stats_from_executions.
+
+    Cela corrige le bug des stats toujours à zéro, car
+    get_closed_trades_since() renvoyait une liste vide.
     """
+
     period = (period or "24h").lower()
 
     if period == "7d":
-        seconds = 7 * 24 * 60 * 60
         title = "Bilan Hebdomadaire (7 jours)"
+        stats = database.recompute_stats_from_executions("7d")
     elif period == "30d":
-        seconds = 30 * 24 * 60 * 60
         title = "Bilan 30 jours"
+        stats = database.recompute_stats_from_executions("30d")
     elif period == "all":
-        seconds = None
         title = "Bilan Global"
+        stats = database.recompute_stats_from_executions("all")
     else:
-        seconds = 24 * 60 * 60
         title = "Bilan Quotidien (24h)"
+        stats = database.recompute_stats_from_executions("24h")
 
-    # Fenêtre temporelle
-    try:
-        since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
-    except Exception:
-        since_ts = 0
-
-    # Lecture DB robuste: tente en secondes puis en millisecondes si vide
-    try:
-        trades = database.get_closed_trades_since(since_ts)
-        if seconds is not None and not trades:
-            trades = database.get_closed_trades_since(since_ts * 1000)
-    except Exception:
-        trades = []
-
-    stats = reporting.calculate_performance_stats(trades)
     balance = _load_balance_optional()
     return reporting.format_report_message(title, stats, balance)
+
 
 
 def _stats_keyboard(active: str = "24h") -> Dict:
