@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from tabulate import tabulate
 import numpy as np
 import math 
+import io
 
 def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Calcule les statistiques de performance à partir d'une liste de trades.
@@ -327,7 +328,7 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
     return history
 
 
-def generate_equity_chart(history: List[tuple]) -> Optional[Any]:
+def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     """
     Génère un graphique PNG (fond sombre) montrant l'évolution de l'equity.
     history = [(timestamp_sec, equity), ...]
