@@ -327,7 +327,7 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
     return history
 
 
-def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
+def generate_equity_chart(history: List[tuple]) -> Optional[Any]:
     """
     Génère un graphique PNG (fond sombre) montrant l'évolution de l'equity.
     history = [(timestamp_sec, equity), ...]
@@ -364,3 +364,4 @@ def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     except Exception as e:
         print(f"[generate_equity_chart] erreur: {e}")
         return None
+
