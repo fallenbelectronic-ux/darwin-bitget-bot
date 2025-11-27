@@ -290,3 +290,77 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
     
     table = tabulate(table_data, headers=headers, tablefmt="simple")
     return f"{header}\n<pre>{table}</pre>"
+
+
+def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
+    """
+    Construit l'historique equity en cumulant les PNL des trades fermés.
+    Retourne une liste triée de tuples: (timestamp, equity).
+    """
+    history = []
+    equity = 0.0
+
+    # tri par timestamp
+    try:
+        trades_sorted = sorted(trades, key=lambda t: float(t.get("close_timestamp", 0)))
+    except Exception:
+        trades_sorted = trades
+
+    for t in trades_sorted:
+        try:
+            pnl = float(t.get("pnl", 0.0) or 0.0)
+        except Exception:
+            pnl = 0.0
+
+        try:
+            ts = float(t.get("close_timestamp") or t.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+
+        # corriger format si millisecondes
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+
+        equity += pnl
+        history.append((ts, equity))
+
+    return history
+
+
+def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
+    """
+    Génère un graphique PNG (fond sombre) montrant l'évolution de l'equity.
+    history = [(timestamp_sec, equity), ...]
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        if not history:
+            return None
+
+        ts = [h[0] for h in history]
+        eq = [h[1] for h in history]
+
+        plt.style.use("dark_background")
+        fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
+
+        ax.plot(ts, eq, linestyle='-', linewidth=1.8)
+
+        ax.set_title("Évolution du Portefeuille (Equity)", fontsize=12)
+        ax.set_xlabel("Temps")
+        ax.set_ylabel("Equity (USDT)")
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+        fig.autofmt_xdate()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    except Exception as e:
+        print(f"[generate_equity_chart] erreur: {e}")
+        return None
+
