@@ -643,6 +643,66 @@ def _sl_from_contact_candle(contact: pd.Series, side: str, atr_contact: Optional
         except Exception:
             return 0.0
 
+def _is_first_after_prolonged_bb80_exit(
+    df: pd.DataFrame,
+    is_long: bool,
+    min_streak: int = 5,
+    lookback: int = 50
+) -> bool:
+    """
+    Détecte si la DERNIÈRE bougie est la PREMIÈRE clôture revenue à l'intérieur du canal BB80
+    après une séquence de `min_streak` clôtures consécutives en dehors.
+    
+    - is_long = True  : on regarde les excès SOUS bb80_lo (sortie basse prolongée) – protège les longs.
+    - is_long = False : on regarde les excès AU-DESSUS de bb80_up – protège les shorts.
+    
+    Utilisé comme gate pour ignorer le premier trade après excès prolongé (tendance et CT).
+    """
+    if df is None or len(df) < min_streak + 1:
+        return False
+
+    try:
+        tail = df.iloc[-min(len(df), lookback):].copy()
+    except Exception:
+        return False
+
+    if len(tail) < min_streak + 1:
+        return False
+
+    outside_streak = 0
+    first_inside_after_prolonged_idx = None
+
+    for idx, row in enumerate(tail.itertuples()):
+        try:
+            close = float(row.close)
+            bb80_lo = float(row.bb80_lo)
+            bb80_up = float(row.bb80_up)
+        except Exception:
+            outside = False
+            inside = False
+        else:
+            if is_long:
+                # Excès prolongé SOUS la BB80 basse pour les futurs longs
+                outside = (close <= bb80_lo)
+            else:
+                # Excès prolongé AU-DESSUS de la BB80 haute pour les futurs shorts
+                outside = (close >= bb80_up)
+            inside = (bb80_lo <= close <= bb80_up)
+
+        if outside:
+            outside_streak += 1
+        else:
+            if outside_streak >= min_streak and first_inside_after_prolonged_idx is None and inside:
+                # Première bougie qui réintègre le couloir BB80 après un excès prolongé
+                first_inside_after_prolonged_idx = idx
+            outside_streak = 0
+
+    if first_inside_after_prolonged_idx is None:
+        return False
+
+    # On veut que la DERNIÈRE bougie de la fenêtre soit justement cette première réintégration
+    return first_inside_after_prolonged_idx == (len(tail) - 1)
+
 
 def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
     """
@@ -2265,6 +2325,33 @@ def execute_signal_with_gates(
             )
             return False, "Rejeté: séquence contre-tendance BB20+BB80 non conforme."
 
+    # ---- Gate sortie prolongée BB80 (tendance & contre-tendance) : éviter le 1er trade après excès prolongé ----
+    try:
+        streak_thr = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
+    except Exception:
+        streak_thr = 5
+    if streak_thr > 0:
+        try:
+            if _is_first_after_prolonged_bb80_exit(df, is_long, streak_thr):
+                signal['entry'] = entry_px
+                signal['sl'] = float(sl_live)
+                signal['tp'] = float(tp_live)
+                # on laisse signal['rr'] tel qu'il vient de detect_signal (ou 0.0 si absent)
+                _update_signal_state(
+                    symbol,
+                    timeframe,
+                    signal,
+                    entry_px,
+                    "SKIPPED",
+                    reason="skip_first_after_prolonged_bb80",
+                    tp=float(tp_live),
+                    sl=float(sl_live),
+                )
+                return False, "Rejeté: premier trade après sortie prolongée des BB80."
+        except Exception:
+            # On ne casse jamais l'exécution sur ce filtre : si le check échoue, on continue normalement.
+            pass
+
     # ---- RR et éventuel cut-wick ----
     rr = 0.0
     if is_long:
@@ -2510,8 +2597,6 @@ def execute_signal_with_gates(
         pass
 
     return True, "Position ouverte avec succès."
-
-
 
 
 def get_tp_offset_pct() -> float:
