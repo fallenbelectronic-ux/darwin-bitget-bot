@@ -10,7 +10,8 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
     - Si df est None : fetch auto via utils.fetch_and_prepare_df
     - Utilise BB20 / BB80 déjà présents dans df
     - Affiche un bloc vert/rouge type 'position' (TP / SL autour de l'entrée)
-      dont la zone commence SUR la bougie d'entrée et s'étend vers l'avant.
+      dont la zone commence SUR la bougie d'entrée et s'étend jusqu'à la
+      dernière bougie visible (jamais dans le futur).
     - Marque les bougies de contact / réaction / entrée par des traits
       verticaux + labels avec flèches.
     """
@@ -191,10 +192,17 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             # position de la bougie d'entrée dans df_plot
             entry_pos = _resolve_bar_position('entry')
 
-            # Limites X actuelles
-            x_left, x_right = ax.get_xlim()
+            # Si on n'a pas réussi à résoudre la bougie d'entrée,
+            # on prend par défaut la dernière bougie visible
+            if entry_pos is None or entry_pos < 0 or entry_pos >= len(df_plot):
+                entry_pos = len(df_plot) - 1
 
-            # Largeur d’une bougie (en jours)
+            # Indices de début/fin pour la zone de position
+            start_idx = max(0, min(entry_pos, len(df_plot) - 1))
+            end_idx   = len(df_plot) - 1  # jamais de bougies futures : on s'arrête à la dernière connue
+
+            # Largeur d’une bougie (en jours) à partir de l’échantillon courant
+            x_left, x_right = ax.get_xlim()
             if len(df_plot) > 1:
                 step_days = (df_plot.index[1] - df_plot.index[0]).total_seconds() / 86400.0
                 if step_days <= 0:
@@ -202,20 +210,16 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             else:
                 step_days = (x_right - x_left) / 20.0
 
-            # Bougie d’entrée → point de départ de la zone
-            if entry_pos is not None and 0 <= entry_pos < len(df_plot):
-                entry_dt  = df_plot.index[entry_pos]
-                entry_num = mdates.date2num(entry_dt)
-                x0 = entry_num
-            else:
-                # Fallback : début à 30% du graphe
-                x0 = x_left + (x_right - x_left) * 0.3
+            # Coordonnées X de la bougie d'entrée (en unités date-num)
+            entry_dt  = df_plot.index[start_idx]
+            x0        = mdates.date2num(entry_dt)
 
-            # La zone s'étend jusqu'à la fin du graphe (+1 bougie)
-            x_end = x_right + step_days
-            box_width = x_end - x0
-            if box_width <= 0:
-                box_width = step_days * 5
+            # Nombre de bougies couvertes par la zone (du start_idx jusqu'à end_idx inclus)
+            n_bars = max(1, end_idx - start_idx + 1)
+            box_width = max(step_days, n_bars * step_days)
+
+            # Limite droite de la zone (toujours <= dernière bougie + 1 step)
+            x_end = x0 + box_width
 
             def _add_box(y1: float, y2: float, color: str, alpha: float) -> None:
                 if y1 is None or y2 is None:
