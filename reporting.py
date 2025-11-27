@@ -333,6 +333,7 @@ def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     history = [(timestamp_sec, equity), ...]
     """
     try:
+        import io
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
 
@@ -363,4 +364,3 @@ def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     except Exception as e:
         print(f"[generate_equity_chart] erreur: {e}")
         return None
-
