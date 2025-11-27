@@ -671,40 +671,147 @@ def get_stats_24h():
 
 def recompute_stats_from_executions(horizon: str) -> Dict[str, Any]:
     """
-    Recalcule basiquement un snapshot de stats à partir d'EXECUTIONS_LOG.
-    Utilise les exécutions fermées dans la fenêtre demandée.
-    Renvoie et ne sauvegarde PAS (la sauvegarde se fait via save_stats_snapshot si voulu).
+    Recalcule un snapshot de stats à partir de la table SQL `trades`
+    (trades FERMÉS uniquement).
+
+    - horizon: '7d', '30d' ou autre (= all time).
+    - Retourne un dict compatible avec l'existant, avec quelques champs
+      supplémentaires possibles pour l'affichage.
+
+    Clés retournées :
+      - trades_count      : nombre de trades fermés
+      - win_rate          : ratio de trades gagnants (0-1)
+      - avg_pnl_pct       : PnL moyen par trade (en %)
+      - pnl_net_abs       : PnL net total (en USDT)
+      - pnl_net_pct       : PnL net moyen (en %)
+      - profit_factor     : Profit Factor (GP / GL)
+      - sharpe_ratio      : Sharpe approx. sur les pnl_percent
+      - max_drawdown_pct  : drawdown max approx. en %
     """
     import math
+    import time as _t
+
     horizon = str(horizon).lower()
-    hours = 7*24 if horizon == '7d' else 30*24 if horizon == '30d' else None
-    execs = _load_json_setting('EXECUTIONS_LOG', [])
-    now_ms = _now_ms()
+    hours = 7 * 24 if horizon == "7d" else 30 * 24 if horizon == "30d" else None
+
+    min_ts: Optional[int] = None
+    now_sec = int(_t.time())
     if hours is not None:
-        min_ts = now_ms - hours * 3600 * 1000
-        execs = [e for e in execs if int(e.get('closed_at', 0)) >= min_ts]
-    closed = [e for e in execs if str(e.get('status','')).lower() == 'closed']
-    n = len(closed)
+        min_ts = now_sec - hours * 3600
+
+    # --- Récupération des trades fermés dans la fenêtre choisie ---
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        if min_ts is not None:
+            rows = cur.execute(
+                """
+                SELECT pnl, pnl_percent, close_timestamp
+                  FROM trades
+                 WHERE status != 'OPEN'
+                   AND close_timestamp IS NOT NULL
+                   AND close_timestamp >= ?
+                """,
+                (int(min_ts),),
+            ).fetchall()
+        else:
+            rows = cur.execute(
+                """
+                SELECT pnl, pnl_percent, close_timestamp
+                  FROM trades
+                 WHERE status != 'OPEN'
+                   AND close_timestamp IS NOT NULL
+                """
+            ).fetchall()
+
+    trades: List[Dict[str, float]] = []
+    for r in rows:
+        # pnl (USDT)
+        try:
+            pnl = float(r["pnl"])
+        except Exception:
+            pnl = float(r[0])
+
+        # pnl_percent (%)
+        try:
+            pnl_pct = float(r["pnl_percent"])
+        except Exception:
+            try:
+                pnl_pct = float(r[1])
+            except Exception:
+                pnl_pct = 0.0
+
+        # timestamp de clôture
+        try:
+            ts = int(r["close_timestamp"])
+        except Exception:
+            try:
+                ts = int(r[2])
+            except Exception:
+                ts = 0
+
+        trades.append({"pnl": pnl, "pnl_pct": pnl_pct, "ts": ts})
+
+    n = len(trades)
     if n == 0:
-        return {"trades_count": 0, "win_rate": 0.0, "avg_pnl_pct": 0.0, "profit_factor": 0.0, "max_drawdown_pct": 0.0}
-    wins = [e for e in closed if float(e.get('pnl_pct', 0)) > 0]
-    losses = [e for e in closed if float(e.get('pnl_pct', 0)) <= 0]
-    avg_pnl_pct = sum(float(e.get('pnl_pct', 0)) for e in closed) / n
-    gross_profit = sum(max(0.0, float(e.get('pnl_abs', 0))) for e in closed)
-    gross_loss = abs(sum(min(0.0, float(e.get('pnl_abs', 0))) for e in closed))
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
-    # max drawdown approximé par cumul des pnl_abs
-    cum, peak, mdd = 0.0, 0.0, 0.0
-    for e in sorted(closed, key=lambda x: int(x.get('closed_at', 0))):
-        cum += float(e.get('pnl_abs', 0))
-        peak = max(peak, cum)
-        mdd = min(mdd, cum - peak)
-    max_drawdown_pct = 0.0  # pct indisponible sans equity de référence; on laisse 0.0
+        return {
+            "trades_count": 0,
+            "win_rate": 0.0,
+            "avg_pnl_pct": 0.0,
+            "pnl_net_abs": 0.0,
+            "pnl_net_pct": 0.0,
+            "profit_factor": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown_pct": 0.0,
+        }
+
+    # --- Agrégats de base ---
+    wins = [t for t in trades if t["pnl"] > 0.0]
+    losses = [t for t in trades if t["pnl"] <= 0.0]
+
+    pnl_net_abs = sum(t["pnl"] for t in trades)
+    pnl_net_pct = sum(t["pnl_pct"] for t in trades) / n  # moyen en %
+
+    avg_pnl_pct = pnl_net_pct
+
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = -sum(t["pnl"] for t in losses if t["pnl"] < 0.0)
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0.0 else float("inf")
+
+    # --- Sharpe approximatif sur les pnl_percent ---
+    returns = [t["pnl_pct"] / 100.0 for t in trades]
+    if len(returns) > 1:
+        mean_r = sum(returns) / len(returns)
+        var = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)
+        std_r = math.sqrt(var) if var > 0.0 else 0.0
+        sharpe = (mean_r / std_r) * (len(returns) ** 0.5) if std_r > 0.0 else 0.0
+    else:
+        sharpe = 0.0
+
+    # --- Max drawdown approx. en partant d'une equity 0 + cumuls de pnl ---
+    trades_sorted = sorted(trades, key=lambda x: x["ts"])
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0  # valeur la plus négative (drawdown absolu)
+    for t in trades_sorted:
+        equity += t["pnl"]
+        if equity > peak:
+            peak = equity
+        dd = equity - peak
+        if dd < max_dd:
+            max_dd = dd
+
+    max_drawdown_pct = 0.0
+    if peak > 0.0 and max_dd < 0.0:
+        max_drawdown_pct = abs(max_dd) / peak * 100.0
+
     return {
         "trades_count": n,
         "win_rate": len(wins) / n if n else 0.0,
         "avg_pnl_pct": avg_pnl_pct,
+        "pnl_net_abs": pnl_net_abs,
+        "pnl_net_pct": pnl_net_pct,
         "profit_factor": profit_factor if math.isfinite(profit_factor) else 0.0,
+        "sharpe_ratio": sharpe,
         "max_drawdown_pct": max_drawdown_pct,
     }
 
