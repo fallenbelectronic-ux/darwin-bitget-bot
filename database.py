@@ -463,16 +463,27 @@ def get_trade_by_id(trade_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
+    """
+    Retourne les trades FERMÉS depuis un timestamp donné.
+    - Utilise en priorité close_timestamp.
+    - Si close_timestamp est NULL/0, bascule sur open_timestamp (fallback pour
+      les anciens enregistrements).
+    - Pour 'Tout', on passe timestamp=0 → récupère toute l'historique.
+    """
     with get_db_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM trades
-             WHERE status != 'OPEN'
-               AND close_timestamp IS NOT NULL
-               AND close_timestamp >= ?
-             ORDER BY close_timestamp DESC
-        """, (timestamp,))
-        return [dict(r) for r in cur.fetchall()]
+        try:
+            cur.execute("""
+                SELECT *
+                  FROM trades
+                 WHERE status != 'OPEN'
+                   AND COALESCE(close_timestamp, open_timestamp, 0) >= ?
+                 ORDER BY COALESCE(close_timestamp, open_timestamp, 0) DESC
+            """, (int(timestamp),))
+            return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            return []
+
 
 # -------- Settings (key/value) --------
 def get_setting(key: str, default: Any = None) -> Any:
