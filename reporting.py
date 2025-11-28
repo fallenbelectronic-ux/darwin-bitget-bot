@@ -557,3 +557,85 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
         "max_drawdown_percent": round(max_drawdown_percent, 2),
     }
 
+def _render_stats_period(period: str) -> str:
+    """
+    Construit le message Stats pour 24h / 7d / 30d / all.
+
+    1) Essaie d'abord de calculer les stats à partir de la table TRADES
+       (via database.get_closed_trades_since + calculate_performance_stats).
+
+    2) Si le résultat est "plat" (aucun trade ou PnL / winrate = 0),
+       on REBASCULE sur EXECUTIONS_LOG (database.fetch_recent_executions)
+       et calculate_performance_stats_from_executions pour reconstruire
+       les stats réelles.
+    """
+    import time
+    import database  # sûr : déjà utilisé ailleurs dans ce fichier
+
+    period = (period or "24h").lower()
+
+    if period == "7d":
+        seconds = 7 * 24 * 60 * 60
+        hours = 7 * 24
+        title = "Bilan Hebdomadaire (7 jours)"
+    elif period == "30d":
+        seconds = 30 * 24 * 60 * 60
+        hours = 30 * 24
+        title = "Bilan 30 jours"
+    elif period == "all":
+        seconds = None
+        hours = None
+        title = "Bilan Global"
+    else:
+        seconds = 24 * 60 * 60
+        hours = 24
+        title = "Bilan Quotidien (24h)"
+
+    # ---------- 1) Stats basées sur TRADES ----------
+    try:
+        since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
+    except Exception:
+        since_ts = 0
+
+    try:
+        trades = database.get_closed_trades_since(since_ts)
+        # Si les timestamps en DB sont en ms, on refait une passe
+        if seconds is not None and not trades:
+            trades = database.get_closed_trades_since(since_ts * 1000)
+    except Exception:
+        trades = []
+
+    stats = calculate_performance_stats(trades)
+
+    # Détermination d'un résultat "plat" : soit aucun trade,
+    # soit trades > 0 mais PnL net et winrate = 0
+    total_trades = int(stats.get("total_trades", 0) or 0)
+    total_pnl = float(stats.get("total_pnl", 0.0) or 0.0)
+    win_rate = float(stats.get("win_rate", 0.0) or 0.0)
+
+    need_exec_fallback = (
+        total_trades < 1
+        or (total_trades > 0 and abs(total_pnl) < 1e-9 and abs(win_rate) < 1e-9)
+    )
+
+    # ---------- 2) Fallback : EXECUTIONS_LOG ----------
+    if need_exec_fallback:
+        try:
+            # hours = fenêtre glissante pour 24h / 7j / 30j
+            # pour "all" -> hours = None = tout l'historique
+            execs = database.fetch_recent_executions(hours=hours, limit=10000)
+        except Exception:
+            execs = []
+
+        try:
+            stats_exec = calculate_performance_stats_from_executions(execs)
+        except Exception:
+            stats_exec = {"total_trades": 0}
+
+        if int(stats_exec.get("total_trades", 0) or 0) > 0:
+            stats = stats_exec  # on remplace les stats "plates" par celles des exécutions
+
+    # ---------- 3) Mise en forme ----------
+    balance = _load_balance_optional()
+    return format_report_message(title, stats, balance)
+
