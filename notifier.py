@@ -987,15 +987,13 @@ def tg_show_signals_6h(limit: int = 50):
 
 def handle_equity_back_callback(update: Dict[str, Any]) -> None:
     """
-    Callback pour le bouton 'Retour' sur le graphique d'équity.
-
-    - Récupère chat_id et message_id depuis callback_query.
-    - Supprime silencieusement le message (photo + clavier).
+    Callback du bouton 'Retour' sur le graphique d'équity.
+    Efface simplement le message (graphique + clavier inline) pour ne pas le laisser persistant.
     """
     try:
-        cq = update.get("callback_query", {})
-        msg = cq.get("message", {}) or {}
-        chat = msg.get("chat", {}) or {}
+        cq = update.get("callback_query") or {}
+        msg = cq.get("message") or {}
+        chat = msg.get("chat") or {}
 
         chat_id = chat.get("id")
         message_id = msg.get("message_id")
@@ -1003,34 +1001,19 @@ def handle_equity_back_callback(update: Dict[str, Any]) -> None:
         if chat_id is None or message_id is None:
             return
 
+        # Suppression du message (graphique + boutons) côté Telegram
         try:
-            # suppression silencieuse du message contenant le graphique
             requests.post(
                 f"{TELEGRAM_API}/deleteMessage",
-                data={
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                },
-                timeout=5,
+                data={"chat_id": chat_id, "message_id": message_id},
+                timeout=10,
             )
         except Exception:
-            # on ne casse jamais le bot pour un simple échec de delete
-            pass
-
-        try:
-            # On répond au callback pour enlever l'icône "chargement" dans Telegram
-            callback_id = cq.get("id")
-            if callback_id:
-                requests.post(
-                    f"{TELEGRAM_API}/answerCallbackQuery",
-                    data={"callback_query_id": callback_id},
-                    timeout=5,
-                )
-        except Exception:
+            # On ne casse jamais le bot sur une erreur réseau
             pass
 
     except Exception:
-        # Sécurité maximale : aucune exception ne doit remonter
+        # Sécurité maximale : ne jamais lever d'erreur vers l'extérieur
         pass
 
 
