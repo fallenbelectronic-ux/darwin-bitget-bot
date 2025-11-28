@@ -891,39 +891,18 @@ def _format_signal_row(sig: dict) -> str:
     return "  ".join(parts)
 
 
-def tg_show_signals_pending(limit: int = 50):
-    """
-    Affiche 'Signaux en attente' : state=PENDING, sans fenêtre de temps.
-    Tri décroissant par ts (les plus récents en premier).
-    Met à jour le message principal avec un bouton Retour.
-    """
-    keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
-    try:
-        signals = database.get_signals(state="PENDING", since_minutes=None, limit=limit)
-    except Exception as e:
-        edit_main(f"⚠️ Erreur lecture signaux en attente : <code>{_escape(e)}</code>", keyboard)
-        return
-
-    signals = sorted(signals or [], key=lambda s: int(s.get("ts", 0)), reverse=True)
-
-    if not signals:
-        edit_main("<b>📟 Signaux en attente</b>\n\nAucun signal en attente pour le moment.", keyboard)
-        return
-
-    lines = ["<b>📟 Signaux en attente</b>", ""]
-    lines.extend(_format_signal_row(s) for s in signals)
-    edit_main("\n".join(lines), keyboard)
-
-
 def tg_show_signals_6h(limit: int = 50):
     """
     Affiche 'Signaux des 6 dernières heures' :
-    inclut VALID_SKIPPED et VALID_TAKEN sur une fenêtre = 360 min.
+    ⚠️ UNIQUEMENT les signaux VALID_TAKEN (pris par le bot),
+    c’est-à-dire les positions réellement ouvrables et conformes
+    à toutes les conditions.
+
     Tri décroissant par ts (les plus récents en premier).
 
     Règles d'affichage:
-      - CUT_WICK_FOR_RR = false  -> masquer VALID_TAKEN si RR < MIN_RR
-      - CUT_WICK_FOR_RR = true   -> masquer VALID_TAKEN si RR < 2.8
+      - CUT_WICK_FOR_RR = false  -> masquer si RR < MIN_RR
+      - CUT_WICK_FOR_RR = true   -> masquer si RR < 2.8 (ou CUT_WICK_MIN_RR)
     """
     keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
 
@@ -942,34 +921,36 @@ def tg_show_signals_6h(limit: int = 50):
     except Exception:
         cw_min_rr = 2.8
 
-    # Lecture DB
+    # Lecture DB : on ne récupère que VALID_TAKEN
     try:
-        s_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit) or []
-        s_taken   = database.get_signals(state="VALID_TAKEN",   since_minutes=360, limit=limit) or []
-        signals = s_skipped + s_taken
+        raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=limit) or []
     except Exception as e:
         edit_main(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
-    # Filtrage selon la règle
-    filtered = []
-    for s in signals:
+    # Filtrage strict : on garde uniquement VALID_TAKEN qui respectent les seuils de RR
+    signals = []
+    for s in raw_taken:
         try:
             st = str(s.get("state", "")).upper()
+            if st != "VALID_TAKEN":
+                # Sécurité supplémentaire : on exclut tout ce qui n'est pas VALID_TAKEN
+                continue
             rr_val = float(s.get("rr", 0) or 0.0)
-            if st == "VALID_TAKEN":
-                if cut_wick:
-                    # cut-wick actif -> masquer si RR < 2.8
-                    if rr_val < cw_min_rr:
-                        continue
-                else:
-                    # cut-wick inactif -> masquer si RR < MIN_RR
-                    if rr_val < min_rr:
-                        continue
+
+            if cut_wick:
+                # cut-wick actif -> masquer si RR < cw_min_rr
+                if rr_val < cw_min_rr:
+                    continue
+            else:
+                # cut-wick inactif -> masquer si RR < MIN_RR
+                if rr_val < min_rr:
+                    continue
         except Exception:
-            pass
-        filtered.append(s)
-    signals = filtered
+            # En cas de problème de données sur un signal, on le jette
+            continue
+
+        signals.append(s)
 
     signals = sorted(signals, key=lambda s: int(s.get("ts", 0)), reverse=True)
 
@@ -977,30 +958,80 @@ def tg_show_signals_6h(limit: int = 50):
         edit_main("<b>⏱️ Signaux validés (6h)</b>\n\nAucun signal validé sur les 6 dernières heures.", keyboard)
         return
 
-    def _badge(s: dict) -> str:
-        st = str(s.get('state', '')).upper()
-        return "✅ Pris" if st == "VALID_TAKEN" else "❌ Non pris"
+    def _badge(_: dict) -> str:
+        # Ici, tous les signaux sont VALID_TAKEN
+        return "✅ Pris"
 
     def _reason(s: dict) -> str:
         payload = s.get("payload") or s.get("data") or {}
         reason = s.get("reason") or (payload.get("reason") if isinstance(payload, dict) else "")
         return f"  (raison: {html.escape(str(reason))})" if reason else ""
 
-    lines = ["<b>⏱️ Signaux validés (6h)</b>", ""]
+    # Titre + une ligne vide entre chaque signal
+    lines = ["<b>⏱️ Signaux validés (6h)</b>"]
     for s in signals:
         row = _format_signal_row(s)
         note = ""
         try:
             rr_val = float(s.get("rr", 0) or 0.0)
-            # Si cut-wick ON et RR entre [2.8 ; MIN_RR[, on l’affiche mais on tag l’écart vs MIN_RR
+            # Si cut-wick ON et RR entre [cw_min_rr ; MIN_RR[, on l’affiche mais on tag l’écart vs MIN_RR
             if cut_wick and rr_val < min_rr and rr_val >= cw_min_rr:
                 note = "  ⚠ RR<MIN_RR (cut-wick)"
         except Exception:
             pass
         lines.append(f"{row}  —  {_badge(s)}{note}{_reason(s)}")
 
-    edit_main("\n".join(lines), keyboard)
+    edit_main("\n\n".join(lines), keyboard)
 
+
+
+def handle_equity_back_callback(update: Dict[str, Any]) -> None:
+    """
+    Callback pour le bouton 'Retour' sur le graphique d'équity.
+
+    - Récupère chat_id et message_id depuis callback_query.
+    - Supprime silencieusement le message (photo + clavier).
+    """
+    try:
+        cq = update.get("callback_query", {})
+        msg = cq.get("message", {}) or {}
+        chat = msg.get("chat", {}) or {}
+
+        chat_id = chat.get("id")
+        message_id = msg.get("message_id")
+
+        if chat_id is None or message_id is None:
+            return
+
+        try:
+            # suppression silencieuse du message contenant le graphique
+            requests.post(
+                f"{TELEGRAM_API}/deleteMessage",
+                data={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                },
+                timeout=5,
+            )
+        except Exception:
+            # on ne casse jamais le bot pour un simple échec de delete
+            pass
+
+        try:
+            # On répond au callback pour enlever l'icône "chargement" dans Telegram
+            callback_id = cq.get("id")
+            if callback_id:
+                requests.post(
+                    f"{TELEGRAM_API}/answerCallbackQuery",
+                    data={"callback_query_id": callback_id},
+                    timeout=5,
+                )
+        except Exception:
+            pass
+
+    except Exception:
+        # Sécurité maximale : aucune exception ne doit remonter
+        pass
 
 
 # ==============================================================================
