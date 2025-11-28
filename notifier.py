@@ -1324,28 +1324,30 @@ def _load_balance_optional() -> Optional[float]:
 
 def _render_stats_period(period: str) -> str:
     """
-    Construit le message Stats pour 24h / 7d / 30d / all.
-    1) Essaie d'abord de calculer les stats à partir de la table TRADES.
-    2) Si aucun trade n'est trouvé, retombe sur EXECUTIONS_LOG via
-       database.recompute_stats_from_executions (pour récupérer l'historique).
+    Construit le message Stats pour 24h / 7d / 30d / all à partir des TRADES fermés.
+    Si la table trades ne contient pas d'info de PnL exploitable, on retombe
+    sur EXECUTIONS_LOG via database.recompute_stats_from_executions.
     """
     period = (period or "24h").lower()
 
     if period == "7d":
         seconds = 7 * 24 * 60 * 60
         title = "Bilan Hebdomadaire (7 jours)"
+        horizon = "7d"
     elif period == "30d":
         seconds = 30 * 24 * 60 * 60
         title = "Bilan 30 jours"
+        horizon = "30d"
     elif period == "all":
         seconds = None
         title = "Bilan Global"
+        horizon = "all"
     else:
-        # défaut : 24h
         seconds = 24 * 60 * 60
         title = "Bilan Quotidien (24h)"
+        horizon = "7d"  # pour le fallback EXECUTIONS_LOG, on prend au moins 7j
 
-    # Fenêtre temporelle (en secondes depuis maintenant)
+    # Fenêtre temporelle (en secondes)
     try:
         since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
     except Exception:
@@ -1354,34 +1356,55 @@ def _render_stats_period(period: str) -> str:
     # 1) Tentative principale : lire les trades fermés depuis la table TRADES
     try:
         trades = database.get_closed_trades_since(since_ts)
-        # Si la DB stocke en millisecondes et que seconds est définie,
-        # on réessaie avec un since_ts en ms si la première requête est vide.
         if seconds is not None and not trades:
             trades = database.get_closed_trades_since(since_ts * 1000)
     except Exception:
         trades = []
 
+    use_trades_stats = False
     if trades:
-        # Stats à partir de TRADES
+        # Vérifier s'il existe au moins un PnL non nul
+        has_pnl = False
+        for t in trades:
+            try:
+                v = float(t.get("pnl") or 0.0)
+                if abs(v) > 1e-9:
+                    has_pnl = True
+                    break
+            except Exception:
+                continue
+        use_trades_stats = has_pnl
+
+    if use_trades_stats:
+        # Stats à partir de la table TRADES
         stats = reporting.calculate_performance_stats(trades)
     else:
         # 2) FALLBACK : reconstruire les stats à partir d'EXECUTIONS_LOG
         try:
-            if seconds is None:
-                horizon = "all"
-            elif seconds >= 30 * 24 * 60 * 60:
-                horizon = "30d"
-            elif seconds >= 7 * 24 * 60 * 60:
-                horizon = "7d"
-            else:
-                # pour 24h on prend au moins une fenêtre courte (7d) sur EXECUTIONS_LOG
-                horizon = "7d"
-            stats = database.recompute_stats_from_executions(horizon)
+            raw = database.recompute_stats_from_executions(horizon)
         except Exception:
-            stats = {"trades_count": 0}
-        # Normaliser la clé que format_report_message attend
-        if "total_trades" not in stats and "trades_count" in stats:
-            stats["total_trades"] = stats.get("trades_count", 0)
+            raw = {}
+
+        trades_count = int(raw.get("trades_count", 0) or 0)
+        total_pnl = float(raw.get("total_pnl", 0.0) or 0.0)
+
+        # Winrate : déjà en % (win_rate_pct). Si seule 'win_rate' existe, on la prend telle quelle.
+        win_rate = raw.get("win_rate_pct", raw.get("win_rate", 0.0) or 0.0)
+
+        avg_pct = float(raw.get("avg_pnl_pct", 0.0) or 0.0)
+        profit_factor = raw.get("profit_factor", None)
+        sharpe_ratio = float(raw.get("sharpe_ratio", 0.0) or 0.0)
+        max_dd = float(raw.get("max_drawdown_pct", 0.0) or 0.0)
+
+        stats = {
+            "total_trades": trades_count,
+            "total_pnl": round(total_pnl, 2),
+            "win_rate": round(float(win_rate), 2),
+            "avg_trade_pnl_percent": round(avg_pct, 2),
+            "profit_factor": profit_factor,
+            "sharpe_ratio": round(sharpe_ratio, 2),
+            "max_drawdown_percent": round(max_dd, 2),
+        }
 
     balance = _load_balance_optional()
     return reporting.format_report_message(title, stats, balance)
