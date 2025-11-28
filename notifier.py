@@ -1324,48 +1324,91 @@ def _load_balance_optional() -> Optional[float]:
 
 def _render_stats_period(period: str) -> str:
     """
-    Construit le message Stats pour 24h / 7j / 30j / all à partir des TRADES fermés.
-    Tolère DB en secondes OU millisecondes pour les timestamps.
-    Pas de fallback compliqué : si la table trades ne contient rien,
-    on laisse reporting indiquer qu'il n'y a pas assez de données.
+    Construit le message Stats pour 24h / 7d / 30j / all.
+    1) lit les trades fermés depuis la table trades (pour le nombre de trades),
+    2) calcule les stats à partir des trades,
+    3) si tout est à zéro alors qu'il y a des trades, tente un fallback
+       à partir d'EXECUTIONS_LOG (database.fetch_recent_executions).
     """
     period = (period or "24h").lower()
 
     if period == "7d":
         seconds = 7 * 24 * 60 * 60
         title = "Bilan Hebdomadaire (7 jours)"
+        exec_hours = 7 * 24
     elif period == "30d":
         seconds = 30 * 24 * 60 * 60
         title = "Bilan 30 jours"
+        exec_hours = 30 * 24
     elif period == "all":
         seconds = None
         title = "Bilan Global"
+        exec_hours = None
     else:
         # défaut : 24h
         seconds = 24 * 60 * 60
         title = "Bilan Quotidien (24h)"
+        exec_hours = 24
 
-    # Fenêtre temporelle
+    # Fenêtre temporelle pour la table trades
     try:
         since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
     except Exception:
         since_ts = 0
 
-    # Lecture DB robuste: tente en secondes puis en millisecondes si vide
+    # 1) Trades fermés
     try:
         trades = database.get_closed_trades_since(since_ts)
+        # Si la DB stocke en millisecondes, on retente avec *1000 si besoin
         if seconds is not None and not trades:
-            # si les timestamps sont stockés en ms
             trades = database.get_closed_trades_since(since_ts * 1000)
     except Exception:
         trades = []
 
-    # Calcul des stats uniquement à partir de la table trades
+    trades_count = len(trades)
+
+    # 2) Stats basées sur la table trades
     stats = reporting.calculate_performance_stats(trades)
+
+    # Détection d'un jeu de stats "vide" (tout à zéro)
+    def _stats_seem_empty(s: Dict[str, Any]) -> bool:
+        try:
+            if s.get("total_trades", 0) == 0:
+                return True
+            if abs(float(s.get("total_pnl", 0.0))) > 1e-8:
+                return False
+            if abs(float(s.get("win_rate", 0.0))) > 1e-8:
+                return False
+            if abs(float(s.get("avg_trade_pnl_percent", 0.0))) > 1e-8:
+                return False
+            return True
+        except Exception:
+            return True
+
+    # 3) Fallback : EXECUTIONS_LOG si on a des trades mais des stats plates
+    if trades_count > 0 and _stats_seem_empty(stats):
+        try:
+            if exec_hours is None:
+                execs = database.fetch_recent_executions(hours=None, limit=10000)
+            else:
+                execs = database.fetch_recent_executions(hours=exec_hours, limit=10000)
+        except Exception:
+            execs = []
+
+        try:
+            stats_exec = reporting.calculate_performance_stats_from_executions(execs)
+        except Exception:
+            stats_exec = {}
+
+        if stats_exec.get("total_trades", 0) > 0:
+            # On remplace par les stats des exécutions,
+            # mais on garde le nombre de trades de la table trades si disponible.
+            stats = stats_exec
+            if trades_count:
+                stats["total_trades"] = trades_count
+
     balance = _load_balance_optional()
-
     return reporting.format_report_message(title, stats, balance)
-
 
 
 def _stats_keyboard(active: str = "24h") -> Dict:
