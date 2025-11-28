@@ -791,15 +791,93 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
         "max_drawdown_percent": round(max_drawdown_percent, 2),
     }
 
+def _get_closed_trades_for_period(hours: Optional[int]) -> List[Dict[str, Any]]:
+    """
+    Tente de récupérer la liste des trades FERMÉS depuis la DB pour une période donnée.
+    - Essaie plusieurs APIs possibles de database.* pour rester compatible avec les versions précédentes.
+    - Filtre autant que possible par statut 'closed' (TP/SL/etc.) et par timestamp si dispo.
+    """
+    import time
+    import database  # type: ignore
+
+    trades: List[Dict[str, Any]] = []
+
+    def _try_call(func_name: str, **kwargs) -> List[Dict[str, Any]]:
+        func = getattr(database, func_name, None)
+        if not callable(func):
+            return []
+        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        try:
+            res = func(**clean_kwargs)
+            if isinstance(res, list):
+                return res
+            if isinstance(res, tuple) and res and isinstance(res[0], list):
+                return res[0]
+        except Exception:
+            return []
+        return []
+
+    # 1) Fonctions les plus probables
+    if not trades:
+        trades = _try_call("fetch_closed_trades", hours=hours, limit=10000)
+    if not trades:
+        trades = _try_call("fetch_trades", hours=hours, status="closed", limit=10000)
+    if not trades:
+        trades = _try_call("get_trades_for_period", hours=hours)
+    if not trades:
+        trades = _try_call("get_trades_for_stats", period_hours=hours)
+    if not trades:
+        trades = _try_call("get_all_trades")
+
+    if not trades:
+        return []
+
+    # Filtre par statut de clôture si un champ 'status' existe
+    closed_statuses = {
+        "closed", "tp", "sl", "closed_by_tp", "closed_by_sl",
+        "closed_by_exchange", "take_profit", "stop_loss",
+        "hit_tp", "hit_sl", "finished", "done", "filled",
+    }
+    filtered: List[Dict[str, Any]] = []
+    for t in trades:
+        status = str(t.get("status", "")).lower()
+        if status:
+            if status not in closed_statuses:
+                continue
+        filtered.append(t)
+
+    trades = filtered or trades  # si aucun statut exploitable, on garde la liste brute
+
+    # Filtre temporel si possible
+    if hours is not None and hours > 0:
+        cutoff = time.time() - hours * 3600.0
+        windowed: List[Dict[str, Any]] = []
+        for t in trades:
+            try:
+                ts = float(t.get("close_timestamp") or t.get("closed_at") or t.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            if ts == 0.0 or ts >= cutoff:
+                windowed.append(t)
+        trades = windowed
+
+    return trades
+
 
 def _render_stats_period(period: str) -> str:
     """
     Construit le message Stats pour 24h / 7d / 30d / all.
 
-    ⚠️ NOUVELLE VERSION :
-    - On calcule les stats UNIQUEMENT à partir de EXECUTIONS_LOG
+    ⚠️ VERSION HYBRIDE :
+    - Calcule les stats à partir de EXECUTIONS_LOG
       via database.fetch_recent_executions() + calculate_performance_stats_from_executions().
-    - TRADES n'est plus utilisé pour le calcul des stats (uniquement pour d'autres usages éventuels).
+    - En parallèle, reconstruit les stats à partir des TRADES fermés
+      via calculate_performance_stats().
+    - Choisit automatiquement l'ensemble le plus informatif :
+        • si un des deux a un PnL total non nul → on privilégie celui-ci,
+        • sinon on choisit celui avec le plus de trades.
     """
     import database
 
@@ -812,22 +890,22 @@ def _render_stats_period(period: str) -> str:
         hours = 30 * 24
         title = "Bilan 30 jours"
     elif period == "all":
-        hours = None          # tout l'historique d'exécutions
+        hours = None          # tout l'historique d'exécutions / trades
         title = "Bilan Global"
     else:
         hours = 24
         title = "Bilan Quotidien (24h)"
 
-    # ---------- Stats basées sur EXECUTIONS_LOG ----------
+    # ---------- 1) Stats EXECUTIONS_LOG ----------
     try:
         execs = database.fetch_recent_executions(hours=hours, limit=10000)
     except Exception:
         execs = []
 
     try:
-        stats = calculate_performance_stats_from_executions(execs)
+        stats_exec = calculate_performance_stats_from_executions(execs)
     except Exception:
-        stats = {
+        stats_exec = {
             "total_trades": 0,
             "nb_wins": 0,
             "nb_losses": 0,
@@ -839,7 +917,61 @@ def _render_stats_period(period: str) -> str:
             "max_drawdown_percent": 0.0,
         }
 
-    # ---------- Mise en forme ----------
+    # ---------- 2) Stats TRADES FERMÉS ----------
+    try:
+        trades = _get_closed_trades_for_period(hours)
+    except Exception:
+        trades = []
+
+    if trades:
+        try:
+            stats_trades = calculate_performance_stats(trades)
+        except Exception:
+            stats_trades = {
+                "total_trades": 0,
+                "nb_wins": 0,
+                "nb_losses": 0,
+                "win_rate": 0.0,
+                "total_pnl": 0.0,
+                "profit_factor": None,
+                "avg_trade_pnl_percent": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown_percent": 0.0,
+            }
+    else:
+        stats_trades = {
+            "total_trades": 0,
+            "nb_wins": 0,
+            "nb_losses": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "profit_factor": None,
+            "avg_trade_pnl_percent": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown_percent": 0.0,
+        }
+
+    # ---------- 3) Choix de la source la plus pertinente ----------
+    def _safe_total_pnl(s: Dict[str, Any]) -> float:
+        try:
+            return float(s.get("total_pnl", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    te = int(stats_exec.get("total_trades", 0) or 0)
+    tt = int(stats_trades.get("total_trades", 0) or 0)
+    pnl_exec = abs(_safe_total_pnl(stats_exec))
+    pnl_trades = abs(_safe_total_pnl(stats_trades))
+
+    if tt > 0 and pnl_trades > 0.0 and pnl_exec == 0.0:
+        stats = stats_trades
+    elif te > 0 and pnl_exec > 0.0 and pnl_trades == 0.0:
+        stats = stats_exec
+    elif tt > te:
+        stats = stats_trades
+    else:
+        stats = stats_exec
+
+    # ---------- 4) Mise en forme ----------
     balance = _load_balance_optional()
     return format_report_message(title, stats, balance)
-
