@@ -348,8 +348,14 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
 def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
     """
     Construit l'historique equity en cumulant les PNL des trades fermés.
-    PnL est RECONSTRUIT à partir des prix si le champ 'pnl' est manquant ou ≈ 0.
-    Retourne une liste triée de tuples: (timestamp, equity).
+
+    ⚠️ NOUVELLE LOGIQUE :
+    1) On essaie d'abord de construire l'équity à partir des lignes TRADES
+       en RECONSTRUISANT le PnL à partir de (entry, exit, qty, side).
+
+    2) Si le résultat est "plat" (aucun PnL significatif possible),
+       on bascule sur EXECUTIONS_LOG (database.fetch_recent_executions)
+       et on reconstruit l'équity à partir des exécutions fermées.
     """
 
     def _to_float(x, default: float = 0.0) -> float:
@@ -366,8 +372,8 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
                 return t[k]
         return default
 
-    def _compute_pnl(t: Dict[str, Any]) -> float:
-        """PnL USDT robuste pour un trade."""
+    def _pnl_from_trade(t: Dict[str, Any]) -> float:
+        """PnL USDT robuste pour une ligne de TRADES."""
         side_raw = str(_first(t, ["side", "direction", "position_side"], "")).lower()
         side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
 
@@ -384,6 +390,7 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
             0.0,
         )
 
+        # PnL DB prioritaire si significatif
         pnl_db = t.get("pnl", None)
         try:
             if pnl_db is not None:
@@ -393,6 +400,7 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
         except Exception:
             pass
 
+        # Reconstruction à partir des prix
         if entry > 0.0 and exit_price > 0.0 and qty > 0.0 and side:
             if side == "buy":
                 return (exit_price - entry) * qty
@@ -400,32 +408,116 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
                 return (entry - exit_price) * qty
         return 0.0
 
+    def _build_history_from_exec(executions: List[Dict[str, Any]]) -> List[tuple]:
+        """Construit history = [(ts, equity)] à partir de EXECUTIONS_LOG."""
+        def _is_closed(e: Dict[str, Any]) -> bool:
+            status = str(e.get("status", "")).lower()
+            if status in ("closed", "filled", "done", "finished", "tp", "sl", "closed_by_sl", "closed_by_tp"):
+                return True
+            closed_at = e.get("closed_at")
+            try:
+                return closed_at not in (None, "", 0, "0")
+            except Exception:
+                return False
+
+        def _pnl_from_exec(e: Dict[str, Any]) -> float:
+            pnl_abs = None
+            if "pnl_abs" in e:
+                try:
+                    pnl_abs = float(e.get("pnl_abs"))
+                except Exception:
+                    pnl_abs = None
+
+            if pnl_abs is None:
+                entry = _to_float(
+                    _first(e, ["avg_entry", "avgEntry", "entry", "entry_price", "price_open"], None),
+                    0.0,
+                )
+                exit_price = _to_float(
+                    _first(e, ["close_price", "exit", "exit_price", "price_close"], None),
+                    0.0,
+                )
+                qty = _to_float(
+                    _first(e, ["qty", "quantity", "contracts", "size", "amount"], None),
+                    0.0,
+                )
+                side_raw = str(_first(e, ["side", "direction", "position_side"], "")).lower()
+                side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
+                if entry > 0.0 and exit_price > 0.0 and qty > 0.0 and side:
+                    if side == "buy":
+                        pnl_abs = (exit_price - entry) * qty
+                    else:
+                        pnl_abs = (entry - exit_price) * qty
+                else:
+                    pnl_abs = 0.0
+            return _to_float(pnl_abs, 0.0)
+
+        def _ts_from_exec(e: Dict[str, Any]) -> float:
+            try:
+                ts = float(e.get("closed_at") or e.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            return ts
+
+        closed_execs = [e for e in (executions or []) if _is_closed(e)]
+        if not closed_execs:
+            return []
+
+        try:
+            closed_execs = sorted(closed_execs, key=_ts_from_exec)
+        except Exception:
+            pass
+
+        eq = 0.0
+        hist: List[tuple] = []
+        for e in closed_execs:
+            pnl = _pnl_from_exec(e)
+            ts = _ts_from_exec(e)
+            eq += pnl
+            hist.append((ts, eq))
+        return hist
+
     history: List[tuple] = []
     equity = 0.0
+    total_abs = 0.0
 
-    # tri par timestamp
+    # ---------- 1) tentative via TRADES ----------
     try:
         trades_sorted = sorted(trades, key=lambda t: float(t.get("close_timestamp", 0) or t.get("ts") or 0))
     except Exception:
         trades_sorted = trades
 
     for t in trades_sorted:
-        pnl = _compute_pnl(t)
-
         try:
             ts = float(t.get("close_timestamp") or t.get("ts") or 0.0)
         except Exception:
             ts = 0.0
-
-        # corriger format si millisecondes
         if ts > 10_000_000_000:
             ts /= 1000.0
 
+        pnl = _pnl_from_trade(t)
+        total_abs += abs(pnl)
         equity += pnl
         history.append((ts, equity))
 
-    return history
+    # Si on a réussi à construire une courbe non triviale → on la renvoie
+    if history and total_abs > 1e-9:
+        return history
 
+    # ---------- 2) fallback via EXECUTIONS_LOG ----------
+    try:
+        import database
+        execs = database.fetch_recent_executions(hours=None, limit=10000)
+    except Exception:
+        execs = []
+
+    if not execs:
+        # aucun historique exploitable
+        return history
+
+    return _build_history_from_exec(execs)
 
 def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     """
@@ -660,81 +752,50 @@ def _render_stats_period(period: str) -> str:
     """
     Construit le message Stats pour 24h / 7d / 30d / all.
 
-    1) Essaie d'abord de calculer les stats à partir de la table TRADES
-       (via database.get_closed_trades_since + calculate_performance_stats).
-
-    2) Si le résultat est "plat" (aucun trade ou PnL / winrate = 0),
-       on REBASCULE sur EXECUTIONS_LOG (database.fetch_recent_executions)
-       et calculate_performance_stats_from_executions pour reconstruire
-       les stats réelles.
+    ⚠️ NOUVELLE VERSION :
+    - On calcule les stats UNIQUEMENT à partir de EXECUTIONS_LOG
+      via database.fetch_recent_executions() + calculate_performance_stats_from_executions().
+    - TRADES n'est plus utilisé pour le calcul des stats (uniquement pour d'autres usages éventuels).
     """
-    import time
-    import database  # sûr : déjà utilisé ailleurs dans ce fichier
+    import database
 
     period = (period or "24h").lower()
 
     if period == "7d":
-        seconds = 7 * 24 * 60 * 60
         hours = 7 * 24
         title = "Bilan Hebdomadaire (7 jours)"
     elif period == "30d":
-        seconds = 30 * 24 * 60 * 60
         hours = 30 * 24
         title = "Bilan 30 jours"
     elif period == "all":
-        seconds = None
-        hours = None
+        hours = None          # tout l'historique d'exécutions
         title = "Bilan Global"
     else:
-        seconds = 24 * 60 * 60
         hours = 24
         title = "Bilan Quotidien (24h)"
 
-    # ---------- 1) Stats basées sur TRADES ----------
+    # ---------- Stats basées sur EXECUTIONS_LOG ----------
     try:
-        since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
+        execs = database.fetch_recent_executions(hours=hours, limit=10000)
     except Exception:
-        since_ts = 0
+        execs = []
 
     try:
-        trades = database.get_closed_trades_since(since_ts)
-        # Si les timestamps en DB sont en ms, on refait une passe
-        if seconds is not None and not trades:
-            trades = database.get_closed_trades_since(since_ts * 1000)
+        stats = calculate_performance_stats_from_executions(execs)
     except Exception:
-        trades = []
+        stats = {
+            "total_trades": 0,
+            "nb_wins": 0,
+            "nb_losses": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "profit_factor": None,
+            "avg_trade_pnl_percent": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown_percent": 0.0,
+        }
 
-    stats = calculate_performance_stats(trades)
-
-    # Détermination d'un résultat "plat" : soit aucun trade,
-    # soit trades > 0 mais PnL net et winrate = 0
-    total_trades = int(stats.get("total_trades", 0) or 0)
-    total_pnl = float(stats.get("total_pnl", 0.0) or 0.0)
-    win_rate = float(stats.get("win_rate", 0.0) or 0.0)
-
-    need_exec_fallback = (
-        total_trades < 1
-        or (total_trades > 0 and abs(total_pnl) < 1e-9 and abs(win_rate) < 1e-9)
-    )
-
-    # ---------- 2) Fallback : EXECUTIONS_LOG ----------
-    if need_exec_fallback:
-        try:
-            # hours = fenêtre glissante pour 24h / 7j / 30j
-            # pour "all" -> hours = None = tout l'historique
-            execs = database.fetch_recent_executions(hours=hours, limit=10000)
-        except Exception:
-            execs = []
-
-        try:
-            stats_exec = calculate_performance_stats_from_executions(execs)
-        except Exception:
-            stats_exec = {"total_trades": 0}
-
-        if int(stats_exec.get("total_trades", 0) or 0) > 0:
-            stats = stats_exec  # on remplace les stats "plates" par celles des exécutions
-
-    # ---------- 3) Mise en forme ----------
+    # ---------- Mise en forme ----------
     balance = _load_balance_optional()
     return format_report_message(title, stats, balance)
 
