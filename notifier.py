@@ -451,23 +451,30 @@ def send_breakeven_notification(symbol: str, pnl_realised: float, remaining_qty:
     )
     tg_send(message, chat_id=TG_ALERTS_CHAT_ID or TG_CHAT_ID)
 
-def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional[str] = None):
-    """Envoie un message avec photo. Peut cibler un chat_id spécifique."""
+def tg_send_with_photo(photo_buffer: io.BytesIO, caption: str, chat_id: Optional[str] = None, reply_markup: Optional[Dict] = None):
+    """Envoie un message avec photo. Peut cibler un chat_id spécifique, avec clavier inline optionnel."""
     target_chat_id = chat_id if chat_id else TG_CHAT_ID
     if not target_chat_id:
         return
-        
+
     if not photo_buffer:
         return tg_send(caption, chat_id=target_chat_id)
-        
+
     try:
         files = {'photo': ('trade_setup.png', photo_buffer, 'image/png')}
-        payload = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
+        payload = {
+            "chat_id": target_chat_id,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+
         requests.post(f"{TELEGRAM_API}/sendPhoto", data=payload, files=files, timeout=20)
     except Exception as e:
-        # CORRECTION : Un bloc 'except' doit contenir du code.
         print(f"Erreur d'envoi de photo Telegram: {e}")
         tg_send(f"⚠️ Erreur de graphique\n{caption}", chat_id=target_chat_id)
+
 
 def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
     """Récupère les mises à jour de Telegram."""
@@ -834,6 +841,12 @@ def try_handle_inline_callback(event: Any) -> bool:
             if cq_id: tg_answer_callback_query(cq_id)
             return True
 
+        # ----- RETOUR GRAPHIQUE ÉQUITY -----
+        if cmd == "equity_back":
+            # On passe l'update complet pour que handle_equity_back_callback retrouve callback_query/message
+            handle_equity_back_callback(event)
+            return True
+
         # ----- RESTART -----
         if cmd == "restart_bot":
             handle_restart_callback(data); return True
@@ -846,6 +859,7 @@ def try_handle_inline_callback(event: Any) -> bool:
     except Exception as e:
         tg_send_error("Callback routing", e)
         return False
+
         
 
 def _format_signal_row(sig: dict) -> str:
@@ -988,10 +1002,15 @@ def tg_show_signals_6h(limit: int = 50):
 def handle_equity_back_callback(update: Dict[str, Any]) -> None:
     """
     Callback du bouton 'Retour' sur le graphique d'équity.
-    Efface simplement le message (graphique + clavier inline) pour ne pas le laisser persistant.
+    Efface le message (graphique + inline keyboard) pour ne pas le laisser persistant.
     """
     try:
         cq = update.get("callback_query") or {}
+        cq_id = cq.get("id")
+        if cq_id:
+            # Accusé de réception pour enlever le "loading" sur le bouton
+            tg_answer_callback_query(str(cq_id))
+
         msg = cq.get("message") or {}
         chat = msg.get("chat") or {}
 
@@ -1469,9 +1488,14 @@ def tg_show_stats(period: str = "24h"):
     # 4) Générer graphique
     img = reporting.generate_equity_chart(history)
 
-    # 5) Envoyer image si dispo
+    # 5) Envoyer image si dispo, avec bouton 'Retour' spécifique
     if img is not None:
-        tg_send_with_photo(img, caption="📈 Évolution du Portefeuille")
+        kb_equity = {
+            "inline_keyboard": [
+                [{"text": "↩️ Retour", "callback_data": "equity_back"}]
+            ]
+        }
+        tg_send_with_photo(img, caption="📈 Évolution du Portefeuille", reply_markup=kb_equity)
 
 
 def tg_show_positions():
