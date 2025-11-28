@@ -586,9 +586,8 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
     (EXECUTIONS_LOG).
 
     - On considère comme "fermées" :
-        • status in ('closed', 'filled', 'done', 'finished', 'tp', 'sl', 'closed_by_sl', 'closed_by_tp')
-        • OU présence d'un champ 'closed_at' non nul.
-      Les autres exécutions sont ignorées.
+        • si closed_at est renseigné (non vide / non 0)
+        • OU si status est présent et n'est PAS un statut "ouvert" (open/pending/...).
 
     - PnL USDT :
         • utilise en priorité e['pnl_abs'] si présent,
@@ -602,14 +601,58 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
     """
 
     def _is_closed(e: Dict[str, Any]) -> bool:
-        status = str(e.get("status", "")).lower()
-        if status in ("closed", "filled", "done", "finished", "tp", "sl", "closed_by_sl", "closed_by_tp"):
-            return True
+        """
+        Détermine si une exécution est considérée comme 'fermée'.
+
+        Logique élargie pour coller à tous les statuts possibles:
+        - PRIORITÉ: si closed_at est renseigné → fermé.
+        - Sinon, on regarde status:
+            • status vide -> non fermé
+            • status 'open' / 'pending' / 'new' / 'live' / 'active' / 'running' / 'partially_filled' / 'partial'
+              -> NON fermé
+            • tout autre status non vide -> considéré comme fermé
+        """
+        # 1) closed_at prioritaire
         closed_at = e.get("closed_at")
         try:
-            return closed_at not in (None, "", 0, "0")
+            if closed_at not in (None, "", 0, "0"):
+                return True
         except Exception:
+            # si closed_at est bizarre, on continue avec status
+            pass
+
+        # 2) status générique
+        try:
+            raw_status = e.get("status", "")
+            status = str(raw_status or "").strip().lower()
+        except Exception:
+            status = ""
+
+        if not status:
+            # pas de status ni closed_at -> on considère que ce n'est pas clairement fermé
             return False
+
+        # Statuts explicitement "ouverts" à exclure
+        open_statuses = {
+            "open",
+            "opening",
+            "pending",
+            "new",
+            "live",
+            "active",
+            "running",
+            "partially_filled",
+            "partial",
+            "in_progress",
+        }
+
+        if status in open_statuses:
+            return False
+
+        # Tout autre status non vide est considéré comme fermé:
+        # ex: 'closed', 'tp', 'sl', 'closed_by_tp', 'closed_by_sl',
+        #     'closed_by_exchange', 'be', 'breakeven', etc.
+        return True
 
     def _to_float(x, default: float = 0.0) -> float:
         try:
@@ -649,7 +692,7 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
         if "pnl_abs" in e:
             pnl_abs = _to_float(e.get("pnl_abs"), None)
 
-        # --- PnL % déjà présent ?
+        # --- PnL % déjà présent ? ---
         pnl_pct = None
         if "pnl_pct" in e:
             pnl_pct = _to_float(e.get("pnl_pct"), None)
@@ -747,6 +790,7 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
         "sharpe_ratio": round(sharpe_ratio, 2),
         "max_drawdown_percent": round(max_drawdown_percent, 2),
     }
+
 
 def _render_stats_period(period: str) -> str:
     """
