@@ -1324,32 +1324,67 @@ def _load_balance_optional() -> Optional[float]:
 
 def _render_stats_period(period: str) -> str:
     """
-    Construit le message Stats pour 24h / 7d / 30d / all
-    en utilisant directement la reconstruction des statistiques
-    depuis la DB via database.recompute_stats_from_executions.
-
-    Cela corrige le bug des stats toujours à zéro, car
-    get_closed_trades_since() renvoyait une liste vide.
+    Construit le message Stats pour 24h / 7d / 30d / all.
+    1) Essaie d'abord de calculer les stats à partir de la table TRADES.
+    2) Si aucun trade n'est trouvé, retombe sur EXECUTIONS_LOG via
+       database.recompute_stats_from_executions (pour récupérer l'historique).
     """
-
     period = (period or "24h").lower()
 
     if period == "7d":
+        seconds = 7 * 24 * 60 * 60
         title = "Bilan Hebdomadaire (7 jours)"
-        stats = database.recompute_stats_from_executions("7d")
     elif period == "30d":
+        seconds = 30 * 24 * 60 * 60
         title = "Bilan 30 jours"
-        stats = database.recompute_stats_from_executions("30d")
     elif period == "all":
+        seconds = None
         title = "Bilan Global"
-        stats = database.recompute_stats_from_executions("all")
     else:
+        # défaut : 24h
+        seconds = 24 * 60 * 60
         title = "Bilan Quotidien (24h)"
-        stats = database.recompute_stats_from_executions("24h")
+
+    # Fenêtre temporelle (en secondes depuis maintenant)
+    try:
+        since_ts = 0 if seconds is None else int(time.time()) - int(seconds)
+    except Exception:
+        since_ts = 0
+
+    # 1) Tentative principale : lire les trades fermés depuis la table TRADES
+    try:
+        trades = database.get_closed_trades_since(since_ts)
+        # Si la DB stocke en millisecondes et que seconds est définie,
+        # on réessaie avec un since_ts en ms si la première requête est vide.
+        if seconds is not None and not trades:
+            trades = database.get_closed_trades_since(since_ts * 1000)
+    except Exception:
+        trades = []
+
+    if trades:
+        # Stats à partir de TRADES
+        stats = reporting.calculate_performance_stats(trades)
+    else:
+        # 2) FALLBACK : reconstruire les stats à partir d'EXECUTIONS_LOG
+        try:
+            if seconds is None:
+                horizon = "all"
+            elif seconds >= 30 * 24 * 60 * 60:
+                horizon = "30d"
+            elif seconds >= 7 * 24 * 60 * 60:
+                horizon = "7d"
+            else:
+                # pour 24h on prend au moins une fenêtre courte (7d) sur EXECUTIONS_LOG
+                horizon = "7d"
+            stats = database.recompute_stats_from_executions(horizon)
+        except Exception:
+            stats = {"trades_count": 0}
+        # Normaliser la clé que format_report_message attend
+        if "total_trades" not in stats and "trades_count" in stats:
+            stats["total_trades"] = stats.get("trades_count", 0)
 
     balance = _load_balance_optional()
     return reporting.format_report_message(title, stats, balance)
-
 
 
 def _stats_keyboard(active: str = "24h") -> Dict:
