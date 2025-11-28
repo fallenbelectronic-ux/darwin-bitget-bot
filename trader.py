@@ -1401,7 +1401,7 @@ def sync_positions_with_exchange(ex) -> None:
     """
     Synchronise la table trades avec L’EXCHANGE COMME SOURCE DE VÉRITÉ (agrégation par symbole).
     - 1 seul trade OPEN par symbole côté DB (on agrège et on ferme les doublons).
-    - Si exchange est flat pour un symbole ⇒ on ferme en DB (CLOSED_BY_EXCHANGE).
+    - Si exchange est flat pour un symbole ⇒ on ferme en DB (CLOSED_BY_EXCHANGE) en estimant le PnL.
     - Si exchange a une position et DB n’en a pas ⇒ on crée (regime='Importé').
     - On met à jour side/quantity/entry_price pour refléter l’exchange.
     - On recopie TP/SL depuis les ordres ouverts exchange si disponibles (sans créer/modifier les ordres ici).
@@ -1441,16 +1441,32 @@ def sync_positions_with_exchange(ex) -> None:
         symbols_all = set(db_by_symbol.keys()) | set(ex_map.keys())
 
         for sym in symbols_all:
-            ex_info = ex_map.get(sym)          # None si flat côté exchange
+            ex_info = ex_map.get(sym)            # None si flat côté exchange
             db_list = db_by_symbol.get(sym, [])  # [] si pas de trade DB
 
-            # --- Cas A: exchange FLAT, DB a des OPEN → fermer tous en DB
+            # --- Cas A: exchange FLAT, DB a des OPEN → fermer tous en DB (avec PnL estimé)
             if ex_info is None and db_list:
                 for row in db_list:
                     try:
-                        database.close_trade(int(row["id"]), status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                        estimated_pnl = _estimate_pnl_for_closed_trade(ex, row)
                     except Exception:
-                        pass
+                        estimated_pnl = 0.0
+                    try:
+                        database.close_trade(
+                            int(row["id"]),
+                            status="CLOSED_BY_EXCHANGE",
+                            pnl=float(estimated_pnl),
+                        )
+                    except Exception:
+                        # fallback: ancien comportement (pnl=0)
+                        try:
+                            database.close_trade(
+                                int(row["id"]),
+                                status="CLOSED_BY_EXCHANGE",
+                                pnl=0.0,
+                            )
+                        except Exception:
+                            pass
                 continue
 
             # --- Cas B: exchange a une position, DB n’a rien → créer + recopie TP/SL si trouvés
@@ -1486,7 +1502,11 @@ def sync_positions_with_exchange(ex) -> None:
                                 try:
                                     database.update_trade_sl(int(keep["id"]), float(sl_ex))
                                 except AttributeError:
-                                    database.update_trade_to_breakeven(int(keep["id"]), float(keep.get("quantity") or 0.0), float(sl_ex))
+                                    database.update_trade_to_breakeven(
+                                        int(keep["id"]),
+                                        float(keep.get("quantity") or 0.0),
+                                        float(sl_ex),
+                                    )
                 except Exception:
                     pass
                 continue
@@ -1531,16 +1551,71 @@ def sync_positions_with_exchange(ex) -> None:
                         try:
                             database.update_trade_sl(keep_id, float(sl_ex))
                         except AttributeError:
-                            database.update_trade_to_breakeven(keep_id, float(ex_info["qty"] or 0.0), float(sl_ex))
+                            database.update_trade_to_breakeven(
+                                keep_id,
+                                float(ex_info["qty"] or 0.0),
+                                float(sl_ex),
+                            )
                 except Exception:
                     pass
 
-        # Optionnel: fermer des artefacts si la symbolisation diverge (ex_map clés nettoyées)
-        # -> Déjà couvert via clés exactes 'symbol' normalisées par ccxt.
+        # Optionnel: cas exotiques déjà couverts par la clé exacte 'symbol'
 
     except Exception as e:
         print(f"[sync_positions_with_exchange] error: {e}")
 
+
+def _estimate_pnl_for_closed_trade(ex, row: Dict[str, Any]) -> float:
+    """
+    Estime le PnL d'un trade fermé côté exchange alors que la DB pense encore qu'il est ouvert.
+    Utilisé uniquement dans sync_positions_with_exchange lorsque l'exchange est FLAT pour un symbole.
+
+    Approche:
+      - side: 'buy'/'sell'
+      - entry: row['entry_price'] (ou 'entry')
+      - qty:   row['quantity'] (ou 'qty')
+      - exit:  row['exit_price']/'close_price' si présent, sinon dernier prix du ticker.
+
+    Si une info clé manque → retourne 0.0 (comportement précédent).
+    """
+    try:
+        symbol = str(row.get("symbol") or "")
+        if not symbol:
+            return 0.0
+
+        side_raw = str(row.get("side") or "").lower()
+        side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
+        if not side:
+            return 0.0
+
+        entry = row.get("entry_price", row.get("entry"))
+        qty = row.get("quantity", row.get("qty"))
+
+        entry = float(entry or 0.0)
+        qty = float(qty or 0.0)
+        if entry <= 0.0 or qty <= 0.0:
+            return 0.0
+
+        # Prix de sortie: on privilégie ce qui est déjà stocké en DB
+        exit_price = row.get("exit_price") or row.get("close_price") or row.get("avg_exit_price")
+        if exit_price is None and ex is not None:
+            try:
+                t = ex.fetch_ticker(symbol) or {}
+                exit_price = t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0
+            except Exception:
+                exit_price = 0.0
+        exit_price = float(exit_price or 0.0)
+        if exit_price <= 0.0:
+            return 0.0
+
+        if side == "buy":
+            pnl = (exit_price - entry) * qty
+        else:
+            pnl = (entry - exit_price) * qty
+        return float(pnl)
+    except Exception:
+        return 0.0
+            
 
 def _validate_tp_for_side(side: str, tp_price: float, current_price: float, tick_size: float) -> float:
     """
