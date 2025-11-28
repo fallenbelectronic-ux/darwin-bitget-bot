@@ -328,196 +328,63 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
     return history
 
 
-def generate_equity_chart(trades: List[Dict[str, Any]]) -> Optional[io.BytesIO]:
+def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     """
-    Génère une courbe d'équité (évolution cumulée du PnL) au format PNG dans un buffer mémoire.
-
-    - Cherche automatiquement un champ temporel dans chaque trade :
-      ('close_time', 'closed_at', 'exit_time', 'timestamp', 'time', 'open_time', 'opened_at')
-    - Convertit de façon robuste les timestamps (s / ms / µs / ns) en datetime.
-    - Classe les trades par temps croissant.
-    - Calcule la courbe d'équité comme somme cumulée du PnL (champ 'pnl').
-    - Retourne un io.BytesIO contenant l'image PNG, ou None si pas assez de données.
+    Génère un graphique PNG (fond sombre) montrant l'évolution de l'equity.
+    history = [(timestamp_sec, equity), ...]
+    Retourne un buffer BytesIO prêt à être envoyé à Telegram (sendPhoto).
     """
-    import math
-    import datetime
-    import matplotlib.pyplot as plt
-    from matplotlib import dates as mdates
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from datetime import datetime
 
-    # ---------- Cas trivial : pas (ou trop peu) de trades ----------
-    if not trades or len(trades) < 1:
-        return None
-
-    # ---------- Helpers internes ----------
-
-    def _extract_time_field(trade: Dict[str, Any]) -> Any:
-        """
-        Tente de récupérer un champ temporel parmi plusieurs clés possibles.
-        Retourne la valeur brute (int/float/str/datetime) ou None.
-        """
-        for key in (
-            "close_time",
-            "closed_at",
-            "exit_time",
-            "timestamp",
-            "time",
-            "open_time",
-            "opened_at",
-        ):
-            if key in trade and trade[key] is not None:
-                return trade[key]
-        return None
-
-    def _to_datetime_safe(raw: Any) -> Optional[datetime.datetime]:
-        """
-        Convertit de manière robuste un champ 'temps' en datetime timezone-aware (UTC).
-
-        Gère les cas fréquents :
-        - int / float en secondes, millisecondes, microsecondes, nanosecondes.
-        - chaîne ISO-8601.
-        - datetime déjà prêt.
-
-        Si la valeur est incohérente (int énorme, etc.), renvoie None.
-        """
-        if raw is None:
+        # Pas d'historique -> pas de graphique
+        if not history:
             return None
 
-        # Déjà un datetime
-        if isinstance(raw, datetime.datetime):
-            # Normalise en UTC aware si possible
-            if raw.tzinfo is None:
-                return raw.replace(tzinfo=datetime.timezone.utc)
-            return raw.astimezone(datetime.timezone.utc)
-
-        # Numérique : timestamp
-        if isinstance(raw, (int, float)):
+        # Séparation des séries
+        ts_raw = []
+        eq = []
+        for t, e in history:
             try:
-                v = float(raw)
-
-                # Si la valeur est vraiment gigantesque, on réduit par palier
-                # jusqu'à obtenir un ordre de grandeur cohérent.
-                # - secondes ~ 1e9 (31 ans)
-                # - ms      ~ 1e12
-                # - µs      ~ 1e15
-                # - ns      ~ 1e18
-                # On divise par 1000 tant que c'est trop grand.
-                # Limite de sécurité : on s'arrête avant que ça ne devienne absurde.
-                steps = 0
-                while abs(v) > 1e11 and steps < 5:
-                    v /= 1000.0
-                    steps += 1
-
-                # Ultime garde-fou : si c'est encore trop grand, on abandonne
-                if abs(v) > 1e11:
-                    return None
-
-                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+                ts_raw.append(float(t))
             except Exception:
-                return None
-
-        # Chaîne de caractères
-        if isinstance(raw, str):
-            raw_str = raw.strip()
-            if not raw_str:
-                return None
-
-            # Essai ISO-8601 direct
+                ts_raw.append(0.0)
             try:
-                dt = datetime.datetime.fromisoformat(raw_str)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=datetime.timezone.utc)
-                else:
-                    dt = dt.astimezone(datetime.timezone.utc)
-                return dt
+                eq.append(float(e))
             except Exception:
-                pass
+                eq.append(0.0)
 
-            # Essai : chaîne numérique (timestamp)
+        # Conversion timestamps -> datetime
+        ts = []
+        for v in ts_raw:
+            # support secondes ou millisecondes
+            if v > 10_000_000_000:
+                v = v / 1000.0
             try:
-                v = float(raw_str)
-                steps = 0
-                while abs(v) > 1e11 and steps < 5:
-                    v /= 1000.0
-                    steps += 1
-                if abs(v) > 1e11:
-                    return None
-                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+                ts.append(datetime.fromtimestamp(v))
             except Exception:
-                return None
+                ts.append(datetime.fromtimestamp(0))
 
-        # Type non géré
-        return None
+        plt.style.use("dark_background")
+        fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
 
-    def _get_pnl(trade: Dict[str, Any]) -> float:
-        """
-        Récupère le PnL du trade (USDT).
-        Si le champ 'pnl' n'existe pas, renvoie 0.0.
-        """
-        try:
-            return float(trade.get("pnl", 0.0) or 0.0)
-        except Exception:
-            return 0.0
+        ax.plot(ts, eq, linestyle='-', linewidth=1.8)
 
-    # ---------- Extraction & préparation des séries temps / équité ----------
+        ax.set_title("Évolution du Portefeuille (Equity)", fontsize=12)
+        ax.set_xlabel("Temps")
+        ax.set_ylabel("Equity (USDT)")
 
-    time_equity_points = []
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+        fig.autofmt_xdate()
 
-    for tr in trades:
-        raw_t = _extract_time_field(tr)
-        dt = _to_datetime_safe(raw_t)
-        if dt is None:
-            continue  # on ignore les trades avec timestamp illisible
-
-        pnl = _get_pnl(tr)
-        time_equity_points.append((dt, pnl))
-
-    # Si après filtrage il ne reste rien, on ne fait pas de graphe
-    if not time_equity_points:
-        return None
-
-    # Tri par date croissante
-    time_equity_points.sort(key=lambda x: x[0])
-
-    # Construction de la courbe d'équité : somme cumulée des PnL
-    dates = [t for (t, _) in time_equity_points]
-    pnls = [p for (_, p) in time_equity_points]
-
-    equity = []
-    cum = 0.0
-    for p in pnls:
-        cum += p
-        equity.append(cum)
-
-    # ---------- Génération du graphique ----------
-
-    # Conversion en format numérique matplotlib
-    x = mdates.date2num(dates)
-    y = equity
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-
-    ax.plot(x, y, linewidth=1.5)
-    ax.set_xlabel("Temps")
-    ax.set_ylabel("Équité (PnL cumulé)")
-    ax.set_title("Courbe d'équité")
-
-    # Formatage de l'axe des dates
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
-    fig.autofmt_xdate()
-
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-
-    # ---------- Export en PNG vers un buffer mémoire ----------
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=120)
-    plt.close(fig)
-    buf.seek(0)
-
-    return buf
-
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf
 
     except Exception as e:
         print(f"[generate_equity_chart] erreur: {e}")
         return None
-
