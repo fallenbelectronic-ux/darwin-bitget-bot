@@ -7,83 +7,105 @@ import io
 
 def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Calcule les statistiques de performance à partir d'une liste de trades.
-    - Utilise en priorité :
-        • 'pnl'  ou 'pnl_abs'  (USDT)
-        • 'pnl_percent' ou 'pnl_pct' ou 'roi'  (%)
-    - Si le pourcentage est manquant, il est recalculé à la volée :
-        pnl_percent = pnl / (entry_price * quantity) * 100
+
+    ⚠️ Ne dépend plus de la colonne 'pnl' en DB :
+    - PnL USDT est RECONSTRUIT à partir de (entry, exit, qty, side) si le champ 'pnl'
+      est manquant ou ≈ 0.
+    - PnL % est RECONSTRUIT à partir de pnl / (entry * qty) * 100 si
+      'pnl_percent' est manquant ou ≈ 0.
     """
+
+    def _to_float(x, default: float = 0.0) -> float:
+        try:
+            if x is None:
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _first(t: Dict[str, Any], keys, default=None):
+        for k in keys:
+            if k in t and t[k] is not None:
+                return t[k]
+        return default
+
     total_trades = len(trades)
     if total_trades < 1:
         return {"total_trades": 0}
 
-    # ---------- Série des PnL en USDT ----------
     pnls_list: List[float] = []
+    pnl_percents_list: List[float] = []
+
     for t in trades:
-        v = t.get('pnl', None)
-        if v is None:
-            v = t.get('pnl_abs', None)        # compat ancien schéma
-        if v is None:
-            v = t.get('profit', 0.0)          # fallback éventuel
+        # --- Récupération robuste des champs prix/qty/side ---
+        side_raw = str(_first(t, ["side", "direction", "position_side"], "")).lower()
+        side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
+
+        entry = _to_float(
+            _first(t, ["entry_price", "entry", "price_open", "avg_entry_price", "avgEntryPrice"], None),
+            0.0,
+        )
+        exit_price = _to_float(
+            _first(t, ["exit_price", "close_price", "price_close", "avg_exit_price", "close"], None),
+            0.0,
+        )
+        qty = _to_float(
+            _first(t, ["quantity", "qty", "contracts", "size", "amount"], None),
+            0.0,
+        )
+
+        # --- PnL absolu : priorité à la DB si non nul, sinon reconstruction ---
+        pnl_db = t.get("pnl", None)
+        pnl_val: float
 
         try:
-            pnls_list.append(float(v if v is not None else 0.0))
+            if pnl_db is not None:
+                tmp = float(pnl_db)
+                # si la DB contient un PnL significatif, on le respecte
+                if abs(tmp) > 1e-9:
+                    pnl_val = tmp
+                else:
+                    raise ValueError("pnl_db≈0 -> recalc")
+            else:
+                raise ValueError("pnl_db missing")
         except Exception:
-            pnls_list.append(0.0)
+            # reconstruction à partir des prix
+            if entry > 0.0 and exit_price > 0.0 and qty > 0.0 and side:
+                if side == "buy":
+                    pnl_val = (exit_price - entry) * qty
+                else:
+                    pnl_val = (entry - exit_price) * qty
+            else:
+                pnl_val = 0.0
+
+        pnls_list.append(float(pnl_val))
+
+        # --- PnL % : priorité au champ DB non nul, sinon reconstruction ---
+        pnl_pct_db = t.get("pnl_percent", None)
+        try:
+            if pnl_pct_db is not None:
+                tmp_pct = float(pnl_pct_db)
+                if abs(tmp_pct) > 1e-9:
+                    pnl_pct_val = tmp_pct
+                else:
+                    raise ValueError("pnl_pct_db≈0 -> recalc")
+            else:
+                raise ValueError("pnl_pct_db missing")
+        except Exception:
+            notional = abs(entry * qty)
+            if notional > 0.0:
+                pnl_pct_val = (pnl_val / notional) * 100.0
+            else:
+                pnl_pct_val = 0.0
+
+        pnl_percents_list.append(float(pnl_pct_val))
 
     pnls = np.array(pnls_list, dtype=float)
-
-    # ---------- Série des PnL en % ----------
-    pnl_percents_list: List[float] = []
-    for t in trades:
-        # priorité : colonnes explicites
-        raw_pct = t.get('pnl_percent', None)
-        if raw_pct is None:
-            raw_pct = t.get('pnl_pct', None)  # compat EXECUTIONS_LOG / anciens schémas
-        if raw_pct is None:
-            raw_pct = t.get('roi', None)
-
-        # Si toujours None -> on tente le recalcul à partir de pnl / notional
-        if raw_pct is None:
-            try:
-                # même logique que pour pnls_list
-                v = t.get('pnl', None)
-                if v is None:
-                    v = t.get('pnl_abs', None)
-                if v is None:
-                    v = t.get('profit', 0.0)
-                pnl_val = float(v if v is not None else 0.0)
-
-                entry_price = float(t.get('entry_price') or t.get('entry') or 0.0)
-                quantity = float(t.get('quantity') or t.get('qty') or t.get('contracts') or 0.0)
-                notional = abs(entry_price * quantity)
-                if notional > 0.0:
-                    raw_pct = (pnl_val / notional) * 100.0
-                else:
-                    raw_pct = 0.0
-            except Exception:
-                raw_pct = 0.0
-
-        try:
-            pnl_percents_list.append(float(raw_pct if raw_pct is not None else 0.0))
-        except Exception:
-            pnl_percents_list.append(0.0)
-
     pnl_percents = np.array(pnl_percents_list, dtype=float)
 
     effective_trades = int(pnls.size)
     if effective_trades < 1:
-        return {
-            "total_trades": 0,
-            "nb_wins": 0,
-            "nb_losses": 0,
-            "win_rate": 0.0,
-            "total_pnl": 0.0,
-            "profit_factor": None,
-            "avg_trade_pnl_percent": 0.0,
-            "sharpe_ratio": 0.0,
-            "max_drawdown_percent": 0.0,
-        }
+        return {"total_trades": 0, "nb_wins": 0, "nb_losses": 0}
 
     wins = pnls[pnls > 0.0]
     losses = pnls[pnls < 0.0]
@@ -95,21 +117,21 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     gross_profit = float(np.sum(wins)) if wins.size else 0.0
     gross_loss = abs(float(np.sum(losses))) if losses.size else 0.0  # positif
 
-    # Winrate sur tous les trades considérés (BE inclus dans le dénominateur)
+    # Winrate (BE inclus dans le dénominateur)
     win_rate = (nb_wins / effective_trades) * 100.0 if effective_trades else 0.0
 
     # Profit Factor robuste
     if gross_profit == 0.0 and gross_loss == 0.0:
-        profit_factor = None                 # indéfini (0/0) => affichage "—"
+        profit_factor = None
     elif gross_loss == 0.0 and gross_profit > 0.0:
-        profit_factor = math.inf             # aucune perte mais du profit => ∞
+        profit_factor = math.inf
     else:
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0.0 else 0.0
 
     # Gain moyen par trade en %
     avg_trade_pnl_percent = float(np.mean(pnl_percents)) if pnl_percents.size > 0 else 0.0
 
-    # Sharpe approx par trade
+    # Sharpe approx
     if pnl_percents.size > 1:
         sigma = float(np.std(pnl_percents, ddof=1))
         if sigma > 0.0:
@@ -120,7 +142,7 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         sharpe_ratio = 0.0
 
-    # Max Drawdown (%) sur l'equity cumulée (en USDT)
+    # Max Drawdown (%) sur l'equity cumulée (en USDT), normalisée par le pic courant
     equity_curve = np.cumsum(pnls).astype(float)
     running_max = np.maximum.accumulate(equity_curve)
     drawdown = equity_curve - running_max  # <= 0
@@ -134,7 +156,7 @@ def calculate_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "nb_losses": nb_losses,
         "win_rate": round(win_rate, 2),
         "total_pnl": round(total_pnl, 2),
-        "profit_factor": profit_factor,
+        "profit_factor": profit_factor,  # laissé tel quel pour être formaté à l'affichage
         "avg_trade_pnl_percent": round(avg_trade_pnl_percent, 2),
         "sharpe_ratio": round(sharpe_ratio, 2),
         "max_drawdown_percent": round(max_drawdown_percent, 2),
@@ -326,22 +348,69 @@ def format_report_message(title: str, stats: Dict[str, Any], balance: Optional[f
 def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
     """
     Construit l'historique equity en cumulant les PNL des trades fermés.
+    PnL est RECONSTRUIT à partir des prix si le champ 'pnl' est manquant ou ≈ 0.
     Retourne une liste triée de tuples: (timestamp, equity).
     """
-    history = []
+
+    def _to_float(x, default: float = 0.0) -> float:
+        try:
+            if x is None:
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _first(t: Dict[str, Any], keys, default=None):
+        for k in keys:
+            if k in t and t[k] is not None:
+                return t[k]
+        return default
+
+    def _compute_pnl(t: Dict[str, Any]) -> float:
+        """PnL USDT robuste pour un trade."""
+        side_raw = str(_first(t, ["side", "direction", "position_side"], "")).lower()
+        side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
+
+        entry = _to_float(
+            _first(t, ["entry_price", "entry", "price_open", "avg_entry_price", "avgEntryPrice"], None),
+            0.0,
+        )
+        exit_price = _to_float(
+            _first(t, ["exit_price", "close_price", "price_close", "avg_exit_price", "close"], None),
+            0.0,
+        )
+        qty = _to_float(
+            _first(t, ["quantity", "qty", "contracts", "size", "amount"], None),
+            0.0,
+        )
+
+        pnl_db = t.get("pnl", None)
+        try:
+            if pnl_db is not None:
+                tmp = float(pnl_db)
+                if abs(tmp) > 1e-9:
+                    return tmp
+        except Exception:
+            pass
+
+        if entry > 0.0 and exit_price > 0.0 and qty > 0.0 and side:
+            if side == "buy":
+                return (exit_price - entry) * qty
+            else:
+                return (entry - exit_price) * qty
+        return 0.0
+
+    history: List[tuple] = []
     equity = 0.0
 
     # tri par timestamp
     try:
-        trades_sorted = sorted(trades, key=lambda t: float(t.get("close_timestamp", 0)))
+        trades_sorted = sorted(trades, key=lambda t: float(t.get("close_timestamp", 0) or t.get("ts") or 0))
     except Exception:
         trades_sorted = trades
 
     for t in trades_sorted:
-        try:
-            pnl = float(t.get("pnl", 0.0) or 0.0)
-        except Exception:
-            pnl = 0.0
+        pnl = _compute_pnl(t)
 
         try:
             ts = float(t.get("close_timestamp") or t.get("ts") or 0.0)
