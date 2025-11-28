@@ -1397,6 +1397,57 @@ def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, q
     except Exception as e:
         notifier.tg_send_error(f"Import position {symbol} -> DB", e)
 
+def _estimate_pnl_for_closed_trade(ex, row: Dict[str, Any]) -> float:
+    """
+    Estime le PnL d'un trade fermé côté exchange alors que la DB pense encore qu'il est ouvert.
+    Utilisé uniquement dans sync_positions_with_exchange lorsque l'exchange est FLAT pour un symbole.
+
+    Approche:
+      - side: 'buy'/'sell'
+      - entry: row['entry_price'] (ou 'entry')
+      - qty:   row['quantity'] (ou 'qty')
+      - exit:  row['exit_price']/'close_price' si présent, sinon dernier prix du ticker.
+
+    Si une info clé manque → retourne 0.0 (comportement précédent).
+    """
+    try:
+        symbol = str(row.get("symbol") or "")
+        if not symbol:
+            return 0.0
+
+        side_raw = str(row.get("side") or "").lower()
+        side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
+        if not side:
+            return 0.0
+
+        entry = row.get("entry_price", row.get("entry"))
+        qty = row.get("quantity", row.get("qty"))
+
+        entry = float(entry or 0.0)
+        qty = float(qty or 0.0)
+        if entry <= 0.0 or qty <= 0.0:
+            return 0.0
+
+        # Prix de sortie: on privilégie ce qui est déjà stocké en DB
+        exit_price = row.get("exit_price") or row.get("close_price") or row.get("avg_exit_price")
+        if exit_price is None and ex is not None:
+            try:
+                t = ex.fetch_ticker(symbol) or {}
+                exit_price = t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0
+            except Exception:
+                exit_price = 0.0
+        exit_price = float(exit_price or 0.0)
+        if exit_price <= 0.0:
+            return 0.0
+
+        if side == "buy":
+            pnl = (exit_price - entry) * qty
+        else:
+            pnl = (entry - exit_price) * qty
+        return float(pnl)
+    except Exception:
+        return 0.0
+
 def sync_positions_with_exchange(ex) -> None:
     """
     Synchronise la table trades avec L’EXCHANGE COMME SOURCE DE VÉRITÉ (agrégation par symbole).
@@ -1563,58 +1614,6 @@ def sync_positions_with_exchange(ex) -> None:
 
     except Exception as e:
         print(f"[sync_positions_with_exchange] error: {e}")
-
-
-def _estimate_pnl_for_closed_trade(ex, row: Dict[str, Any]) -> float:
-    """
-    Estime le PnL d'un trade fermé côté exchange alors que la DB pense encore qu'il est ouvert.
-    Utilisé uniquement dans sync_positions_with_exchange lorsque l'exchange est FLAT pour un symbole.
-
-    Approche:
-      - side: 'buy'/'sell'
-      - entry: row['entry_price'] (ou 'entry')
-      - qty:   row['quantity'] (ou 'qty')
-      - exit:  row['exit_price']/'close_price' si présent, sinon dernier prix du ticker.
-
-    Si une info clé manque → retourne 0.0 (comportement précédent).
-    """
-    try:
-        symbol = str(row.get("symbol") or "")
-        if not symbol:
-            return 0.0
-
-        side_raw = str(row.get("side") or "").lower()
-        side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
-        if not side:
-            return 0.0
-
-        entry = row.get("entry_price", row.get("entry"))
-        qty = row.get("quantity", row.get("qty"))
-
-        entry = float(entry or 0.0)
-        qty = float(qty or 0.0)
-        if entry <= 0.0 or qty <= 0.0:
-            return 0.0
-
-        # Prix de sortie: on privilégie ce qui est déjà stocké en DB
-        exit_price = row.get("exit_price") or row.get("close_price") or row.get("avg_exit_price")
-        if exit_price is None and ex is not None:
-            try:
-                t = ex.fetch_ticker(symbol) or {}
-                exit_price = t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0
-            except Exception:
-                exit_price = 0.0
-        exit_price = float(exit_price or 0.0)
-        if exit_price <= 0.0:
-            return 0.0
-
-        if side == "buy":
-            pnl = (exit_price - entry) * qty
-        else:
-            pnl = (entry - exit_price) * qty
-        return float(pnl)
-    except Exception:
-        return 0.0
             
 
 def _validate_tp_for_side(side: str, tp_price: float, current_price: float, tick_size: float) -> float:
