@@ -392,12 +392,50 @@ def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
 def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Variante de calculate_performance_stats travaillant sur une liste d'exécutions
-    (EXECUTIONS_LOG). Utilise 'pnl_abs' (USDT) et 'pnl_pct' (%).
-    Seuls les enregistrements avec status == 'closed' sont pris en compte.
-    Retourne les mêmes clés que calculate_performance_stats.
+    (EXECUTIONS_LOG).
+
+    - On considère comme "fermées" :
+        • status in ('closed', 'filled', 'done', 'finished', 'tp', 'sl', 'closed_by_sl', 'closed_by_tp')
+        • OU présence d'un champ 'closed_at' non nul.
+      Les autres exécutions sont ignorées.
+
+    - PnL USDT :
+        • utilise en priorité e['pnl_abs'] si présent,
+        • sinon est recalculé à partir de (exit - entry) * qty (long) ou (entry - exit) * qty (short).
+
+    - PnL en % :
+        • utilise en priorité e['pnl_pct'] si présent,
+        • sinon est recalculé à partir de pnl_abs / (entry * qty) * 100.
+
+    Retourne le même dictionnaire que calculate_performance_stats.
     """
-    closed = [e for e in (executions or []) if str(e.get("status", "")).lower() == "closed"]
-    total_trades = len(closed)
+
+    def _is_closed(e: Dict[str, Any]) -> bool:
+        status = str(e.get("status", "")).lower()
+        if status in ("closed", "filled", "done", "finished", "tp", "sl", "closed_by_sl", "closed_by_tp"):
+            return True
+        closed_at = e.get("closed_at")
+        try:
+            return closed_at not in (None, "", 0, "0")
+        except Exception:
+            return False
+
+    def _to_float(x, default: float = 0.0) -> float:
+        try:
+            if x is None:
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _first(e: Dict[str, Any], keys, default=None):
+        for k in keys:
+            if k in e and e[k] is not None:
+                return e[k]
+        return default
+
+    closed_execs = [e for e in (executions or []) if _is_closed(e)]
+    total_trades = len(closed_execs)
     if total_trades < 1:
         return {
             "total_trades": 0,
@@ -411,19 +449,55 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
             "max_drawdown_percent": 0.0,
         }
 
-    # PnL absolu (USDT)
-    pnls = []
-    # PnL en %
-    pnl_percents = []
-    for e in closed:
-        try:
-            pnls.append(float(e.get("pnl_abs", 0.0) or 0.0))
-        except Exception:
-            pnls.append(0.0)
-        try:
-            pnl_percents.append(float(e.get("pnl_pct", 0.0) or 0.0))
-        except Exception:
-            pnl_percents.append(0.0)
+    pnls: List[float] = []
+    pnl_percents: List[float] = []
+
+    for e in closed_execs:
+        # --- PnL absolu ---
+        pnl_abs = None
+        if "pnl_abs" in e:
+            pnl_abs = _to_float(e.get("pnl_abs"), None)
+
+        # --- PnL % déjà présent ?
+        pnl_pct = None
+        if "pnl_pct" in e:
+            pnl_pct = _to_float(e.get("pnl_pct"), None)
+
+        # Si manque, on recalcule à partir d'entry/exit/qty/side
+        if pnl_abs is None or pnl_pct is None:
+            entry = _to_float(
+                _first(e, ["avg_entry", "avgEntry", "entry", "entry_price", "price_open"], None),
+                0.0,
+            )
+            exit_price = _to_float(
+                _first(e, ["close_price", "exit", "exit_price", "price_close"], None),
+                0.0,
+            )
+            qty = _to_float(
+                _first(e, ["qty", "quantity", "contracts", "size", "amount"], None),
+                0.0,
+            )
+            side_raw = str(
+                _first(e, ["side", "direction", "position_side"], "")
+            ).lower()
+            side = "buy" if side_raw in ("buy", "long") else "sell" if side_raw in ("sell", "short") else ""
+
+            if entry > 0.0 and exit_price > 0.0 and qty > 0.0 and side:
+                if pnl_abs is None:
+                    if side == "buy":
+                        pnl_abs = (exit_price - entry) * qty
+                    else:
+                        pnl_abs = (entry - exit_price) * qty
+                if pnl_pct is None and pnl_abs is not None:
+                    notional = abs(entry * qty)
+                    pnl_pct = (pnl_abs / notional) * 100.0 if notional > 0.0 else 0.0
+
+        # Sécurités finales
+        pnl_abs = _to_float(pnl_abs, 0.0)
+        pnl_pct = _to_float(pnl_pct, 0.0)
+
+        pnls.append(pnl_abs)
+        pnl_percents.append(pnl_pct)
 
     pnls_arr = np.array(pnls, dtype=float)
     pnl_pct_arr = np.array(pnl_percents, dtype=float)
@@ -463,7 +537,7 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
     else:
         sharpe_ratio = 0.0
 
-    # Max drawdown approximé sur la courbe d’equity
+    # Max drawdown sur la courbe d’equity cumulée
     equity_curve = np.cumsum(pnls_arr).astype(float)
     running_max = np.maximum.accumulate(equity_curve)
     drawdown = equity_curve - running_max  # <= 0
@@ -482,3 +556,4 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
         "sharpe_ratio": round(sharpe_ratio, 2),
         "max_drawdown_percent": round(max_drawdown_percent, 2),
     }
+
