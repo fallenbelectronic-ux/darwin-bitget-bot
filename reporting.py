@@ -519,66 +519,15 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
 
     return _build_history_from_exec(execs)
 
-def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
+def generate_equity_chart(trades: List[Dict[str, Any]]) -> Optional[io.BytesIO]:
     """
-    Génère un graphique PNG (fond sombre) montrant l'évolution de l'equity.
-    history = [(timestamp_sec, equity), ...]
-    Retourne un buffer BytesIO prêt à être envoyé à Telegram (sendPhoto).
+    (Désactivé) Génération du schéma PnL / courbe d'équité.
+
+    Cette fonction renvoie toujours None afin de désactiver
+    l'affichage du schéma dans les statistiques.
     """
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        from datetime import datetime
+    return None
 
-        # Pas d'historique -> pas de graphique
-        if not history:
-            return None
-
-        # Séparation des séries
-        ts_raw = []
-        eq = []
-        for t, e in history:
-            try:
-                ts_raw.append(float(t))
-            except Exception:
-                ts_raw.append(0.0)
-            try:
-                eq.append(float(e))
-            except Exception:
-                eq.append(0.0)
-
-        # Conversion timestamps -> datetime
-        ts = []
-        for v in ts_raw:
-            # support secondes ou millisecondes
-            if v > 10_000_000_000:
-                v = v / 1000.0
-            try:
-                ts.append(datetime.fromtimestamp(v))
-            except Exception:
-                ts.append(datetime.fromtimestamp(0))
-
-        plt.style.use("dark_background")
-        fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
-
-        ax.plot(ts, eq, linestyle='-', linewidth=1.8)
-
-        ax.set_title("Évolution du Portefeuille (Equity)", fontsize=12)
-        ax.set_xlabel("Temps")
-        ax.set_ylabel("Equity (USDT)")
-
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
-        fig.autofmt_xdate()
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-
-    except Exception as e:
-        print(f"[generate_equity_chart] erreur: {e}")
-        return None
 
 def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
