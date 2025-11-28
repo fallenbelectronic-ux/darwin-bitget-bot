@@ -135,6 +135,60 @@ def send_validated_signal_report(symbol: str, signal: Dict, is_taken: bool, reas
     except Exception:
         pass
 
+def tg_show_signals_pending(callback: Dict[str, Any]) -> None:
+    """
+    Affiche la liste des signaux en attente (state.get_pending_signals()).
+
+    Utilisé par le bouton « Signal(s) en attente » :
+    - Si aucun signal : message dédié.
+    - Sinon : liste symbol / side / timeframe / RR approximatif.
+    """
+    import state  # import local pour éviter les imports circulaires
+
+    try:
+        pending = state.get_pending_signals()
+    except Exception as e:
+        print(f"[tg_show_signals_pending] erreur lors de la récupération des signaux en attente: {e}")
+        return
+
+    # Récupération des infos de chat / message depuis le callback
+    msg = (callback or {}).get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id") or TG_CHAT_ID
+    message_id = msg.get("message_id")
+
+    if not pending:
+        text = "🧊 Aucun signal en attente pour le moment."
+    else:
+        lines: List[str] = ["⚪ <b>Signal(s) en attente :</b>", ""]
+        for symbol, payload in pending.items():
+            side = (payload.get("side") or "").upper()
+            timeframe = payload.get("timeframe") or "?"
+            # On essaie de récupérer une info de RR si disponible
+            rr_val = payload.get("rr") or payload.get("rr_expected")
+            if isinstance(rr_val, (int, float)):
+                rr_txt = f"{rr_val:.2f}R"
+            else:
+                rr_txt = "?"
+
+            lines.append(
+                f"• <b>{_escape(symbol)}</b> "
+                f"({_escape(timeframe)}) – {_escape(side)} – RR≈{_escape(rr_txt)}"
+            )
+
+        text = "\n".join(lines)
+
+    try:
+        if message_id is not None:
+            tg_edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+            )
+        else:
+            tg_send(text=text, chat_id=chat_id)
+    except Exception as e:
+        print(f"[tg_show_signals_pending] erreur lors de l'envoi du message: {e}")
 
     
 def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]) -> None:
