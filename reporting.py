@@ -388,3 +388,97 @@ def generate_equity_chart(history: List[tuple]) -> Optional[io.BytesIO]:
     except Exception as e:
         print(f"[generate_equity_chart] erreur: {e}")
         return None
+
+def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Variante de calculate_performance_stats travaillant sur une liste d'exécutions
+    (EXECUTIONS_LOG). Utilise 'pnl_abs' (USDT) et 'pnl_pct' (%).
+    Seuls les enregistrements avec status == 'closed' sont pris en compte.
+    Retourne les mêmes clés que calculate_performance_stats.
+    """
+    closed = [e for e in (executions or []) if str(e.get("status", "")).lower() == "closed"]
+    total_trades = len(closed)
+    if total_trades < 1:
+        return {
+            "total_trades": 0,
+            "nb_wins": 0,
+            "nb_losses": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "profit_factor": None,
+            "avg_trade_pnl_percent": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown_percent": 0.0,
+        }
+
+    # PnL absolu (USDT)
+    pnls = []
+    # PnL en %
+    pnl_percents = []
+    for e in closed:
+        try:
+            pnls.append(float(e.get("pnl_abs", 0.0) or 0.0))
+        except Exception:
+            pnls.append(0.0)
+        try:
+            pnl_percents.append(float(e.get("pnl_pct", 0.0) or 0.0))
+        except Exception:
+            pnl_percents.append(0.0)
+
+    pnls_arr = np.array(pnls, dtype=float)
+    pnl_pct_arr = np.array(pnl_percents, dtype=float)
+
+    wins = pnls_arr[pnls_arr > 0.0]
+    losses = pnls_arr[pnls_arr < 0.0]
+
+    nb_wins = int(wins.size)
+    nb_losses = int(losses.size)
+
+    total_pnl = float(np.sum(pnls_arr))
+    gross_profit = float(np.sum(wins)) if wins.size else 0.0
+    gross_loss = abs(float(np.sum(losses))) if losses.size else 0.0  # positif
+
+    # Winrate
+    win_rate = (nb_wins / total_trades) * 100.0 if total_trades else 0.0
+
+    # Profit factor
+    if gross_profit == 0.0 and gross_loss == 0.0:
+        profit_factor = None
+    elif gross_loss == 0.0 and gross_profit > 0.0:
+        profit_factor = math.inf
+    else:
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0.0 else 0.0
+
+    # Gain moyen par trade en %
+    avg_trade_pnl_percent = float(np.mean(pnl_pct_arr)) if pnl_pct_arr.size > 0 else 0.0
+
+    # Sharpe approx
+    if pnl_pct_arr.size > 1:
+        sigma = float(np.std(pnl_pct_arr, ddof=1))
+        if sigma > 0.0:
+            mu = float(np.mean(pnl_pct_arr))
+            sharpe_ratio = (mu / sigma) * math.sqrt(pnl_pct_arr.size)
+        else:
+            sharpe_ratio = 0.0
+    else:
+        sharpe_ratio = 0.0
+
+    # Max drawdown approximé sur la courbe d’equity
+    equity_curve = np.cumsum(pnls_arr).astype(float)
+    running_max = np.maximum.accumulate(equity_curve)
+    drawdown = equity_curve - running_max  # <= 0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dd_pct = np.where(running_max != 0.0, drawdown / running_max, 0.0)
+    max_drawdown_percent = float(abs(np.min(dd_pct)) * 100.0) if dd_pct.size > 0 else 0.0
+
+    return {
+        "total_trades": total_trades,
+        "nb_wins": nb_wins,
+        "nb_losses": nb_losses,
+        "win_rate": round(win_rate, 2),
+        "total_pnl": round(total_pnl, 2),
+        "profit_factor": profit_factor,
+        "avg_trade_pnl_percent": round(avg_trade_pnl_percent, 2),
+        "sharpe_ratio": round(sharpe_ratio, 2),
+        "max_drawdown_percent": round(max_drawdown_percent, 2),
+    }
