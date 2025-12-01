@@ -13,15 +13,35 @@ _EPS = 1e-9              # tolérance numérique
 def get_universe_by_market_cap(ex, universe_size):
     """
     Construit un univers de paires USDT-perp triées par volume/turnover 24h (avec fallbacks).
+
+    MISE À JOUR :
+    - Priorise une liste fixe de bases (BTC, EGLD, KITE, etc.) fournie par l'utilisateur.
+    - Les paires correspondant à ces bases sont ajoutées en tête de l'univers.
+    - Ensuite, on complète avec les autres perps classés par volume.
+    - universe_size reste le NOMBRE MAXIMUM TOTAL de paires retournées, mais on garantit
+      que toutes les paires prioritaires présentes sur l'exchange sont incluses, quitte
+      à dépasser la valeur si universe_size < nb_prioritaires.
+
     Ne renvoie jamais une liste vide : plusieurs niveaux de repli, puis un 'core set' si nécessaire.
 
     Args:
         ex: instance ccxt (Bybit/Bitget) déjà configurée (rate limit, defaultType=swap si possible)
-        universe_size: nombre maximum de paires à renvoyer
+        universe_size: nombre maximum de paires à renvoyer (prioritaires + auto)
 
     Returns:
         list[str]: symboles CCXT (priorité perp 'BASE/USDT:USDT', fallback spot 'BASE/USDT')
     """
+    # ---------- Bases prioritaires (liste de l'utilisateur) ----------
+    preferred_bases = [
+        "BTC", "EGLD", "KITE", "ALGO", "HBAR", "ETH", "AVAX", "BEAM", "CAKE", "RSR",
+        "LIGHT", "KAS", "SUI", "XLM", "ZEC", "XRP", "SOL", "TAO", "BNB", "DOT", "NEAR",
+        "TURBO", "LQTY", "GALA", "EIGEN", "CFX", "APT", "LTC", "ETC", "ADA", "ALICE",
+        "LINK", "TON", "IMX", "ZK", "IOTA", "STX", "OP", "MANA", "VET", "ZIL", "DOGE",
+        "SHIB", "RUNE", "1INCH", "CHZ", "RVN", "DYDX", "JASMY", "FET", "MINA", "DODO",
+        "ARB", "FLUX", "QTUM", "BCH",
+    ]
+    preferred_bases = [b.upper() for b in preferred_bases]
+
     # ---------- Helpers locaux ----------
     def _is_usdt_perp(mkt):
         try:
@@ -175,17 +195,55 @@ def get_universe_by_market_cap(ex, universe_size):
         if picked:
             scored = picked
 
-    # ---------- 7) Tri, dédoublonnage, découpe ----------
-    scored = sorted(scored, key=lambda x: (x[1], x[0]), reverse=True)
-    seen, final_symbols = set(), []
-    max_n = max(1, int(universe_size or 30))
-    for sym, _vol in scored:
-        if sym in seen:
+    # ---------- 7) Tri, priorisation, dédoublonnage, découpe ----------
+    if not scored:
+        print("⚠️ utils.get_universe_by_market_cap: aucun marché scoré après tous les fallbacks.")
+        return []
+
+    scored_sorted = sorted(scored, key=lambda x: (x[1], x[0]), reverse=True)
+
+    # 7.a) Sélection des symboles prioritaires (bases dans preferred_bases)
+    preferred_symbols = []
+    seen_pref = set()
+    for sym, _vol in scored_sorted:
+        mkt = markets.get(sym, {})
+        base = (mkt.get("base") or "").upper()
+        if base in preferred_bases and sym not in seen_pref:
+            preferred_symbols.append(sym)
+            seen_pref.add(sym)
+
+    # 7.b) Reste des symboles auto (non prioritaires)
+    auto_symbols = []
+    for sym, _vol in scored_sorted:
+        if sym in seen_pref:
             continue
-        seen.add(sym)
+        auto_symbols.append(sym)
+
+    # 7.c) Taille max de l'univers (on garantit au moins toutes les priorités)
+    try:
+        max_n_raw = int(universe_size or 30)
+    except Exception:
+        max_n_raw = 30
+    max_n = max(1, max(len(preferred_symbols), max_n_raw))
+
+    final_symbols = []
+    seen_all = set()
+
+    # D'abord les priorités
+    for sym in preferred_symbols:
+        if sym in seen_all:
+            continue
+        seen_all.add(sym)
         final_symbols.append(sym)
+
+    # Puis le reste jusqu'à max_n
+    for sym in auto_symbols:
         if len(final_symbols) >= max_n:
             break
+        if sym in seen_all:
+            continue
+        seen_all.add(sym)
+        final_symbols.append(sym)
 
     if not final_symbols:
         print("⚠️ utils.get_universe_by_market_cap: univers vide après tous les fallbacks.")
@@ -200,6 +258,7 @@ def get_universe_by_market_cap(ex, universe_size):
         return minimal[:max_n]
 
     return final_symbols
+
 
 
 def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 200) -> Optional[pd.DataFrame]:
