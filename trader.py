@@ -2262,22 +2262,25 @@ def adjust_tp_for_bb_offset(raw_tp: float, side: str, atr: float = 0.0, ref_pric
 
 def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: Optional[float] = None) -> float:
     """
-    (MISE À JOUR) Offset hybride pour le SL : max(pourcentage, ATR*k).
+    (MISE À JOUR) Offset hybride pour le SL : min(pourcentage, ATR*k) pour éviter un SL trop éloigné.
     - ref_price: l’ancre (high/low de la bougie d’ancrage) pour convertir ATR en %.
     - Sans ref_price, on retombe sur l'ancien comportement (pourcentage seul).
     """
     try:
-        pct = float(database.get_setting('SL_OFFSET_PCT', '0.006'))  # 0.60%
+        pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))  # 0.30%
     except Exception:
-        pct = 0.006
+        pct = 0.003
     try:
-        atr_k = float(database.get_setting('SL_ATR_K', '1.00'))
+        atr_k = float(database.get_setting('SL_ATR_K', '0.50'))
     except Exception:
-        atr_k = 1.00
+        atr_k = 0.50
 
     eff_pct = pct
     if ref_price and ref_price > 0 and atr > 0:
-        eff_pct = max(pct, (atr_k * float(atr)) / float(ref_price))
+        # Avant : eff_pct = max(pct, (atr_k * atr) / ref_price) -> pouvait envoyer le SL très loin.
+        # Maintenant : on CAPE l'effet ATR pour garder un SL plus proche (≤ pct).
+        atr_pct = (atr_k * float(atr)) / float(ref_price)
+        eff_pct = min(pct, atr_pct)
 
     s = (side or "").lower()
     if s in ("buy", "long"):
@@ -2285,6 +2288,7 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
     if s in ("sell", "short"):
         return float(raw_sl) * (1.0 + eff_pct)
     return float(raw_sl)
+
 
 
 def _update_signal_state(
