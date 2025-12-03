@@ -3223,18 +3223,50 @@ def manage_open_positions(ex: ccxt.Exchange):
         else:
             be_allowed = True                        # CT: BE toujours permis
 
-        # 2) Condition de déclenchement BE: contact/franchissement BB20_mid
+        # 2) Condition de déclenchement BE: contact/franchissement de la BB20_mid
         be_trigger = False
         try:
-            if is_long and (float(last['high']) >= bb20_mid):
-                be_trigger = True
-            if (not is_long) and (float(last['low']) <= bb20_mid):
-                be_trigger = True
+            # On regarde les dernières bougies (wick contact) pour détecter AU MOINS UN contact avec la BB20_mid.
+            try:
+                be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', 2))
+            except Exception:
+                be_lookback = 2
+            be_lookback = max(1, min(be_lookback, len(df)))
+            window_be = df.iloc[-be_lookback:]
+
+            for _, row_be in window_be.iterrows():
+                try:
+                    high_be = float(row_be['high'])
+                    low_be = float(row_be['low'])
+                    mid_be = float(row_be.get('bb20_mid', bb20_mid))
+                except Exception:
+                    continue
+
+                if is_long and high_be >= mid_be:
+                    be_trigger = True
+                    break
+                if (not is_long) and low_be <= mid_be:
+                    be_trigger = True
+                    break
+
+            # Fallback: si aucun contact wick détecté, on garde le test sur la clôture de la dernière bougie.
+            if not be_trigger:
+                if is_long and last_close >= bb20_mid:
+                    be_trigger = True
+                if (not is_long) and last_close <= bb20_mid:
+                    be_trigger = True
         except Exception:
-            if is_long and last_close >= bb20_mid:
-                be_trigger = True
-            if (not is_long) and last_close <= bb20_mid:
-                be_trigger = True
+            # Dernier recours robuste : tests directs sur la dernière bougie
+            try:
+                if is_long and float(last['high']) >= bb20_mid:
+                    be_trigger = True
+                if (not is_long) and float(last['low']) <= bb20_mid:
+                    be_trigger = True
+            except Exception:
+                if is_long and last_close >= bb20_mid:
+                    be_trigger = True
+                if (not is_long) and last_close <= bb20_mid:
+                    be_trigger = True
 
         # 3) Prix BE (frais + buffer)
         try:
