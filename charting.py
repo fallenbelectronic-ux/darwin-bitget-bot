@@ -5,47 +5,28 @@ import mplfinance as mpf
 from typing import Dict, Any, Optional
 
 def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) -> Optional[io.BytesIO]:
-    """Génère une image PNG (fond sombre) pour un trade.
-
-    - Si df est None : fetch auto via utils.fetch_and_prepare_df
-    - Utilise BB20 / BB80 déjà présents dans df
-    - Affiche un bloc vert/rouge type 'position' (TP / SL autour de l'entrée)
-      dont la zone commence SUR la bougie d'entrée et s'étend jusqu'à la
-      dernière bougie visible (jamais dans le futur).
-    - Marque les bougies de contact / réaction / entrée par des traits
-      verticaux + labels avec flèches.
-    """
+    """Génère une image PNG (fond sombre) pour un trade, avec:
+       - BB20 turquoise (lignes pleines) + MM20 turquoise pointillé
+       - BB80 bleu (plus épais)      + MM80 bleu pointillé
+       - Lignes Entrée / SL / TP
+       - (AJOUT) Bloc vert/rouge entre Entrée–TP / Entrée–SL
+       - (AJOUT) Marqueurs verticaux + flèches : Contact / Réaction / Entrée
+       Retourne un io.BytesIO prêt pour Telegram."""
     try:
-        import os
-        import ccxt
-        import utils
         import matplotlib.pyplot as plt
         from matplotlib import dates as mdates
         from matplotlib.patches import Rectangle
 
-        # 1) Si aucun DF fourni, on le prépare (OHLCV + BB requis par utils.fetch_and_prepare_df)
-        if df is None:
-            timeframe = os.getenv("TIMEFRAME", "1h")
-            try:
-                ex = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-                if os.getenv("BITGET_TESTNET", "true").lower() in ("1", "true", "yes"):
-                    try:
-                        ex.set_sandbox_mode(True)
-                    except Exception:
-                        pass
-                df = utils.fetch_and_prepare_df(ex, symbol, timeframe)
-            except Exception:
-                df = None
-
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        # Colonnes nécessaires (inclut bb20_mid pour tracer la MM20)
+        required_cols = ['bb20_up', 'bb20_mid', 'bb20_lo', 'bb80_up', 'bb80_mid', 'bb80_lo']
+        if not all(col in df.columns for col in required_cols):
+            print("Erreur graphique: le DataFrame ne contient pas toutes les colonnes de BB nécessaires.")
             return None
 
-        # 2) Vérifs colonnes nécessaires BB
-        bb_cols = ['bb20_up', 'bb20_mid', 'bb20_lo', 'bb80_up', 'bb80_mid', 'bb80_lo']
-        if not all(c in df.columns for c in bb_cols):
-            return None
+        # Fenêtre compacte
+        BARS = 20
 
-        # 3) S'assurer d'un DatetimeIndex
+        # Assurer un DatetimeIndex pour mplfinance
         if not isinstance(df.index, pd.DatetimeIndex):
             try:
                 df = df.copy()
@@ -53,27 +34,17 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             except Exception:
                 return None
 
-        # 4) Sous-DF pour mplfinance (OHLCV) = 20 dernières bougies
-        base_cols = ['open', 'high', 'low', 'close']
-        if not all(c in df.columns for c in base_cols):
-            return None
-
-        df_plot = df[base_cols + (['volume'] if 'volume' in df.columns else [])].copy()
-        if 'volume' not in df_plot.columns:
-            df_plot['volume'] = 0.0
-
-        df_plot = df_plot.tail(20)
+        # Sous-DataFrame OHLCV avec noms attendus par mplfinance
+        df_plot = df[['open', 'high', 'low', 'close', 'volume']].tail(BARS).copy()
         if df_plot.empty:
             return None
-
-        # renommage pour mplfinance
         df_plot.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
 
-        # Sous-DF BB aligné sur df_plot
-        df_bb = df[bb_cols].loc[df_plot.index].copy()
+        # Thème sombre
+        bg_fig   = '#121417'   # fond global
+        bg_ax    = '#0f1215'   # fond axe
+        grid_col = '#1f2937'
 
-        # 5) Thème sombre & couleurs
-        bg_fig, bg_ax, grid_col = '#121417', '#0f1215', '#1f2937'
         mc = mpf.make_marketcolors(
             up='#22c55e',
             down='#ef4444',
@@ -90,43 +61,160 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             figcolor=bg_fig,
             edgecolor=bg_ax
         )
-        col_turq, col_blue = '#2dd4bf', '#60a5fa'
 
-        # 6) Séries supplémentaires (BB20/BB80)
+        # Couleurs BB
+        col_turq = '#2dd4bf'   # BB20
+        col_blue = '#60a5fa'   # BB80
+
+        # Séries addplot alignées sur la même fenêtre
+        seg = slice(-BARS, None)
         plots = [
-            mpf.make_addplot(df_bb['bb20_up'],  color=col_turq, linestyle='-',  width=1.2),
-            mpf.make_addplot(df_bb['bb20_lo'],  color=col_turq, linestyle='-',  width=1.2),
-            mpf.make_addplot(df_bb['bb20_mid'], color=col_turq, linestyle='--', width=1.2),
-            mpf.make_addplot(df_bb['bb80_up'],  color=col_blue, linestyle='-',  width=1.6),
-            mpf.make_addplot(df_bb['bb80_lo'],  color=col_blue, linestyle='-',  width=1.6),
-            mpf.make_addplot(df_bb['bb80_mid'], color=col_blue, linestyle='--', width=1.2),
+            # BB20 (pleines) + MM20 (pointillé)
+            mpf.make_addplot(df['bb20_up'].iloc[seg],  color=col_turq, linestyle='-',  width=1.2),
+            mpf.make_addplot(df['bb20_lo'].iloc[seg],  color=col_turq, linestyle='-',  width=1.2),
+            mpf.make_addplot(df['bb20_mid'].iloc[seg], color=col_turq, linestyle='--', width=1.2),
+
+            # BB80 (plus épaisses) + MM80 (pointillé)
+            mpf.make_addplot(df['bb80_up'].iloc[seg],  color=col_blue, linestyle='-',  width=1.6),
+            mpf.make_addplot(df['bb80_lo'].iloc[seg],  color=col_blue, linestyle='-',  width=1.6),
+            mpf.make_addplot(df['bb80_mid'].iloc[seg], color=col_blue, linestyle='--', width=1.2),
         ]
 
-        # Helpers pour récupérer prix et positions de bougies
-        def _get_price(keys) -> Optional[float]:
-            for k in keys:
-                try:
-                    v = signal.get(k, None)
-                except Exception:
-                    v = None
-                if v is None:
-                    continue
-                try:
-                    return float(v)
-                except Exception:
-                    continue
-            return None
+        # Lignes horizontales Entrée / SL / TP (base d'origine)
+        try:
+            entry_price = float(signal['entry'])
+            sl_price    = float(signal['sl'])
+            tp_price    = float(signal['tp'])
+            h_prices = [entry_price, sl_price, tp_price]
+        except Exception:
+            # Si un des prix est manquant, on ne casse pas le graphe
+            entry_price = sl_price = tp_price = None
+            h_prices = []
+        h_colors = ['#60a5fa', '#ef4444', '#22c55e']  # bleu, rouge, vert
+        h_widths = [1.2, 1.2, 1.2]
+
+        fig, axes = mpf.plot(
+            df_plot,
+            type='candle',
+            style=style,
+            title=f"Setup de Trade: {symbol} ({signal.get('regime', '')})",
+            ylabel='Prix (USDT)',
+            addplot=plots,
+            hlines=dict(hlines=h_prices, colors=h_colors[:len(h_prices)], linewidths=h_widths[:len(h_prices)], alpha=0.95) if h_prices else None,
+            returnfig=True,
+            figsize=(12, 7)
+        )
+
+        # Récupération de l'axe principal
+        try:
+            ax = axes[0]
+        except TypeError:
+            ax = axes
+
+        # -------------------------
+        # Bloc position (profit / perte)
+        # -------------------------
+        if entry_price is not None and sl_price is not None and tp_price is not None:
+            # X : par défaut toute la fenêtre
+            x_left, x_right = ax.get_xlim()
+            x0 = x_left
+            x1 = x_right
+
+            # Si on a un index de bougie d'entrée dans le signal ET qu'elle est dans les 20 dernières,
+            # on fait commencer le bloc sur cette bougie.
+            def _resolve_entry_pos() -> Optional[int]:
+                keys = ['entry_index', 'entry_idx', 'entry_bar']
+                for k in keys:
+                    if k in signal and signal[k] is not None:
+                        try:
+                            idx_full = int(signal[k])
+                        except Exception:
+                            continue
+                        if idx_full < 0 or idx_full >= len(df):
+                            continue
+                        ts_full = df.index[idx_full]
+                        try:
+                            loc = df_plot.index.get_loc(ts_full)
+                            if isinstance(loc, slice):
+                                loc = loc.start
+                            if isinstance(loc, (list, tuple)):
+                                loc = loc[0]
+                            return int(loc)
+                        except Exception:
+                            continue
+                # Sinon, on tente avec un timestamp
+                ts_keys = ['entry_ts', 'entry_time', 'entry_timestamp']
+                for k in ts_keys:
+                    if k in signal and signal[k] is not None:
+                        raw = signal[k]
+                        try:
+                            if isinstance(raw, (int, float)):
+                                if raw > 1e12:
+                                    ts = pd.to_datetime(int(raw), unit='ms', utc=True)
+                                else:
+                                    ts = pd.to_datetime(int(raw), unit='s', utc=True)
+                            else:
+                                ts = pd.to_datetime(raw, utc=True)
+                        except Exception:
+                            continue
+                        try:
+                            if ts < df_plot.index[0] or ts > df_plot.index[-1]:
+                                continue
+                            deltas = (df_plot.index - ts)
+                            pos = int(deltas.abs().argmin())
+                            return pos
+                        except Exception:
+                            continue
+                return None
+
+            try:
+                entry_pos = _resolve_entry_pos()
+            except Exception:
+                entry_pos = None
+
+            if entry_pos is not None and 0 <= entry_pos < len(df_plot):
+                entry_dt = df_plot.index[entry_pos]
+                x0 = mdates.date2num(entry_dt.to_pydatetime())
+
+            width = max(x1 - x0, 0.0)
+
+            def _add_box(y1: float, y2: float, color: str, alpha: float) -> None:
+                if y1 is None or y2 is None or width <= 0:
+                    return
+                y_bottom = min(y1, y2)
+                height = abs(y2 - y1)
+                if height <= 0:
+                    return
+                rect = Rectangle(
+                    (x0, y_bottom),
+                    width,
+                    height,
+                    facecolor=color,
+                    edgecolor=color,
+                    alpha=alpha,
+                    linewidth=1.0,
+                    zorder=1
+                )
+                ax.add_patch(rect)
+
+            # LONG ou SHORT
+            if tp_price > entry_price:
+                # LONG
+                _add_box(entry_price, tp_price, '#22c55e', 0.16)   # zone profit
+                _add_box(sl_price, entry_price, '#ef4444', 0.18)   # zone perte
+            else:
+                # SHORT
+                _add_box(tp_price, entry_price, '#22c55e', 0.16)   # zone profit
+                _add_box(entry_price, sl_price, '#ef4444', 0.18)   # zone perte
+
+        # -------------------------
+        # Marqueurs Contact / Réaction / Entrée
+        # -------------------------
+        y_min, y_max = ax.get_ylim()
+        y_range = max(y_max - y_min, 1e-9)
 
         def _resolve_bar_position(base_key: str) -> Optional[int]:
-            """
-            Retourne la position (0..len(df_plot)-1) de la bougie
-            base_key (contact / reaction / entry) si possible.
-
-            On NE force PAS sur la dernière bougie si la bougie n'est pas
-            dans la fenêtre des 20 dernières bougies : dans ce cas on
-            renvoie None et on ne dessine pas le marqueur.
-            """
-            # 1) Index sur DF complet
+            # Essai via index
             idx_keys = [f"{base_key}_index", f"{base_key}_idx", f"{base_key}_bar"]
             for k in idx_keys:
                 if k in signal and signal[k] is not None:
@@ -145,17 +233,15 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
                             loc = loc[0]
                         return int(loc)
                     except Exception:
-                        # pas dans la fenêtre df_plot
                         continue
 
-            # 2) Timestamp
+            # Essai via timestamp
             ts_keys = [f"{base_key}_ts", f"{base_key}_time", f"{base_key}_timestamp"]
             for k in ts_keys:
                 if k in signal and signal[k] is not None:
                     raw = signal[k]
                     try:
                         if isinstance(raw, (int, float)):
-                            # heuristique ms / s
                             if raw > 1e12:
                                 ts = pd.to_datetime(int(raw), unit='ms', utc=True)
                             else:
@@ -175,101 +261,14 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
 
             return None
 
-        # 7) Plot principal
-        regime = (signal.get('regime') or '').upper()
-        fig, axes = mpf.plot(
-            df_plot,
-            type='candle',
-            style=style,
-            title=f"Setup de Trade: {symbol} ({regime})",
-            ylabel='Prix (USDT)',
-            addplot=plots,
-            returnfig=True,
-            figsize=(12, 7)
-        )
-
-        try:
-            ax = axes[0]  # cas figure + volume
-        except TypeError:
-            ax = axes      # cas figure sans volume
-
-        # 8) Bloc risque/rendement type "position"
-        entry_price = _get_price(['entry', 'entry_price'])
-        sl_price    = _get_price(['sl', 'sl_price', 'stop_loss'])
-        tp_price    = _get_price(['tp', 'tp_price', 'take_profit'])
-
-        entry_pos = None
-        if entry_price is not None and sl_price is not None and tp_price is not None:
-            entry_pos = _resolve_bar_position('entry')
-
-            # Si la bougie d'entrée n'est pas dans les 20 dernières, on ne dessine pas le bloc
-            if entry_pos is not None and 0 <= entry_pos < len(df_plot):
-                start_idx = entry_pos
-                end_idx   = len(df_plot) - 1  # jusqu'à la dernière bougie visible
-
-                entry_dt  = df_plot.index[start_idx]
-                last_dt   = df_plot.index[end_idx]
-
-                x0_num    = mdates.date2num(entry_dt.to_pydatetime())
-                x_end_num = mdates.date2num(last_dt.to_pydatetime())
-
-                if len(df_plot) > 1:
-                    step_days = (df_plot.index[1] - df_plot.index[0]).total_seconds() / 86400.0
-                    if step_days > 0:
-                        x_end_num += step_days * 0.5
-
-                box_width = max(x_end_num - x0_num, 0.0)
-
-                def _add_box(y1: float, y2: float, color: str, alpha: float) -> None:
-                    if y1 is None or y2 is None or box_width <= 0:
-                        return
-                    y_bottom = min(y1, y2)
-                    height   = abs(y2 - y1)
-                    if height <= 0:
-                        return
-                    rect = Rectangle(
-                        (x0_num, y_bottom),
-                        box_width,
-                        height,
-                        facecolor=color,
-                        edgecolor=color,
-                        alpha=alpha,
-                        linewidth=1.0,
-                        zorder=1
-                    )
-                    ax.add_patch(rect)
-
-                # Long ou short
-                if tp_price > entry_price:
-                    # LONG
-                    _add_box(entry_price, tp_price, '#22c55e', 0.16)   # profit
-                    _add_box(sl_price,    entry_price, '#ef4444', 0.18)   # perte
-                else:
-                    # SHORT
-                    _add_box(tp_price,    entry_price, '#22c55e', 0.16)   # profit
-                    _add_box(entry_price, sl_price,    '#ef4444', 0.18)   # perte
-
-                # Lignes SL / Entry / TP
-                try:
-                    ax.hlines(sl_price,    x0_num, x_end_num, colors='#ef4444', linewidth=1.0)
-                    ax.hlines(entry_price, x0_num, x_end_num, colors='#60a5fa', linewidth=1.0)
-                    ax.hlines(tp_price,    x0_num, x_end_num, colors='#22c55e', linewidth=1.0)
-                except Exception:
-                    pass
-
-        # 9) Marqueurs verticaux + flèches : bougies de contact / réaction / entrée
-        y_min, y_max = ax.get_ylim()
-        y_range = max(y_max - y_min, 1e-9)
-
         contact_pos  = _resolve_bar_position('contact')
         reaction_pos = _resolve_bar_position('reaction')
-        if entry_pos is None:
-            entry_pos = _resolve_bar_position('entry')
+        entry_pos_m  = _resolve_bar_position('entry')
 
         markers = [
             ("Contact",  contact_pos,  '#f97316'),
             ("Réaction", reaction_pos, '#eab308'),
-            ("Entrée",   entry_pos,    '#3b82f6'),
+            ("Entrée",   entry_pos_m,  '#3b82f6'),
         ]
 
         label_idx = 0
@@ -279,17 +278,14 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
 
             x_dt = df_plot.index[pos]
 
-            # Ligne verticale
             ax.axvline(x_dt, color=color, linestyle='--', linewidth=1.1, alpha=0.95)
 
-            # Niveau de la bougie (haut du chandelier)
             try:
                 row = df_plot.iloc[pos]
                 y_candle = float(row['High'])
             except Exception:
                 y_candle = y_max - 0.2 * y_range
 
-            # Position du texte au-dessus + flèche vers la bougie
             y_text = y_max - 0.04 * y_range * (label_idx + 1)
             ax.annotate(
                 name,
@@ -310,12 +306,25 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             )
             label_idx += 1
 
-        # 10) Export PNG en mémoire
+        # Annotations texte à droite (version d’origine, on garde)
+        last_x = ax.get_xlim()[1]
+        labels = ['Entrée', 'SL', 'TP']
+        for y, label, color in zip(h_prices, labels, h_colors):
+            ax.text(
+                last_x, y, f"  {label}",
+                va='center', ha='left', color=color, fontsize=9,
+                bbox=dict(facecolor='#0b0f14', alpha=0.7, edgecolor='none', pad=1.5)
+            )
+
         buf = io.BytesIO()
         fig.savefig(buf, format='png', bbox_inches='tight', dpi=110)
         buf.seek(0)
 
-        plt.close(fig)
+        try:
+            plt.close(fig)
+        except Exception:
+            fig.clf()
+
         return buf
 
     except Exception as e:
