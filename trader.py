@@ -3055,6 +3055,55 @@ def _progress_to_tp(entry: float, tp: float, mark: float, is_long: bool) -> floa
         return max(0.0, min(1.0, (entry - mark) / (entry - tp)))
 
 
+def _find_last_swing_anchor(df: pd.DataFrame, is_long: bool, max_lookback: int = 15) -> Optional[float]:
+    """
+    Cherche le DERNIER swing confirmé dans les dernières bougies :
+      - SHORT : swing high (top local)
+      - LONG  : swing low  (bottom local)
+    Utilisé comme ancre de SL pour le passage à BE (avec offset hybride).
+    """
+    try:
+        if df is None:
+            return None
+        n = len(df)
+        if n < 3:
+            return None
+
+        lb = max(3, int(max_lookback))
+        start = max(1, n - lb - 1)
+        end = n - 2  # on évite la dernière bougie (encore en formation)
+
+        if end <= 0 or start > end:
+            return None
+
+        if is_long:
+            # Swing LOW (bottom) pour les longs
+            for i in range(end, start - 1, -1):
+                cur = df.iloc[i]
+                prev = df.iloc[i - 1]
+                nxt = df.iloc[i + 1]
+                l = float(cur["low"])
+                l_prev = float(prev["low"])
+                l_next = float(nxt["low"])
+                if l < l_prev and l < l_next:
+                    return l
+        else:
+            # Swing HIGH (top) pour les shorts
+            for i in range(end, start - 1, -1):
+                cur = df.iloc[i]
+                prev = df.iloc[i - 1]
+                nxt = df.iloc[i + 1]
+                h = float(cur["high"])
+                h_prev = float(prev["high"])
+                h_next = float(nxt["high"])
+                if h > h_prev and h > h_next:
+                    return h
+    except Exception:
+        return None
+
+    return None
+
+
 def manage_open_positions(ex: ccxt.Exchange):
     """TP dynamique (tendance→BB80 opposée ; CT→BB20 up/lo) + Break-Even + Trailing live après BE.
     Règles BE:
@@ -3094,8 +3143,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         return
 
     # --- Sélection d'un trade ACTIF par symbole (le plus récent) ---
-    # Objectif: éviter que des anciens trades (ex: #10) continuent à être gérés
-    # alors qu'un nouveau trade (#14) est ouvert sur le même symbole.
     latest_by_symbol: Dict[str, Dict[str, Any]] = {}
     for p in open_positions:
         sym = p.get('symbol')
@@ -3121,7 +3168,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 ref_id = int(ref.get('id') or 0)
             except Exception:
                 ref_id = 0
-            # On garde le trade le plus récent (timestamp puis id comme tie-breaker)
             if (cur_ts, cur_id) > (ref_ts, ref_id):
                 latest_by_symbol[sym] = p
 
@@ -3132,8 +3178,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             continue
 
-    # On filtre: on ne gère plus que le trade actif par symbole.
-    # Les éventuels doublons ouverts sont marqués fermés en DB, sans toucher aux ordres exchange.
     filtered_positions: List[Dict[str, Any]] = []
     for p in open_positions:
         sym = p.get('symbol')
@@ -3177,7 +3221,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         try:
             real_qty = float(live_map.get(symbol, 0.0))
             if real_qty <= 0:
-                # 👉 Position réellement flat : on ferme en DB ET on annule tous les ordres restants (TP/SL/BE).
                 try:
                     _cancel_all_orders_safe(ex, symbol)
                 except Exception:
@@ -3197,16 +3240,12 @@ def manage_open_positions(ex: ccxt.Exchange):
         is_long = (pos['side'] == 'buy')
         close_side = 'sell' if is_long else 'buy'
 
-        # 🔒 IMPORTANT : ne PAS gérer en automatique les positions importées / reprises manuellement
-        # Regime 'Importé' (ou variantes) = suivi uniquement informatif, sans BE, sans trailing, sans TP dynamique.
         regime_raw = pos.get('regime', 'Tendance')
         if isinstance(regime_raw, str) and regime_raw.lower().startswith('import'):
-            # On laisse la position telle quelle : le trader garde la main (TP/SL manuels).
             continue
 
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
-        # Sécu context Bitget
         try:
             ex.set_leverage(LEVERAGE, symbol)
             try:
@@ -3220,13 +3259,11 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             pass
 
-        # Politique override manuel
         try:
             FOLLOW_MANUAL_SL_WITH_TRAILING = str(database.get_setting('FOLLOW_MANUAL_SL_WITH_TRAILING', 'true')).lower() == 'true'
         except Exception:
             FOLLOW_MANUAL_SL_WITH_TRAILING = True
 
-        # Tick / mark
         try:
             market = ex.market(symbol) or {}
             tick_size = _bitget_tick_size(market)
@@ -3236,7 +3273,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         manual = _apply_manual_override_if_needed(ex, pos, tick_size)
         skip_sl_updates = bool(manual.get('sl_changed') and (not FOLLOW_MANUAL_SL_WITH_TRAILING))
 
-        # Récup DF pour BB/ATR (TP dyn + BE + Trailing)
         try:
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
         except Exception:
@@ -3252,7 +3288,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         bb80_lo    = float(last['bb80_lo'])
         last_atr   = float(last.get('atr', 0.0))
 
-        # ---------- TP dynamique (corrigé) ----------
+        # ---------- TP dynamique ----------
         try:
             regime = pos.get('regime', 'Tendance')
             offset_pct = get_tp_offset_pct()
@@ -3260,9 +3296,8 @@ def manage_open_positions(ex: ccxt.Exchange):
                 tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
             except Exception:
                 tp_atr_k = 0.50
-            # epsilon configurable pour éviter l'effet “bruit”
             try:
-                tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', 0.0005))  # 0.05%
+                tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', 0.0005))
             except Exception:
                 tp_update_eps = 0.0005
 
@@ -3275,7 +3310,6 @@ def manage_open_positions(ex: ccxt.Exchange):
             target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
             current_tp = float(pos['tp_price'])
-            # En LONG, un TP “qui se resserre” doit DESCENDRE ; en SHORT il doit MONTER.
             improve = (is_long and (target_tp < current_tp * (1.0 - tp_update_eps))) or \
                       ((not is_long) and (target_tp > current_tp * (1.0 + tp_update_eps)))
 
@@ -3341,21 +3375,18 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         # ---------- Break-Even & Trailing ----------
         if skip_sl_updates:
-            continue  # override manuel et suivi désactivé
+            continue
 
-        # 1) Déterminer si BE est autorisé selon le régime/stratégie
         strategy_mode = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
         regime = pos.get('regime', 'Tendance')
         be_allowed = False
         if regime == 'Tendance':
-            be_allowed = (strategy_mode == 'SPLIT')  # trend: BE seulement si SPLIT
+            be_allowed = (strategy_mode == 'SPLIT')
         else:
-            be_allowed = True                        # CT: BE toujours permis
+            be_allowed = True
 
-        # 2) Condition de déclenchement BE: contact/franchissement de la BB20_mid
         be_trigger = False
         try:
-            # On regarde les dernières bougies (wick contact) pour détecter AU MOINS UN contact avec la BB20_mid.
             try:
                 be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', 2))
             except Exception:
@@ -3378,14 +3409,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                     be_trigger = True
                     break
 
-            # Fallback: si aucun contact wick détecté, on garde le test sur la clôture de la dernière bougie.
             if not be_trigger:
                 if is_long and last_close >= bb20_mid:
                     be_trigger = True
                 if (not is_long) and last_close <= bb20_mid:
                     be_trigger = True
         except Exception:
-            # Dernier recours robuste : tests directs sur la dernière bougie
             try:
                 if is_long and float(last['high']) >= bb20_mid:
                     be_trigger = True
@@ -3397,7 +3426,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if (not is_long) and last_close <= bb20_mid:
                     be_trigger = True
 
-        # 3) Prix BE (frais + buffer)
         try:
             be_price_theo = compute_fee_safe_be_price(
                 entry=float(pos['entry_price']),
@@ -3412,7 +3440,6 @@ def manage_open_positions(ex: ccxt.Exchange):
             be_price_theo = float(pos['entry_price'])
 
         sl_current = float(pos.get('sl_price') or pos['entry_price'])
-        # ⚠️ Mémorise le statut BE actuel pour éviter de re-notifier plusieurs fois
         try:
             prev_be_status = str(pos.get('breakeven_status', '')).upper()
         except Exception:
@@ -3424,11 +3451,37 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             qty = float(pos['quantity'])
 
+        # ----------- 🔸 NOUVEAU : BE basé sur swing + offset SL ----------
         if be_allowed and be_trigger and qty > 0:
-            want_sl = be_price_theo
+            # 1) Ancre swing (top/bottom) récente
+            swing_anchor = _find_last_swing_anchor(df, is_long, max_lookback=15)
+
+            # 2) SL proposé depuis le swing avec le MÊME offset que pour le SL normal
+            want_sl_from_swing = None
+            if swing_anchor is not None:
+                try:
+                    want_sl_from_swing = adjust_sl_for_offset(
+                        raw_sl=float(swing_anchor),
+                        side=('buy' if is_long else 'sell'),
+                        atr=float(last_atr or 0.0),
+                        ref_price=float(swing_anchor)
+                    )
+                except Exception:
+                    want_sl_from_swing = float(swing_anchor)
+
+            # 3) Combinaison avec le prix BE théorique (protection fees)
+            if want_sl_from_swing is None:
+                want_sl = be_price_theo
+            else:
+                if is_long:
+                    # Long : on protège au mieux (max entre BE et swing-offset)
+                    want_sl = max(be_price_theo, float(want_sl_from_swing))
+                else:
+                    # Short : SL au plus bas (min) entre BE et swing-offset
+                    want_sl = min(be_price_theo, float(want_sl_from_swing))
+
             improve_sl = (is_long and want_sl > sl_current) or ((not is_long) and want_sl < sl_current)
             if improve_sl:
-                # Prix courant utilisé pour valider le SL et calculer un PnL indicatif pour la notif BE
                 try:
                     mark_now_be = _current_mark_price(ex, symbol)
                 except Exception:
@@ -3453,8 +3506,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                     sl_current = float(want_sl)
                     be_armed = True
 
-                    # 🔔 Notification BE au moment exact où le SL est déplacé à BE
-                    #    → envoyée UNE SEULE FOIS par trade (si pas déjà en statut ACTIVE auparavant)
                     if prev_be_status != 'ACTIVE':
                         try:
                             remaining_qty = float(qty)
@@ -3481,26 +3532,24 @@ def manage_open_positions(ex: ccxt.Exchange):
                                 remaining_qty=float(remaining_qty)
                             )
                         except Exception:
-                            # On ne bloque jamais la gestion du trade sur un problème de notification
                             pass
                 except Exception:
                     pass
+        # ---------------------------------------------------------------
 
-        # 5) Trailing après BE actif (MIS À JOUR: conditionné par la proximité du TP)
+        # 5) Trailing après BE actif (inchangé)
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
-            # Seuils minimums de mouvement avant mise à jour du SL
             try:
-                min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))      # 0.10%
+                min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
             except Exception:
                 min_move_pct = 0.001
             try:
-                min_move_atr_k = float(database.get_setting('TRAIL_MIN_MOVE_ATR_K', 0.25))  # 0.25×ATR
+                min_move_atr_k = float(database.get_setting('TRAIL_MIN_MOVE_ATR_K', 0.25))
             except Exception:
                 min_move_atr_k = 0.25
 
             mark_now = _current_mark_price(ex, symbol)
 
-            # Progression vers le TP (0 = loin, 1 = au TP)
             try:
                 tp_pos = float(pos.get('tp_price') or 0.0)
                 entry_px = float(pos.get('entry_price') or 0.0)
@@ -3509,7 +3558,6 @@ def manage_open_positions(ex: ccxt.Exchange):
 
             progress = _progress_to_tp(entry_px, tp_pos, mark_now, is_long)
 
-            # Seuils de progression pour activer / resserrer le trailing
             try:
                 act_prog = float(database.get_setting('TRAIL_PROGRESS_ACTIVATION', 0.60))
             except Exception:
@@ -3519,11 +3567,9 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception:
                 tight_prog = 0.85
 
-            # Tant qu'on est loin du TP → on laisse respirer le prix : pas de trailing
             if progress < act_prog:
                 continue
 
-            # Paramètres de distance (base / near / ultra-near) — tous configurables
             try:
                 base_pct = float(database.get_setting('TRAIL_PCT', 0.0035))
             except Exception:
@@ -3549,19 +3595,15 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception:
                 ultra_k = 0.5
 
-            # Choix du régime de trailing selon la proximité du TP
             d_pct = base_pct
             k_atr = base_k
             if progress >= tight_prog:
-                # Très proche du TP → trailing très serré
                 d_pct = ultra_pct
                 k_atr = ultra_k
             elif progress >= act_prog:
-                # Proche du TP → trailing intermédiaire
                 d_pct = near_pct
                 k_atr = near_k
 
-            # Distance en prix = max(d% du mark, k*ATR)
             dist_pct = abs(d_pct) * mark_now
             dist_atr = abs(k_atr) * last_atr
             dist = max(dist_pct, dist_atr)
@@ -3571,18 +3613,15 @@ def manage_open_positions(ex: ccxt.Exchange):
             else:
                 want_sl = max(0.0, mark_now + dist)
 
-            # Ne jamais reculer le SL
             if is_long and want_sl <= sl_current:
                 continue
             if (not is_long) and want_sl >= sl_current:
                 continue
 
-            # Filtre de mouvement minimal pour éviter les micro-ajustements
             min_move_abs = max(min_move_pct * mark_now, min_move_atr_k * last_atr)
             if abs(want_sl - sl_current) < max(min_move_abs, tick_size):
                 continue
 
-            # Validations Bitget + arrondis
             want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
             try:
                 want_sl = float(ex.price_to_precision(symbol, want_sl))
@@ -3603,6 +3642,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 pos['breakeven_status'] = 'ACTIVE'
             except Exception:
                 pass
+
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
