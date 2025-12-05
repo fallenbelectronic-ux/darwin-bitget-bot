@@ -2328,6 +2328,124 @@ def _update_signal_state(
         )
     except Exception:
         pass
+        
+def _is_reaction_candle(row: pd.Series, is_long: bool) -> bool:
+    """
+    Détection d'une bougie de réaction (Tendance & Contre-Tendance).
+
+    Utilise les ratios déjà définis dans la stratégie :
+    - Pinbar (grosse mèche opposée, petit corps)
+    - Wick simple (mèche significative côté réaction)
+    - Impulsion directionnelle (marubozu / gros corps dans le sens du trade)
+
+    Si des tags de pattern existent déjà dans la ligne (ex: 'pattern'),
+    ils sont utilisés en priorité, sinon on retombe sur l'analyse OHLC.
+    """
+    # 1) Si la ligne porte déjà un tag de pattern exploitable
+    try:
+        pattern = str(row.get("pattern", "")).lower()
+        if is_long and pattern in ("pinbar_long", "wick_long", "impulse_long", "reaction_long"):
+            return True
+        if (not is_long) and pattern in ("pinbar_short", "wick_short", "impulse_short", "reaction_short"):
+            return True
+    except Exception:
+        pass
+
+    # 2) Analyse directe OHLC
+    try:
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+    except Exception:
+        return False
+
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    body_pct = body / rng
+    upper_pct = upper / rng
+    lower_pct = lower / rng
+
+    # Seuils proches de ceux de la strat (pinbar / wick / marubozu)
+    # PINBAR_MAX_BODY ≈ 0.35
+    # SIMPLE_WICK_MIN ≈ 0.27
+    # PINBAR_OPP_WICK_MAX ≈ 0.24
+    # MARUBOZU_MIN_BODY ≈ 0.28
+
+    if is_long:
+        bullish = c >= o
+        pinbar = (body_pct <= 0.35 and lower_pct >= 0.45 and upper_pct <= 0.24)
+        simple_wick = (lower_pct >= 0.27 and body_pct <= 0.60)
+        impulsion = bullish and body_pct >= 0.28 and upper_pct <= 0.25
+        return bullish and (pinbar or simple_wick or impulsion)
+    else:
+        bearish = c <= o
+        pinbar = (body_pct <= 0.35 and upper_pct >= 0.45 and lower_pct <= 0.24)
+        simple_wick = (upper_pct >= 0.27 and body_pct <= 0.60)
+        impulsion = bearish and body_pct >= 0.28 and lower_pct <= 0.25
+        return bearish and (pinbar or simple_wick or impulsion)
+
+
+def _check_reaction_before_entry(df: pd.DataFrame, signal: Dict[str, Any], is_long: bool) -> bool:
+    """
+    Vérifie la présence d'une bougie de réaction OBLIGATOIRE avant l'entrée.
+    S'applique en Tendance ET en Contre-Tendance.
+
+    Logique :
+      1) Si le signal indique déjà explicitement une réaction (has_reaction / idx_reaction) → OK.
+      2) Sinon, on cherche une bougie de réaction dans les 1 à 3 bougies AVANT la bougie d'entrée.
+         - entry_index dans le signal si présent
+         - sinon, dernière bougie clôturée (len(df) - 2)
+
+    En cas de doute ou d'erreur → on considère qu'il n'y a PAS de réaction (fail-safe).
+    """
+    # 1) Signal déjà taggé comme "avec réaction"
+    try:
+        if bool(signal.get("has_reaction")):
+            return True
+    except Exception:
+        pass
+
+    # 2) Index de bougie de réaction explicite
+    try:
+        idx_react = signal.get("idx_reaction")
+        if idx_react is not None:
+            idx_react = int(idx_react)
+            if 0 <= idx_react < len(df):
+                return True
+    except Exception:
+        pass
+
+    # 3) Recherche locale autour de l'entrée
+    if df is None or len(df) < 3:
+        return False
+
+    try:
+        entry_idx = signal.get("entry_index")
+        if entry_idx is None:
+            # on prend la dernière bougie clôturée comme référence
+            entry_idx = len(df) - 2
+        entry_idx = int(entry_idx)
+    except Exception:
+        entry_idx = len(df) - 2
+
+    # fenêtre: 1 à 3 bougies avant l'entrée
+    start = max(0, entry_idx - 3)
+    end = max(0, entry_idx - 1)
+
+    if end < start:
+        return False
+
+    window = df.iloc[start : end + 1]
+
+    for _, row in window.iterrows():
+        if _is_reaction_candle(row, is_long):
+            return True
+
+    return False
 
 def execute_signal_with_gates(
     ex: ccxt.Exchange,
@@ -2346,6 +2464,16 @@ def execute_signal_with_gates(
     if df is None or len(df) < 3:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
         return False, "Rejeté: données insuffisantes pour valider l’entrée."
+
+    # --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
+    # Sans bougie de réaction valide avant l'entrée, on NE prend PAS le trade.
+    try:
+        if not _check_reaction_before_entry(df, signal, is_long):
+            _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="no_reaction_candle")
+            return False, "Rejeté: aucune bougie de réaction valide avant l’entrée."
+    except Exception:
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="reaction_check_error")
+        return False, "Rejeté: erreur lors du contrôle de la bougie de réaction."
 
     last = df.iloc[-1]
     last_atr = float(last.get('atr', 0.0))
@@ -2675,6 +2803,7 @@ def execute_signal_with_gates(
         pass
 
     return True, "Position ouverte avec succès."
+
 
 
 def get_tp_offset_pct() -> float:
