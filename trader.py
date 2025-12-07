@@ -1248,19 +1248,25 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             rr_final = (tp_price - entry_price) / (entry_price - sl_price) if (entry_price - sl_price) > 0 else 0
             
             if rr_final >= min_rr:
+                # Index d'entrée = dernière bougie
+                entry_idx = len(df) - 1
+                
                 return {
                     'symbol': symbol,
                     'side': 'buy',
                     'regime': 'Tendance',
                     'pattern': pattern,
                     'entry_price': entry_price,
+                    'entry': entry_price,  # alias pour compatibilité
                     'sl_price': sl_price,
+                    'sl': sl_price,  # alias
                     'tp_price': tp_price,
+                    'tp': tp_price,  # alias
                     'rr': rr_final,
                     # INDICES POUR GRAPHIQUE
-                    'contact_idx': contact_idx,
-                    'reaction_idx': reaction_idx,
-                    'entry_idx': len(df) - 1
+                    'contact_index': contact_idx,
+                    'reaction_index': reaction_idx,
+                    'entry_index': entry_idx
                 }
     
     # SHORT en tendance baissière
@@ -1313,19 +1319,24 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             rr_final = (entry_price - tp_price) / (sl_price - entry_price) if (sl_price - entry_price) > 0 else 0
             
             if rr_final >= min_rr:
+                entry_idx = len(df) - 1
+                
                 return {
                     'symbol': symbol,
                     'side': 'sell',
                     'regime': 'Tendance',
                     'pattern': pattern,
                     'entry_price': entry_price,
+                    'entry': entry_price,
                     'sl_price': sl_price,
+                    'sl': sl_price,
                     'tp_price': tp_price,
+                    'tp': tp_price,
                     'rr': rr_final,
                     # INDICES POUR GRAPHIQUE
-                    'contact_idx': contact_idx,
-                    'reaction_idx': reaction_idx,
-                    'entry_idx': len(df) - 1
+                    'contact_index': contact_idx,
+                    'reaction_index': reaction_idx,
+                    'entry_index': entry_idx
                 }
     
     # ========================================================================
@@ -1385,6 +1396,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Vérifier RR
             if risk > 0 and (tp_price - entry_price) / risk >= min_rr:
                 rr_final = (tp_price - entry_price) / risk
+                entry_idx = len(df) - 1
                 
                 return {
                     'symbol': symbol,
@@ -1392,13 +1404,16 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'regime': 'Contre-tendance',
                     'pattern': pattern,
                     'entry_price': entry_price,
+                    'entry': entry_price,
                     'sl_price': sl_price,
+                    'sl': sl_price,
                     'tp_price': tp_price,
+                    'tp': tp_price,
                     'rr': rr_final,
                     # INDICES POUR GRAPHIQUE
-                    'contact_idx': contact_idx,
-                    'reaction_idx': reaction_idx,
-                    'entry_idx': len(df) - 1
+                    'contact_index': contact_idx,
+                    'reaction_index': reaction_idx,
+                    'entry_index': entry_idx
                 }
     
     # SHORT CT (prix au-dessus MM80, double extrême haut)
@@ -1452,6 +1467,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             
             if risk > 0 and (entry_price - tp_price) / risk >= min_rr:
                 rr_final = (entry_price - tp_price) / risk
+                entry_idx = len(df) - 1
                 
                 return {
                     'symbol': symbol,
@@ -1459,17 +1475,19 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'regime': 'Contre-tendance',
                     'pattern': pattern,
                     'entry_price': entry_price,
+                    'entry': entry_price,
                     'sl_price': sl_price,
+                    'sl': sl_price,
                     'tp_price': tp_price,
+                    'tp': tp_price,
                     'rr': rr_final,
                     # INDICES POUR GRAPHIQUE
-                    'contact_idx': contact_idx,
-                    'reaction_idx': reaction_idx,
-                    'entry_idx': len(df) - 1
+                    'contact_index': contact_idx,
+                    'reaction_index': reaction_idx,
+                    'entry_index': entry_idx
                 }
     
     return None
-
 
 def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
     """
