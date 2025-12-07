@@ -1157,16 +1157,35 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if len(df) < 85:
         return None
     
+    # VALIDATION DES COLONNES REQUISES + CALCUL SI MANQUANTES
+    if 'mm80' not in df.columns:
+        df['mm80'] = df['close'].rolling(window=80).mean()
+    
+    if 'bb20_mid' not in df.columns or 'bb20_up' not in df.columns or 'bb20_lo' not in df.columns:
+        df['bb20_mid'] = df['close'].rolling(window=20).mean()
+        bb20_std = df['close'].rolling(window=20).std()
+        df['bb20_up'] = df['bb20_mid'] + (2 * bb20_std)
+        df['bb20_lo'] = df['bb20_mid'] - (2 * bb20_std)
+    
+    if 'bb80_mid' not in df.columns or 'bb80_up' not in df.columns or 'bb80_lo' not in df.columns:
+        df['bb80_mid'] = df['close'].rolling(window=80).mean()
+        bb80_std = df['close'].rolling(window=80).std()
+        df['bb80_up'] = df['bb80_mid'] + (2 * bb80_std)
+        df['bb80_lo'] = df['bb80_mid'] - (2 * bb80_std)
+    
     # Données actuelles
     current = df.iloc[-1]
     prev = df.iloc[-2]
     
-    close = current['close']
-    mm80 = current['mm80']
-    bb20_up = current['bb20_up']
-    bb20_lo = current['bb20_lo']
-    bb80_up = current['bb80_up']
-    bb80_lo = current['bb80_lo']
+    try:
+        close = float(current['close'])
+        mm80 = float(current['mm80'])
+        bb20_up = float(current['bb20_up'])
+        bb20_lo = float(current['bb20_lo'])
+        bb80_up = float(current['bb80_up'])
+        bb80_lo = float(current['bb80_lo'])
+    except (KeyError, ValueError, TypeError) as e:
+        return None
     
     # ========================================================================
     # DÉTECTION TENDANCE
@@ -1204,7 +1223,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             
             if not reintegration_result['valid']:
                 # Pas de réintégration, skip
-                print(f"❌ {symbol} LONG Tendance rejeté : {reintegration_result['reason']}")
+                try:
+                    notifier.tg_send(f"⚠️ {symbol} LONG Tendance rejeté\n{reintegration_result['reason']}")
+                except:
+                    pass
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1214,16 +1236,22 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             entry_price = close
             
             # SL = BB20_lo avec offset
-            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
+            except:
+                sl_offset_pct = 0.003
             sl_price = bb20_lo * (1 - sl_offset_pct)
             
             # TP = calculé pour RR >= MIN_RR
-            min_rr = get_setting('MIN_RR', 3.0)
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '3.0'))
+            except:
+                min_rr = 3.0
             risk = entry_price - sl_price
             tp_price = entry_price + (risk * min_rr)
             
             # Vérifier RR
-            rr_final = (tp_price - entry_price) / (entry_price - sl_price)
+            rr_final = (tp_price - entry_price) / (entry_price - sl_price) if (entry_price - sl_price) > 0 else 0
             
             if rr_final >= min_rr:
                 return {
@@ -1264,7 +1292,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
-                print(f"❌ {symbol} SHORT Tendance rejeté : {reintegration_result['reason']}")
+                try:
+                    notifier.tg_send(f"⚠️ {symbol} SHORT Tendance rejeté\n{reintegration_result['reason']}")
+                except:
+                    pass
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1272,14 +1303,20 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup VALIDE
             entry_price = close
             
-            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
+            except:
+                sl_offset_pct = 0.003
             sl_price = bb20_up * (1 + sl_offset_pct)
             
-            min_rr = get_setting('MIN_RR', 3.0)
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '3.0'))
+            except:
+                min_rr = 3.0
             risk = sl_price - entry_price
             tp_price = entry_price - (risk * min_rr)
             
-            rr_final = (entry_price - tp_price) / (sl_price - entry_price)
+            rr_final = (entry_price - tp_price) / (sl_price - entry_price) if (sl_price - entry_price) > 0 else 0
             
             if rr_final >= min_rr:
                 return {
@@ -1327,7 +1364,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
-                print(f"❌ {symbol} LONG CT rejeté : {reintegration_result['reason']}")
+                try:
+                    notifier.tg_send(f"⚠️ {symbol} LONG CT rejeté\n{reintegration_result['reason']}")
+                except:
+                    pass
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1335,15 +1375,21 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup CT VALIDE
             entry_price = close
             
-            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
+            except:
+                sl_offset_pct = 0.003
             sl_price = bb80_lo * (1 - sl_offset_pct)
             
-            min_rr = get_setting('MIN_RR', 3.0)
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '3.0'))
+            except:
+                min_rr = 3.0
             risk = entry_price - sl_price
             tp_price = mm80  # TP = MM80 pour CT
             
             # Vérifier RR
-            if (tp_price - entry_price) / risk >= min_rr:
+            if risk > 0 and (tp_price - entry_price) / risk >= min_rr:
                 rr_final = (tp_price - entry_price) / risk
                 
                 return {
@@ -1386,7 +1432,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
-                print(f"❌ {symbol} SHORT CT rejeté : {reintegration_result['reason']}")
+                try:
+                    notifier.tg_send(f"⚠️ {symbol} SHORT CT rejeté\n{reintegration_result['reason']}")
+                except:
+                    pass
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1394,14 +1443,20 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup CT VALIDE
             entry_price = close
             
-            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
+            except:
+                sl_offset_pct = 0.003
             sl_price = bb80_up * (1 + sl_offset_pct)
             
-            min_rr = get_setting('MIN_RR', 3.0)
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '3.0'))
+            except:
+                min_rr = 3.0
             risk = sl_price - entry_price
             tp_price = mm80  # TP = MM80 pour CT
             
-            if (entry_price - tp_price) / risk >= min_rr:
+            if risk > 0 and (entry_price - tp_price) / risk >= min_rr:
                 rr_final = (entry_price - tp_price) / risk
                 
                 return {
@@ -1415,6 +1470,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'rr': rr_final
                 }
     
+    return None
     return None
 
 
