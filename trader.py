@@ -853,325 +853,568 @@ def _check_ct_reintegration_window(df: pd.DataFrame, is_long: bool, max_window: 
     return True
 
 
+# ============================================================================
+# VALIDATION PATTERNS DARWIN (selon slides)
+# ============================================================================
+
+def is_pinbar_30pct(bar: pd.Series, setup_type: str) -> bool:
+    """
+    Valide un Pinbar 30% selon slides Darwin.
+    
+    Args:
+        bar: Bougie à analyser
+        setup_type: 'long' ou 'short'
+    
+    Returns:
+        True si pinbar valide
+    """
+    total_range = bar['high'] - bar['low']
+    if total_range == 0:
+        return False
+    
+    body = abs(bar['close'] - bar['open'])
+    
+    if setup_type == 'long':
+        # Pour LONG : mèche BASSE doit être >= 30% du range total
+        lower_wick = min(bar['open'], bar['close']) - bar['low']
+        wick_pct = lower_wick / total_range
+        return wick_pct >= 0.30
+    
+    else:  # short
+        # Pour SHORT : mèche HAUTE doit être >= 30% du range total
+        upper_wick = bar['high'] - max(bar['open'], bar['close'])
+        wick_pct = upper_wick / total_range
+        return wick_pct >= 0.30
+
+
+def is_simple_wick_30pct(bar: pd.Series, setup_type: str) -> bool:
+    """
+    Valide un Méchage simple 30% selon slides Darwin.
+    
+    Args:
+        bar: Bougie à analyser
+        setup_type: 'long' ou 'short'
+    
+    Returns:
+        True si méchage simple valide
+    """
+    total_range = bar['high'] - bar['low']
+    if total_range == 0:
+        return False
+    
+    if setup_type == 'long':
+        # Mèche basse >= 30%
+        lower_wick = min(bar['open'], bar['close']) - bar['low']
+        return (lower_wick / total_range) >= 0.30
+    else:
+        # Mèche haute >= 30%
+        upper_wick = bar['high'] - max(bar['open'], bar['close'])
+        return (upper_wick / total_range) >= 0.30
+
+
+def is_double_marubozu_30pct(bar1: pd.Series, bar2: pd.Series, setup_type: str) -> bool:
+    """
+    Valide un Double marubozu 30% selon slides Darwin.
+    
+    Args:
+        bar1: Première bougie (contact)
+        bar2: Deuxième bougie (réaction)
+        setup_type: 'long' ou 'short'
+    
+    Returns:
+        True si double marubozu valide
+    """
+    # Vérifier que les deux bougies ont un body >= 30% de leur range
+    for bar in [bar1, bar2]:
+        total_range = bar['high'] - bar['low']
+        if total_range == 0:
+            return False
+        
+        body = abs(bar['close'] - bar['open'])
+        body_pct = body / total_range
+        
+        if body_pct < 0.30:
+            return False
+    
+    # Vérifier que les couleurs sont cohérentes avec le setup
+    if setup_type == 'long':
+        # bar1 rouge (bearish), bar2 verte (bullish)
+        bar1_bearish = bar1['close'] < bar1['open']
+        bar2_bullish = bar2['close'] > bar2['open']
+        return bar1_bearish and bar2_bullish
+    else:
+        # bar1 verte (bullish), bar2 rouge (bearish)
+        bar1_bullish = bar1['close'] > bar1['open']
+        bar2_bearish = bar2['close'] < bar2['open']
+        return bar1_bullish and bar2_bearish
+
+
+def is_gap_impulse(bar1: pd.Series, bar2: pd.Series, setup_type: str) -> bool:
+    """
+    Valide un Gap + Impulsion selon slides Darwin.
+    
+    Args:
+        bar1: Bougie précédente
+        bar2: Bougie de réaction (avec gap)
+        setup_type: 'long' ou 'short'
+    
+    Returns:
+        True si gap + impulsion valide
+    """
+    # Détecter le gap
+    if setup_type == 'long':
+        # Gap haussier : low de bar2 > high de bar1
+        gap_exists = bar2['low'] > bar1['high']
+        # Impulsion : grosse bougie verte
+        is_bullish = bar2['close'] > bar2['open']
+        body = bar2['close'] - bar2['open']
+        total_range = bar2['high'] - bar2['low']
+        strong_body = (body / total_range) > 0.60 if total_range > 0 else False
+        
+        return gap_exists and is_bullish and strong_body
+    
+    else:  # short
+        # Gap baissier : high de bar2 < low de bar1
+        gap_exists = bar2['high'] < bar1['low']
+        # Impulsion : grosse bougie rouge
+        is_bearish = bar2['close'] < bar2['open']
+        body = bar2['open'] - bar2['close']
+        total_range = bar2['high'] - bar2['low']
+        strong_body = (body / total_range) > 0.60 if total_range > 0 else False
+        
+        return gap_exists and is_bearish and strong_body
+
+
+def find_reaction_pattern(df: pd.DataFrame, contact_idx: int, setup_type: str) -> dict:
+    """
+    Cherche un pattern de réaction valide dans les 1-2 bougies après contact.
+    
+    Patterns valides (slides Darwin) :
+    - Pinbar 30%
+    - Méchage simple 30%
+    - Double marubozu 30%
+    - Gap + Impulsion
+    
+    Args:
+        df: DataFrame avec les données
+        contact_idx: Index de la bougie de contact
+        setup_type: 'long' ou 'short'
+    
+    Returns:
+        {
+            'valid': bool,
+            'reaction_idx': int ou None,
+            'pattern': str ou None,
+            'reason': str
+        }
+    """
+    # Chercher dans les 2 bougies suivantes
+    for i in range(contact_idx + 1, min(contact_idx + 3, len(df))):
+        bar = df.iloc[i]
+        
+        # Test PINBAR 30%
+        if is_pinbar_30pct(bar, setup_type):
+            return {
+                'valid': True,
+                'reaction_idx': i,
+                'pattern': 'pinbar',
+                'reason': "Pinbar 30% détecté"
+            }
+        
+        # Test MÉCHAGE 30%
+        if is_simple_wick_30pct(bar, setup_type):
+            return {
+                'valid': True,
+                'reaction_idx': i,
+                'pattern': 'wick',
+                'reason': "Méchage simple 30% détecté"
+            }
+        
+        # Test DOUBLE MARUBOZU 30% (besoin de 2 bougies)
+        if i >= contact_idx + 1:
+            prev_bar = df.iloc[i - 1]
+            if is_double_marubozu_30pct(prev_bar, bar, setup_type):
+                return {
+                    'valid': True,
+                    'reaction_idx': i,
+                    'pattern': 'marubozu',
+                    'reason': "Double marubozu 30% détecté"
+                }
+        
+        # Test GAP + IMPULSION
+        if i > 0:
+            prev_bar = df.iloc[i - 1]
+            if is_gap_impulse(prev_bar, bar, setup_type):
+                return {
+                    'valid': True,
+                    'reaction_idx': i,
+                    'pattern': 'gap',
+                    'reason': "Gap + Impulsion détecté"
+                }
+    
+    return {
+        'valid': False,
+        'reaction_idx': None,
+        'pattern': None,
+        'reason': "Aucun pattern 30% trouvé dans les 2 bougies"
+    }
+
+
+def validate_reintegration_bb20(df: pd.DataFrame, reaction_idx: int, setup_type: str) -> dict:
+    """
+    CRITIQUE : Vérifie que le prix RÉINTÈGRE la BB20 après la réaction.
+    
+    Selon slides Darwin :
+    Contact → Réaction → RÉINTÉGRATION → Entrée
+    
+    Args:
+        df: DataFrame
+        reaction_idx: Index de la bougie de réaction
+        setup_type: 'long' ou 'short'
+    
+    Returns:
+        {
+            'valid': bool,
+            'reintegration_idx': int ou None,
+            'reason': str
+        }
+    """
+    # Chercher dans les 1-2 bougies APRÈS la réaction
+    for i in range(reaction_idx + 1, min(reaction_idx + 3, len(df))):
+        bar = df.iloc[i]
+        bb20_up = bar['bb20_up']
+        bb20_lo = bar['bb20_lo']
+        
+        # Le prix doit être DANS la BB20
+        # close doit être entre bb20_lo et bb20_up
+        if bb20_lo <= bar['close'] <= bb20_up:
+            return {
+                'valid': True,
+                'reintegration_idx': i,
+                'reason': f"Réintégration BB20 valide à la bougie {i}"
+            }
+    
+    # Aucune réintégration trouvée
+    return {
+        'valid': False,
+        'reintegration_idx': None,
+        'reason': "Pas de réintégration BB20 après la réaction (prix reste dehors)"
+    }
+
+
+def validate_double_extreme_ct(df: pd.DataFrame, contact_idx: int) -> bool:
+    """
+    Pour CT : vérifie que BB20 ET BB80 ont été touchées.
+    
+    Slides Darwin CT : "Zone contact/traversement avec borne basse BB blanche ET jaune"
+    
+    Args:
+        df: DataFrame
+        contact_idx: Index de contact
+    
+    Returns:
+        True si double extrême détecté
+    """
+    # Vérifier dans les 5 dernières bougies avant/pendant contact
+    start_idx = max(0, contact_idx - 5)
+    window = df.iloc[start_idx:contact_idx + 1]
+    
+    bb20_touched = False
+    bb80_touched = False
+    
+    for _, row in window.iterrows():
+        # BB20 touchée
+        if row['low'] <= row['bb20_lo'] or row['high'] >= row['bb20_up']:
+            bb20_touched = True
+        
+        # BB80 touchée
+        if row['low'] <= row['bb80_lo'] or row['high'] >= row['bb80_up']:
+            bb80_touched = True
+    
+    return bb20_touched and bb80_touched
+
+
+
+
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """(MIS À JOUR) SL sur bougie 1 (contact) + offset hybride ; TP avant borne
-    (BB80 en tendance / BB20 UP/LO en contre-tendance) avec offset hybride ;
-    RR recalculé et rejet si RR < MIN_RR (cut-wick optionnel)."""
-    if df is None or len(df) < 81:
+    """
+    Détecte un signal Darwin (Tendance ou CT) avec validation stricte.
+    
+    SÉQUENCE OBLIGATOIRE (slides Darwin) :
+    1. Contact BB
+    2. Réaction 1-2 bougies (pattern 30%)
+    3. RÉINTÉGRATION BB20 ← CRITIQUE
+    4. Entrée bougie suivante
+    
+    Args:
+        symbol: Symbole à analyser
+        df: DataFrame avec colonnes : open, high, low, close, volume,
+            mm80, bb20_up, bb20_lo, bb80_up, bb80_lo
+    
+    Returns:
+        Signal dict ou None
+    """
+    if len(df) < 85:
         return None
-
-    # --- Paramètres ---
-    try:
-        reaction_max_bars = int(database.get_setting('REACTION_MAX_BARS', 3))
-    except Exception:
-        reaction_max_bars = 3
-    try:
-        tol_yellow = float(database.get_setting('YELLOW_BB_CONTACT_TOL_PCT', 0.001))
-    except Exception:
-        tol_yellow = 0.001
-    try:
-        enforce_next_bar = str(database.get_setting('CT_ENTRY_ON_NEXT_BAR', 'true')).lower() == 'true'
-    except Exception:
-        enforce_next_bar = True
-    try:
-        atr_tol_k = float(database.get_setting('BB80_ATR_TOL_K', 0.125))
-    except Exception:
-        atr_tol_k = 0.125
-    try:
-        ct_reintegrate_both = str(database.get_setting('CT_REINTEGRATE_BOTH_BB', 'true')).lower() == 'true'
-    except Exception:
-        ct_reintegrate_both = True
-    try:
-        cut_wick_enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
-    except Exception:
-        cut_wick_enabled = False
-
-    tp_pct = get_tp_offset_pct()
-    try:
-        tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
-    except Exception:
-        tp_atr_k = 0.50
-
-    # --- Anti-excès BB80 ---
-    try:
-        skip_threshold = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
-    except Exception:
-        skip_threshold = 5
-    lookback = max(skip_threshold, 8)
-    allow_countertrend = True
-    if len(df) >= lookback:
-        recent = df.iloc[-lookback:]
-        streak_up = 0
-        for i in range(len(recent)):
-            row = recent.iloc[-1 - i]
-            if float(row['close']) >= float(row['bb80_up']):
-                streak_up += 1
-            else:
+    
+    # Données actuelles
+    current = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    close = current['close']
+    mm80 = current['mm80']
+    bb20_up = current['bb20_up']
+    bb20_lo = current['bb20_lo']
+    bb80_up = current['bb80_up']
+    bb80_lo = current['bb80_lo']
+    
+    # ========================================================================
+    # DÉTECTION TENDANCE
+    # ========================================================================
+    
+    is_above_mm80 = close > mm80
+    is_below_mm80 = close < mm80
+    
+    # LONG en tendance haussière
+    if is_above_mm80:
+        # Chercher contact BB20_lo dans les dernières bougies
+        contact_idx = None
+        for i in range(len(df) - 6, len(df) - 1):
+            if i < 0:
+                continue
+            bar = df.iloc[i]
+            # Contact = mèche touche ou traverse BB20_lo
+            if bar['low'] <= bar['bb20_lo']:
+                contact_idx = i
                 break
-        streak_down = 0
-        for i in range(len(recent)):
-            row = recent.iloc[-1 - i]
-            if float(row['close']) <= float(row['bb80_lo']):
-                streak_down += 1
-            else:
-                break
-        if streak_up >= skip_threshold or streak_down >= skip_threshold:
-            allow_countertrend = False
-
-    # --- Bougie de référence pour l’Option E ---
-    last_idx = -2 if (enforce_next_bar and len(df) >= 2) else -1
-    last = df.iloc[last_idx]
-    base_idx = len(df) + last_idx
-
-    # Prix d'entrée utilisé pour le sizing/RR
-    if enforce_next_bar and len(df) >= 1:
-        entry_px_for_rr = float(df.iloc[-1]['open'])
-    else:
-        entry_px_for_rr = float(last['close'])
-
-    # --- Cherche la bougie CONTACT ---
-    contact, contact_idx = None, None
-    for back in range(1, reaction_max_bars + 1):
-        idx = base_idx - back
-        if idx < 0:
-            break
-        cand = df.iloc[idx]
-        touched_lo = utils.touched_or_crossed(cand['low'], cand['high'], cand['bb20_lo'], "buy")
-        touched_up = utils.touched_or_crossed(cand['low'], cand['high'], cand['bb20_up'], "sell")
-        if touched_lo or touched_up:
-            contact, contact_idx = cand, idx
-            break
-    if contact is None:
-        return None
-
-    # --- Sens via bougie de réaction ---
-    side_guess = 'buy' if float(last['close']) > float(last['open']) else 'sell'
-
-    # --- Neutralité MM80 via vague précédente (BB80 mid) ---
-    bb80_mid_last = float(last['bb80_mid'])
-    dead_zone = bb80_mid_last * (MM_DEAD_ZONE_PERCENT / 100.0)
-    in_dead_zone = abs(float(last['close']) - bb80_mid_last) < dead_zone
-
-    prev_wave = None
-    if in_dead_zone:
-        prev_wave = _previous_wave_by_bb80(df, base_idx, MM_DEAD_ZONE_PERCENT)
-
-    # Bougies fenêtre (c1 = contact)
-    c1 = contact
-    c2 = df.iloc[contact_idx + 1] if (contact_idx + 1) < len(df) else None
-    c3 = df.iloc[contact_idx + 2] if (contact_idx + 2) < len(df) else None
-
-    # Détermination finale du sens MM80 (vague précédente si dead-zone)
-    if in_dead_zone and prev_wave in ('up', 'down'):
-        is_above_mm80 = (prev_wave == 'up')
-    else:
-        is_above_mm80 = float(last['close']) > float(last['bb80_mid'])
-
-    def _inside_both(candle):
-        return _inside(float(candle['close']), float(candle['bb80_lo']), float(candle['bb80_up'])) and \
-               _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
-
-    def _inside_bb20_only(candle):
-        return _inside(float(candle['close']), float(candle['bb20_lo']), float(candle['bb20_up']))
-
-    # (1) PINBAR contact + confirmations
-    pinbar_confirmed = False
-    try:
-        pinbar_opp_wick_max = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.25))
-    except Exception:
-        pinbar_opp_wick_max = 0.25
-    try:
-        pinbar_confirm_max = int(database.get_setting('PINBAR_CONFIRM_MAX_BARS', PINBAR_CONFIRM_MAX_BARS))
-    except Exception:
-        pinbar_confirm_max = PINBAR_CONFIRM_MAX_BARS
-    try:
-        pinbar_confirm_min_body = float(database.get_setting('PINBAR_CONFIRM_MIN_BODY', PINBAR_CONFIRM_MIN_BODY))
-    except Exception:
-        pinbar_confirm_min_body = PINBAR_CONFIRM_MIN_BODY
-    try:
-        simple_wick_min_dyn = float(database.get_setting('SIMPLE_WICK_MIN', SIMPLE_WICK_MIN))
-    except Exception:
-        simple_wick_min_dyn = SIMPLE_WICK_MIN
-
-    is_pinbar_contact = False
-    if _body_ratio(c1) <= PINBAR_MAX_BODY and _inside_both(c1):
-        o1, c1v = float(c1['open']), float(c1['close'])
-        h1, l1 = float(c1['high']), float(c1['low'])
-        rng1 = max(1e-12, h1 - l1)
-        w_up1 = max(0.0, h1 - max(o1, c1v)) / rng1
-        w_dn1 = max(0.0, min(o1, c1v) - l1) / rng1
-        if side_guess == 'buy':
-            is_pinbar_contact = (w_dn1 >= simple_wick_min_dyn and w_up1 <= pinbar_opp_wick_max)
-        else:
-            is_pinbar_contact = (w_up1 >= simple_wick_min_dyn and w_dn1 <= pinbar_opp_wick_max)
-
-    if is_pinbar_contact:
-        pb_high, pb_low = float(c1['high']), float(c1['low'])
-        for j in range(1, pinbar_confirm_max + 1):
-            k = contact_idx + j
-            if k >= len(df):
-                break
-            rc = df.iloc[k]
-            o, c = float(rc['open']), float(rc['close'])
-            h, l = float(rc['high']), float(rc['low'])
-            rng = max(1e-12, h - l)
-            body_r = abs(c - o) / rng
-            if side_guess == 'buy':
-                if (c >= o) and (body_r >= pinbar_confirm_min_body) and (h >= pb_high):
-                    pinbar_confirmed = True
-                    break
-            else:
-                if (c <= o) and (body_r >= pinbar_confirm_min_body) and (l <= pb_low):
-                    pinbar_confirmed = True
-                    break
-
-    # (2) Réintégration fenêtre (barres 2–3)
-    inside_both_seen = False
-    inside_bb20_seen = False
-    for cx in (c2, c3):
-        if cx is None:
-            continue
-        if _inside_both(cx):
-            inside_both_seen = True
-            inside_bb20_seen = True
-        elif _inside_bb20_only(cx):
-            inside_bb20_seen = True
-
-    trend_reintegration_ok = inside_bb20_seen
-    ct_reintegration_ok = inside_both_seen if ct_reintegrate_both else inside_bb20_seen
-
-    # (3) Pattern valide (1→4) dans la fenêtre
-    pat_ok = False
-    for cx, pv in ((c2, c1), (c3, c2)):
-        if cx is None:
-            continue
-        if is_valid_reaction_candle(cx, side_guess, prev=pv):
-            pat_ok = True
-            break
-    if pinbar_confirmed:
-        pat_ok = True
-    if not pat_ok:
-        return None
-
-    # ATR
-    last_atr = float(last.get('atr', c1.get('atr', 0.0)))
-    atr_contact = float(c1.get('atr', last_atr))
-
-    signal = None
-    touched_bb20_low  = utils.touched_or_crossed(c1['low'],  c1['high'], c1['bb20_lo'], "buy")
-    touched_bb20_high = utils.touched_or_crossed(c1['low'],  c1['high'], c1['bb20_up'], "sell")
-
-    # --- TENDANCE (corrigé : utilise is_above_mm80 / vague précédente) ---
-    if is_above_mm80 and touched_bb20_low and trend_reintegration_ok:
-        regime = "Tendance"
-        entry = entry_px_for_rr
-        # SL depuis bougie 1 (contact) + offset hybride
-        sl = float(_sl_from_contact_candle(c1, 'buy', atr_contact))
-
-        # TP avant BB80_up (offset hybride)
-        target_band = float(last['bb80_up'])
-        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
-        tp = target_band * (1.0 - eff_pct)
-        if tp <= entry:
-            return None
-
-        if (entry - sl) > 0:
-            rr = (tp - entry) / (entry - sl)
-            rr_final = rr
-            if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                rr_alt, _ = _maybe_improve_rr_with_cut_wick(c1, entry, sl, tp, 'buy')
-                rr_final = max(rr, rr_alt)
-            if rr_final >= MIN_RR:
-                signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
-
-    elif (not is_above_mm80) and touched_bb20_high and trend_reintegration_ok:
-        regime = "Tendance"
-        entry = entry_px_for_rr
-        sl = float(_sl_from_contact_candle(c1, 'sell', atr_contact))
-
-        target_band = float(last['bb80_lo'])
-        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
-        tp = target_band * (1.0 + eff_pct)
-        if tp >= entry:
-            return None
-
-        if (sl - entry) > 0:
-            rr = (entry - tp) / (sl - entry)
-            rr_final = rr
-            if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                rr_alt, _ = _maybe_improve_rr_with_cut_wick(c1, entry, sl, tp, 'sell')
-                rr_final = max(rr, rr_alt)
-            if rr_final >= MIN_RR:
-                signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
-
-    # --- Garde-fou CT après excès ---
-    if not allow_countertrend:
-        if signal:
-            signal['bb20_mid'] = last['bb20_mid']
-            signal['entry_atr'] = c1.get('atr', 0.0)
-            signal['entry_rsi'] = 0.0
-            return signal
-        return None
-
-    # --- CONTRE-TENDANCE (TP = BB20 UP/LO, pas MID) ---
-    if not signal:
-        prev = c1
-
-        touched_ct_low  = (float(prev['low'])  <= float(prev['bb20_lo'])) and (
-            float(prev['low'])  <= float(prev['bb80_lo']) or _near_bb80_with_tolerance(float(prev['low']),  float(prev['bb80_lo']), 'buy',  tol_yellow, atr_contact, atr_tol_k)
-        )
-        touched_ct_high = (float(prev['high']) >= float(prev['bb20_up'])) and (
-            float(prev['high']) >= float(prev['bb80_up']) or _near_bb80_with_tolerance(float(prev['high']), float(prev['bb80_up']), 'sell', tol_yellow, atr_contact, atr_tol_k)
-        )
-
-        if touched_ct_low and ct_reintegration_ok:
-            regime = "Contre-tendance"
-            entry = entry_px_for_rr
-            sl = float(_sl_from_contact_candle(c1, 'buy', atr_contact))
-
-            # ❗ TP dynamique avant BB20_UP (pas MID) pour un long CT
-            target_band = float(last['bb20_up'])
-            eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
-            tp = target_band * (1.0 - eff_pct)
-            if tp <= entry:
+        
+        if contact_idx is not None:
+            # VALIDATION RÉACTION
+            reaction_result = find_reaction_pattern(df, contact_idx, 'long')
+            
+            if not reaction_result['valid']:
+                # Pas de pattern valide, skip
                 return None
-
-            if (entry - sl) > 0:
-                rr = (tp - entry) / (entry - sl)
-                rr_final = rr
-                if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'buy')
-                    rr_final = max(rr, rr_alt)
-                if rr_final >= MIN_RR:
-                    signal = {"side": "buy", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
-
-        elif touched_ct_high and ct_reintegration_ok:
-            regime = "Contre-tendance"
-            entry = entry_px_for_rr
-            sl = float(_sl_from_contact_candle(c1, 'sell', atr_contact))
-
-            # ❗ TP dynamique avant BB20_LO (pas MID) pour un short CT
-            target_band = float(last['bb20_lo'])
-            eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
-            tp = target_band * (1.0 + eff_pct)
-            if tp >= entry:
+            
+            reaction_idx = reaction_result['reaction_idx']
+            pattern = reaction_result['pattern']
+            
+            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
+            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
+            
+            if not reintegration_result['valid']:
+                # Pas de réintégration, skip
+                print(f"❌ {symbol} LONG Tendance rejeté : {reintegration_result['reason']}")
                 return None
-
-            if (sl - entry) > 0:
-                rr = (entry - tp) / (sl - entry)
-                rr_final = rr
-                if rr < MIN_RR and rr >= 2.8 and cut_wick_enabled:
-                    rr_alt, _ = _maybe_improve_rr_with_cut_wick(prev, entry, sl, tp, 'sell')
-                    rr_final = max(rr, rr_alt)
-                if rr_final >= MIN_RR:
-                    signal = {"side": "sell", "regime": regime, "entry": entry, "sl": sl, "tp": tp, "rr": rr_final}
-
-    if signal:
-        signal['bb20_mid'] = last['bb20_mid']
-        signal['entry_atr'] = c1.get('atr', 0.0)
-        signal['entry_rsi'] = 0.0
-        return signal
-
+            
+            reintegration_idx = reintegration_result['reintegration_idx']
+            
+            # Si on est ici, le setup est VALIDE
+            # Calculer SL/TP
+            entry_price = close
+            
+            # SL = BB20_lo avec offset
+            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            sl_price = bb20_lo * (1 - sl_offset_pct)
+            
+            # TP = calculé pour RR >= MIN_RR
+            min_rr = get_setting('MIN_RR', 3.0)
+            risk = entry_price - sl_price
+            tp_price = entry_price + (risk * min_rr)
+            
+            # Vérifier RR
+            rr_final = (tp_price - entry_price) / (entry_price - sl_price)
+            
+            if rr_final >= min_rr:
+                return {
+                    'symbol': symbol,
+                    'side': 'buy',
+                    'regime': 'Tendance',
+                    'pattern': pattern,
+                    'entry_price': entry_price,
+                    'sl_price': sl_price,
+                    'tp_price': tp_price,
+                    'rr': rr_final
+                }
+    
+    # SHORT en tendance baissière
+    if is_below_mm80:
+        # Chercher contact BB20_up dans les dernières bougies
+        contact_idx = None
+        for i in range(len(df) - 6, len(df) - 1):
+            if i < 0:
+                continue
+            bar = df.iloc[i]
+            # Contact = mèche touche ou traverse BB20_up
+            if bar['high'] >= bar['bb20_up']:
+                contact_idx = i
+                break
+        
+        if contact_idx is not None:
+            # VALIDATION RÉACTION
+            reaction_result = find_reaction_pattern(df, contact_idx, 'short')
+            
+            if not reaction_result['valid']:
+                return None
+            
+            reaction_idx = reaction_result['reaction_idx']
+            pattern = reaction_result['pattern']
+            
+            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
+            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
+            
+            if not reintegration_result['valid']:
+                print(f"❌ {symbol} SHORT Tendance rejeté : {reintegration_result['reason']}")
+                return None
+            
+            reintegration_idx = reintegration_result['reintegration_idx']
+            
+            # Setup VALIDE
+            entry_price = close
+            
+            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            sl_price = bb20_up * (1 + sl_offset_pct)
+            
+            min_rr = get_setting('MIN_RR', 3.0)
+            risk = sl_price - entry_price
+            tp_price = entry_price - (risk * min_rr)
+            
+            rr_final = (entry_price - tp_price) / (sl_price - entry_price)
+            
+            if rr_final >= min_rr:
+                return {
+                    'symbol': symbol,
+                    'side': 'sell',
+                    'regime': 'Tendance',
+                    'pattern': pattern,
+                    'entry_price': entry_price,
+                    'sl_price': sl_price,
+                    'tp_price': tp_price,
+                    'rr': rr_final
+                }
+    
+    # ========================================================================
+    # DÉTECTION CONTRE-TENDANCE
+    # ========================================================================
+    
+    # LONG CT (prix sous MM80, double extrême bas)
+    if is_below_mm80:
+        # Chercher double extrême (BB20 + BB80 touchées)
+        contact_idx = None
+        for i in range(len(df) - 6, len(df) - 1):
+            if i < 0:
+                continue
+            
+            # Vérifier double extrême
+            if validate_double_extreme_ct(df, i):
+                bar = df.iloc[i]
+                # Contact BB20_lo ou BB80_lo
+                if bar['low'] <= bar['bb20_lo'] or bar['low'] <= bar['bb80_lo']:
+                    contact_idx = i
+                    break
+        
+        if contact_idx is not None:
+            # VALIDATION RÉACTION
+            reaction_result = find_reaction_pattern(df, contact_idx, 'long')
+            
+            if not reaction_result['valid']:
+                return None
+            
+            reaction_idx = reaction_result['reaction_idx']
+            pattern = reaction_result['pattern']
+            
+            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
+            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
+            
+            if not reintegration_result['valid']:
+                print(f"❌ {symbol} LONG CT rejeté : {reintegration_result['reason']}")
+                return None
+            
+            reintegration_idx = reintegration_result['reintegration_idx']
+            
+            # Setup CT VALIDE
+            entry_price = close
+            
+            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            sl_price = bb80_lo * (1 - sl_offset_pct)
+            
+            min_rr = get_setting('MIN_RR', 3.0)
+            risk = entry_price - sl_price
+            tp_price = mm80  # TP = MM80 pour CT
+            
+            # Vérifier RR
+            if (tp_price - entry_price) / risk >= min_rr:
+                rr_final = (tp_price - entry_price) / risk
+                
+                return {
+                    'symbol': symbol,
+                    'side': 'buy',
+                    'regime': 'Contre-tendance',
+                    'pattern': pattern,
+                    'entry_price': entry_price,
+                    'sl_price': sl_price,
+                    'tp_price': tp_price,
+                    'rr': rr_final
+                }
+    
+    # SHORT CT (prix au-dessus MM80, double extrême haut)
+    if is_above_mm80:
+        # Chercher double extrême (BB20 + BB80 touchées)
+        contact_idx = None
+        for i in range(len(df) - 6, len(df) - 1):
+            if i < 0:
+                continue
+            
+            if validate_double_extreme_ct(df, i):
+                bar = df.iloc[i]
+                # Contact BB20_up ou BB80_up
+                if bar['high'] >= bar['bb20_up'] or bar['high'] >= bar['bb80_up']:
+                    contact_idx = i
+                    break
+        
+        if contact_idx is not None:
+            # VALIDATION RÉACTION
+            reaction_result = find_reaction_pattern(df, contact_idx, 'short')
+            
+            if not reaction_result['valid']:
+                return None
+            
+            reaction_idx = reaction_result['reaction_idx']
+            pattern = reaction_result['pattern']
+            
+            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
+            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
+            
+            if not reintegration_result['valid']:
+                print(f"❌ {symbol} SHORT CT rejeté : {reintegration_result['reason']}")
+                return None
+            
+            reintegration_idx = reintegration_result['reintegration_idx']
+            
+            # Setup CT VALIDE
+            entry_price = close
+            
+            sl_offset_pct = get_setting('SL_OFFSET_PCT', 0.003)
+            sl_price = bb80_up * (1 + sl_offset_pct)
+            
+            min_rr = get_setting('MIN_RR', 3.0)
+            risk = sl_price - entry_price
+            tp_price = mm80  # TP = MM80 pour CT
+            
+            if (entry_price - tp_price) / risk >= min_rr:
+                rr_final = (entry_price - tp_price) / risk
+                
+                return {
+                    'symbol': symbol,
+                    'side': 'sell',
+                    'regime': 'Contre-tendance',
+                    'pattern': pattern,
+                    'entry_price': entry_price,
+                    'sl_price': sl_price,
+                    'tp_price': tp_price,
+                    'rr': rr_final
+                }
+    
     return None
 
 
