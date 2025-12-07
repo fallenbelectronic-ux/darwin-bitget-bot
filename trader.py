@@ -1221,7 +1221,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
-                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1257,7 +1256,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'entry_price': entry_price,
                     'sl_price': sl_price,
                     'tp_price': tp_price,
-                    'rr': rr_final
+                    'rr': rr_final,
+                    # INDICES POUR GRAPHIQUE
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'entry_idx': len(df) - 1
                 }
     
     # SHORT en tendance baissière
@@ -1287,7 +1290,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
-                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1319,7 +1321,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'entry_price': entry_price,
                     'sl_price': sl_price,
                     'tp_price': tp_price,
-                    'rr': rr_final
+                    'rr': rr_final,
+                    # INDICES POUR GRAPHIQUE
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'entry_idx': len(df) - 1
                 }
     
     # ========================================================================
@@ -1356,7 +1362,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
-                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1389,7 +1394,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'entry_price': entry_price,
                     'sl_price': sl_price,
                     'tp_price': tp_price,
-                    'rr': rr_final
+                    'rr': rr_final,
+                    # INDICES POUR GRAPHIQUE
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'entry_idx': len(df) - 1
                 }
     
     # SHORT CT (prix au-dessus MM80, double extrême haut)
@@ -1421,7 +1430,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
-                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1453,7 +1461,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'entry_price': entry_price,
                     'sl_price': sl_price,
                     'tp_price': tp_price,
-                    'rr': rr_final
+                    'rr': rr_final,
+                    # INDICES POUR GRAPHIQUE
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'entry_idx': len(df) - 1
                 }
     
     return None
