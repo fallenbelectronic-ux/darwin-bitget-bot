@@ -937,10 +937,11 @@ def _format_signal_row(sig: dict) -> str:
 
 def tg_show_signals_6h(limit: int = 50):
     """
-    Affiche 'Signaux des 6 dernières heures' :
-    ⚠️ UNIQUEMENT les signaux VALID_TAKEN (pris par le bot),
-    c’est-à-dire les positions réellement ouvrables et conformes
-    à toutes les conditions.
+    Affiche 'Signaux valides des 6 dernières heures' :
+    - uniquement les signaux VALID_TAKEN ou VALID_SKIPPED,
+      c’est-à-dire les setups qui respectent toutes les conditions
+      d’entrée (contact, réintégration, réaction, RR, etc.).
+    - filtrage supplémentaire via les règles de RR / cut-wick.
 
     Tri décroissant par ts (les plus récents en premier).
 
@@ -950,7 +951,7 @@ def tg_show_signals_6h(limit: int = 50):
     """
     keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
 
-    # Paramètres
+    # Paramètres de RR
     try:
         min_rr = float(database.get_setting('MIN_RR', os.getenv("MIN_RR", "3.0")))
     except Exception:
@@ -965,21 +966,28 @@ def tg_show_signals_6h(limit: int = 50):
     except Exception:
         cw_min_rr = 2.8
 
-    # Lecture DB : on ne récupère que VALID_TAKEN
+    # Lecture DB : on ne récupère que les signaux validés (pris + valides non pris)
     try:
         raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=limit) or []
+        raw_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit) or []
     except Exception as e:
-        edit_main(f"⚠️ Erreur lecture signaux (6h) : <code>{_escape(e)}</code>", keyboard)
+        edit_main(f"⚠️ Erreur lecture signaux valides (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
-    # Filtrage strict : on garde uniquement VALID_TAKEN qui respectent les seuils de RR
+    raw_all = (raw_taken or []) + (raw_skipped or [])
+    if not raw_all:
+        edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal valide sur les 6 dernières heures.", keyboard)
+        return
+
+    # Filtrage strict : on garde uniquement VALID_TAKEN / VALID_SKIPPED qui respectent les seuils de RR
     signals = []
-    for s in raw_taken:
+    for s in raw_all:
         try:
             st = str(s.get("state", "")).upper()
-            if st != "VALID_TAKEN":
-                # Sécurité supplémentaire : on exclut tout ce qui n'est pas VALID_TAKEN
+            if st not in ("VALID_TAKEN", "VALID_SKIPPED"):
+                # Sécurité supplémentaire : on exclut tout ce qui n'est pas explicitement validé
                 continue
+
             rr_val = float(s.get("rr", 0) or 0.0)
 
             if cut_wick:
@@ -996,15 +1004,22 @@ def tg_show_signals_6h(limit: int = 50):
 
         signals.append(s)
 
+    # Tri du plus récent au plus ancien + respect du limit global
     signals = sorted(signals, key=lambda s: int(s.get("ts", 0)), reverse=True)
+    if limit and len(signals) > limit:
+        signals = signals[:limit]
 
     if not signals:
-        edit_main("<b>⏱️ Signaux validés (6h)</b>\n\nAucun signal validé sur les 6 dernières heures.", keyboard)
+        edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal valide sur les 6 dernières heures.", keyboard)
         return
 
-    def _badge(_: dict) -> str:
-        # Ici, tous les signaux sont VALID_TAKEN
-        return "✅ Pris"
+    def _badge(s: dict) -> str:
+        st = str(s.get("state", "")).upper()
+        if st == "VALID_TAKEN":
+            return "✅ Pris"
+        if st == "VALID_SKIPPED":
+            return "☑️ Valide (non pris)"
+        return "ℹ️"
 
     def _reason(s: dict) -> str:
         payload = s.get("payload") or s.get("data") or {}
@@ -1012,7 +1027,7 @@ def tg_show_signals_6h(limit: int = 50):
         return f"  (raison: {html.escape(str(reason))})" if reason else ""
 
     # Titre + une ligne vide entre chaque signal
-    lines = ["<b>⏱️ Signaux validés (6h)</b>"]
+    lines = ["<b>⏱️ Signaux valides (6h)</b>"]
     for s in signals:
         row = _format_signal_row(s)
         note = ""
@@ -1026,7 +1041,6 @@ def tg_show_signals_6h(limit: int = 50):
         lines.append(f"{row}  —  {_badge(s)}{note}{_reason(s)}")
 
     edit_main("\n\n".join(lines), keyboard)
-
 
 
 def handle_equity_back_callback(update: Dict[str, Any]) -> None:
