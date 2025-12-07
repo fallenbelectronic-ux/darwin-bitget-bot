@@ -3280,13 +3280,13 @@ def manage_open_positions(ex: ccxt.Exchange):
         if df is None or len(df) < 2:
             continue
         last = df.iloc[-1]
-        last_close = float(last['close'])
         bb20_mid   = float(last['bb20_mid'])
         bb20_up    = float(last['bb20_up'])
         bb20_lo    = float(last['bb20_lo'])
         bb80_up    = float(last['bb80_up'])
         bb80_lo    = float(last['bb80_lo'])
         last_atr   = float(last.get('atr', 0.0))
+        last_close = float(last['close'])
 
         # ---------- TP dynamique ----------
         try:
@@ -3385,16 +3385,39 @@ def manage_open_positions(ex: ccxt.Exchange):
         else:
             be_allowed = True
 
+        # ---------- Déclencheur BE : contact BB20_mid depuis l'ENTRÉE ----------
         be_trigger = False
         try:
+            # 1) Fenêtre principale : depuis l'ouverture du trade si possible
+            scan_df = None
             try:
-                be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', 2))
+                ts_open = int(pos.get('open_timestamp') or 0)
             except Exception:
-                be_lookback = 2
-            be_lookback = max(1, min(be_lookback, len(df)))
-            window_be = df.iloc[-be_lookback:]
+                ts_open = 0
 
-            for _, row_be in window_be.iterrows():
+            if ts_open > 0 and isinstance(df.index, pd.DatetimeIndex):
+                try:
+                    # on tolère timestamp en secondes ou millisecondes
+                    if ts_open > 10**12:
+                        ts_open_ts = pd.to_datetime(ts_open, unit='ms')
+                    else:
+                        ts_open_ts = pd.to_datetime(ts_open, unit='s')
+                    window_from_entry = df[df.index >= ts_open_ts]
+                    if len(window_from_entry) > 0:
+                        scan_df = window_from_entry
+                except Exception:
+                    scan_df = None
+
+            # 2) Fallback : petite fenêtre glissante BE_TOUCH_LOOKBACK (comportement historique)
+            if scan_df is None:
+                try:
+                    be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', 2))
+                except Exception:
+                    be_lookback = 2
+                be_lookback = max(1, min(be_lookback, len(df)))
+                scan_df = df.iloc[-be_lookback:]
+
+            for _, row_be in scan_df.iterrows():
                 try:
                     high_be = float(row_be['high'])
                     low_be = float(row_be['low'])
@@ -3409,12 +3432,14 @@ def manage_open_positions(ex: ccxt.Exchange):
                     be_trigger = True
                     break
 
+            # 3) Sécurité : si rien détecté mais la clôture actuelle est déjà de l'autre côté de la médiane
             if not be_trigger:
                 if is_long and last_close >= bb20_mid:
                     be_trigger = True
                 if (not is_long) and last_close <= bb20_mid:
                     be_trigger = True
         except Exception:
+            # Fallback extrême : on retombe sur la simple position de la dernière bougie
             try:
                 if is_long and float(last['high']) >= bb20_mid:
                     be_trigger = True
@@ -3451,12 +3476,10 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             qty = float(pos['quantity'])
 
-        # ----------- 🔸 NOUVEAU : BE basé sur swing + offset SL ----------
+        # ----------- 🔸 BE basé sur swing + offset SL ----------
         if be_allowed and be_trigger and qty > 0:
-            # 1) Ancre swing (top/bottom) récente
             swing_anchor = _find_last_swing_anchor(df, is_long, max_lookback=15)
 
-            # 2) SL proposé depuis le swing avec le MÊME offset que pour le SL normal
             want_sl_from_swing = None
             if swing_anchor is not None:
                 try:
@@ -3469,15 +3492,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     want_sl_from_swing = float(swing_anchor)
 
-            # 3) Combinaison avec le prix BE théorique (protection fees)
             if want_sl_from_swing is None:
                 want_sl = be_price_theo
             else:
                 if is_long:
-                    # Long : on protège au mieux (max entre BE et swing-offset)
                     want_sl = max(be_price_theo, float(want_sl_from_swing))
                 else:
-                    # Short : SL au plus bas (min) entre BE et swing-offset
                     want_sl = min(be_price_theo, float(want_sl_from_swing))
 
             improve_sl = (is_long and want_sl > sl_current) or ((not is_long) and want_sl < sl_current)
@@ -3535,9 +3555,8 @@ def manage_open_positions(ex: ccxt.Exchange):
                             pass
                 except Exception:
                     pass
-        # ---------------------------------------------------------------
 
-        # 5) Trailing après BE actif (inchangé)
+        # 5) Trailing après BE actif
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
             try:
                 min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
