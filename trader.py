@@ -2542,7 +2542,6 @@ def execute_signal_with_gates(
                 signal['entry'] = entry_px
                 signal['sl'] = float(sl_live)
                 signal['tp'] = float(tp_live)
-                # on laisse signal['rr'] tel qu'il vient de detect_signal (ou 0.0 si absent)
                 _update_signal_state(
                     symbol,
                     timeframe,
@@ -2577,8 +2576,10 @@ def execute_signal_with_gates(
         signal['sl'] = float(sl_live)
         signal['tp'] = float(tp_live)
         signal['rr'] = float(rr_final)
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED",
-                             reason=f"rr_entry_gate({rr_final:.2f})", tp=float(tp_live), sl=float(sl_live))
+        _update_signal_state(
+            symbol, timeframe, signal, entry_px, "SKIPPED",
+            reason=f"rr_entry_gate({rr_final:.2f})", tp=float(tp_live), sl=float(sl_live)
+        )
         return False, f"Rejeté: RR entrée {rr_final:.2f} < MIN_RR ({MIN_RR})."
 
     signal['entry'] = entry_px
@@ -2589,7 +2590,7 @@ def execute_signal_with_gates(
     is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
     max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
 
-    # Sync eventuelle avant exécution
+    # Sync éventuelle avant exécution
     try:
         if str(database.get_setting('SYNC_BEFORE_EXECUTE', 'true')).lower() == 'true':
             sync_positions_with_exchange(ex)
@@ -2605,9 +2606,7 @@ def execute_signal_with_gates(
                     continue
                 pos_side = str(pos_open.get('side', '')).lower()
                 if not pos_side or pos_side == side:
-                    # même sens ou inconnu → on ne ferme pas ici
                     continue
-                # sens inverse sur le même symbole → on ferme avant d'envisager le nouveau trade
                 close_position_manually(ex, int(pos_open['id']))
             except Exception:
                 continue
@@ -2624,7 +2623,10 @@ def execute_signal_with_gates(
 
     balance = get_usdt_balance(ex)
     if balance is None or balance <= 10:
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"low_balance({balance or 0:.2f} USDT)")
+        _update_signal_state(
+            symbol, timeframe, signal, entry_px,
+            "SKIPPED", reason=f"low_balance({balance or 0:.2f} USDT)"
+        )
         return False, f"Rejeté: Solde insuffisant ({balance or 0:.2f} USDT) ou erreur API."
 
     price_ref = entry_px
@@ -2663,6 +2665,7 @@ def execute_signal_with_gates(
         if (not is_long) and tp >= last_px:
             tp = last_px * (1.0 - gap_pct)
 
+    # --- Taille théorique selon le risque ---
     quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, price_ref, sl)
     if quantity <= 0:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="qty_zero_after_sizing")
@@ -2676,7 +2679,10 @@ def execute_signal_with_gates(
         except Exception:
             ref_price = price_ref
 
-    capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, abs(float(quantity)), ref_price or price_ref)
+    # --- Cap par marge/filtres marché ---
+    capped_qty, meta = _cap_qty_for_margin_and_filters(
+        ex, symbol, side, abs(float(quantity)), ref_price or price_ref
+    )
     if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="insufficient_after_cap")
         try:
@@ -2699,9 +2705,14 @@ def execute_signal_with_gates(
 
     notional_value = capped_qty * price_ref
     if notional_value < MIN_NOTIONAL_VALUE:
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED",
-                             reason=f"below_min_notional({notional_value:.2f}<{MIN_NOTIONAL_VALUE})")
-        return False, f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) < min requis ({MIN_NOTIONAL_VALUE} USDT)."
+        _update_signal_state(
+            symbol, timeframe, signal, entry_px, "SKIPPED",
+            reason=f"below_min_notional({notional_value:.2f}<{MIN_NOTIONAL_VALUE})"
+        )
+        return False, (
+            f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) "
+            f"< min requis ({MIN_NOTIONAL_VALUE} USDT)."
+        )
 
     try:
         sl = float(ex.price_to_precision(symbol, sl))
@@ -2723,6 +2734,7 @@ def execute_signal_with_gates(
 
     if not is_paper_mode:
         try:
+            # Contexte marge/levier
             try:
                 ex.set_leverage(LEVERAGE, symbol)
                 try:
@@ -2736,10 +2748,44 @@ def execute_signal_with_gates(
             except Exception:
                 pass
 
-            order = create_market_order_smart(ex, symbol, side, quantity, ref_price=final_entry_price, params=common_params)
+            # --- Ordre marché d'entrée ---
+            order = create_market_order_smart(
+                ex, symbol, side, quantity, ref_price=final_entry_price, params=common_params
+            )
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
 
+            # --- RÉCUPÉRATION DE LA TAILLE RÉELLE SUR L'EXCHANGE ---
+            # (permet d'avoir SL/TP exactement sur la taille exécutée)
+            try:
+                market_real = None
+                try:
+                    market_real = ex.market(symbol)
+                except Exception:
+                    pass
+
+                real_qty = None
+                positions = _fetch_positions_safe(ex, [symbol])
+                for p in positions:
+                    same = (p.get('symbol') == symbol)
+                    if (not same) and market_real:
+                        same = (p.get('raw', {}) or {}).get('symbol') == market_real.get('id')
+                    if same:
+                        size_val = float(p.get('size') or p.get('contracts') or p.get('positionAmt') or 0.0)
+                        if abs(size_val) > 0:
+                            real_qty = abs(size_val)
+                            break
+
+                if real_qty is not None and real_qty > 0:
+                    try:
+                        quantity = float(ex.amount_to_precision(symbol, real_qty))
+                    except Exception:
+                        quantity = float(real_qty)
+            except Exception:
+                # en cas d'erreur, on garde la quantité théorique
+                pass
+
+            # --- SL/TP sur la QUANTITÉ RÉELLE ---
             close_side = 'sell' if is_long else 'buy'
             mark_now = _current_mark_price(ex, symbol)
             sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
@@ -2766,6 +2812,7 @@ def execute_signal_with_gates(
             _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"execution_error:{e}")
             return False, f"Erreur d'exécution: {e}"
 
+    # --- Persistance & notification ---
     signal['entry'] = final_entry_price
     signal['sl'] = float(sl)
     signal['tp'] = float(tp)
@@ -2777,7 +2824,7 @@ def execute_signal_with_gates(
         entry_price=final_entry_price,
         sl_price=float(sl),
         tp_price=float(tp),
-        quantity=float(quantity),
+        quantity=float(quantity),  # taille réelle si on a réussi à la lire
         risk_percent=RISK_PER_TRADE_PERCENT,
         management_strategy=management_strategy,
         entry_atr=float(signal.get('entry_atr', 0.0) or 0.0),
@@ -2803,8 +2850,6 @@ def execute_signal_with_gates(
         pass
 
     return True, "Position ouverte avec succès."
-
-
 
 def get_tp_offset_pct() -> float:
     """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
@@ -3112,21 +3157,16 @@ def manage_open_positions(ex: ccxt.Exchange):
       • Déclencheur BE: franchissement OU contact de la BB20_mid.
       • Prix BE: entry ajusté frais/buffer via compute_fee_safe_be_price().
     Trailing (MIS À JOUR):
-      • Actif uniquement APRÈS BE + lorsque le prix a déjà bien progressé vers le TP.
-      • Proximité TP mesurée par _progress_to_tp(entry, tp, mark, side).
-      • Deux zones:
-          - zone 'near TP' : trailing plus serré.
-          - zone 'ultra near TP' : trailing encore plus serré.
+      • Actif dès que le BE est armé (ou que le SL est déjà au-delà du BE).
+      • Fonctionne comme un trailing-stop d’exchange: distance = max(%, k*ATR) autour du prix courant.
       • Paramètres configurables via la DB:
-          - TRAIL_PROGRESS_ACTIVATION (def 0.60)
-          - TRAIL_PROGRESS_TIGHT      (def 0.85)
-          - TRAIL_NEAR_TP_PCT         (def 0.0020)
-          - TRAIL_NEAR_TP_ATR_K       (def 0.7)
-          - TRAIL_ULTRA_NEAR_TP_PCT   (def 0.0010)
-          - TRAIL_ULTRA_NEAR_TP_ATR_K (def 0.5)
+          - TRAIL_PCT (def 0.0035)
+          - TRAIL_ATR_K (def 1.0)
+          - TRAIL_MIN_MOVE_PCT   (def 0.001)
+          - TRAIL_MIN_MOVE_ATR_K (def 0.25)
       • Ne recule jamais le SL ; mise à jour live à chaque boucle.
       • Conserve le TP (les deux coexistent).
-      • Si override manuel et FOLLOW_MANUAL_SL_WITH_TRAILING=true, on continue à suivre.
+      • Si override manuel et FOLLOW_MANUAL_SL_WITH_TRAILING=false, on n’y touche pas.
     """
     _ensure_bitget_mix_options(ex)
 
@@ -3218,6 +3258,8 @@ def manage_open_positions(ex: ccxt.Exchange):
 
     for pos in open_positions:
         symbol = pos['symbol']
+
+        # Vérification que la position est toujours ouverte côté exchange
         try:
             real_qty = float(live_map.get(symbol, 0.0))
             if real_qty <= 0:
@@ -3240,12 +3282,14 @@ def manage_open_positions(ex: ccxt.Exchange):
         is_long = (pos['side'] == 'buy')
         close_side = 'sell' if is_long else 'buy'
 
+        # On ignore les trades d'import legacy
         regime_raw = pos.get('regime', 'Tendance')
         if isinstance(regime_raw, str) and regime_raw.lower().startswith('import'):
             continue
 
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
+        # Contexte marge / levier
         try:
             ex.set_leverage(LEVERAGE, symbol)
             try:
@@ -3259,11 +3303,15 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             pass
 
+        # Suivi manuel
         try:
-            FOLLOW_MANUAL_SL_WITH_TRAILING = str(database.get_setting('FOLLOW_MANUAL_SL_WITH_TRAILING', 'true')).lower() == 'true'
+            FOLLOW_MANUAL_SL_WITH_TRAILING = str(
+                database.get_setting('FOLLOW_MANUAL_SL_WITH_TRAILING', 'true')
+            ).lower() == 'true'
         except Exception:
             FOLLOW_MANUAL_SL_WITH_TRAILING = True
 
+        # Tick size
         try:
             market = ex.market(symbol) or {}
             tick_size = _bitget_tick_size(market)
@@ -3273,20 +3321,22 @@ def manage_open_positions(ex: ccxt.Exchange):
         manual = _apply_manual_override_if_needed(ex, pos, tick_size)
         skip_sl_updates = bool(manual.get('sl_changed') and (not FOLLOW_MANUAL_SL_WITH_TRAILING))
 
+        # DF marché
         try:
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
         except Exception:
             df = None
         if df is None or len(df) < 2:
             continue
-        last = df.iloc[-1]
+
+        last      = df.iloc[-1]
+        last_close = float(last['close'])
         bb20_mid   = float(last['bb20_mid'])
         bb20_up    = float(last['bb20_up'])
         bb20_lo    = float(last['bb20_lo'])
         bb80_up    = float(last['bb80_up'])
         bb80_lo    = float(last['bb80_lo'])
         last_atr   = float(last.get('atr', 0.0))
-        last_close = float(last['close'])
 
         # ---------- TP dynamique ----------
         try:
@@ -3346,9 +3396,15 @@ def manage_open_positions(ex: ccxt.Exchange):
                     sl_price  = float(ex.price_to_precision(symbol, sl_price))
                 except Exception:
                     pass
+
                 if qty > 0:
                     mark_now_tp = _current_mark_price(ex, symbol)
-                    sl_price = _validate_sl_for_side(('buy' if is_long else 'sell'), float(sl_price), mark_now_tp, tick_size)
+                    sl_price = _validate_sl_for_side(
+                        ('buy' if is_long else 'sell'),
+                        float(sl_price),
+                        mark_now_tp,
+                        tick_size
+                    )
 
                     ex.create_order(
                         symbol,
@@ -3385,39 +3441,16 @@ def manage_open_positions(ex: ccxt.Exchange):
         else:
             be_allowed = True
 
-        # ---------- Déclencheur BE : contact BB20_mid depuis l'ENTRÉE ----------
         be_trigger = False
         try:
-            # 1) Fenêtre principale : depuis l'ouverture du trade si possible
-            scan_df = None
             try:
-                ts_open = int(pos.get('open_timestamp') or 0)
+                be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', 2))
             except Exception:
-                ts_open = 0
+                be_lookback = 2
+            be_lookback = max(1, min(be_lookback, len(df)))
+            window_be = df.iloc[-be_lookback:]
 
-            if ts_open > 0 and isinstance(df.index, pd.DatetimeIndex):
-                try:
-                    # on tolère timestamp en secondes ou millisecondes
-                    if ts_open > 10**12:
-                        ts_open_ts = pd.to_datetime(ts_open, unit='ms')
-                    else:
-                        ts_open_ts = pd.to_datetime(ts_open, unit='s')
-                    window_from_entry = df[df.index >= ts_open_ts]
-                    if len(window_from_entry) > 0:
-                        scan_df = window_from_entry
-                except Exception:
-                    scan_df = None
-
-            # 2) Fallback : petite fenêtre glissante BE_TOUCH_LOOKBACK (comportement historique)
-            if scan_df is None:
-                try:
-                    be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', 2))
-                except Exception:
-                    be_lookback = 2
-                be_lookback = max(1, min(be_lookback, len(df)))
-                scan_df = df.iloc[-be_lookback:]
-
-            for _, row_be in scan_df.iterrows():
+            for _, row_be in window_be.iterrows():
                 try:
                     high_be = float(row_be['high'])
                     low_be = float(row_be['low'])
@@ -3432,14 +3465,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                     be_trigger = True
                     break
 
-            # 3) Sécurité : si rien détecté mais la clôture actuelle est déjà de l'autre côté de la médiane
             if not be_trigger:
                 if is_long and last_close >= bb20_mid:
                     be_trigger = True
                 if (not is_long) and last_close <= bb20_mid:
                     be_trigger = True
         except Exception:
-            # Fallback extrême : on retombe sur la simple position de la dernière bougie
             try:
                 if is_long and float(last['high']) >= bb20_mid:
                     be_trigger = True
@@ -3476,7 +3507,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             qty = float(pos['quantity'])
 
-        # ----------- 🔸 BE basé sur swing + offset SL ----------
+        # ----------- BE basé sur swing + offset SL ----------
         if be_allowed and be_trigger and qty > 0:
             swing_anchor = _find_last_swing_anchor(df, is_long, max_lookback=15)
 
@@ -3507,7 +3538,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     mark_now_be = None
 
-                want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now_be, tick_size)
+                want_sl = _validate_sl_for_side(
+                    ('buy' if is_long else 'sell'),
+                    float(want_sl),
+                    mark_now_be,
+                    tick_size
+                )
                 try:
                     want_sl = float(ex.price_to_precision(symbol, want_sl))
                 except Exception:
@@ -3526,6 +3562,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     sl_current = float(want_sl)
                     be_armed = True
 
+                    # Notification BE la première fois
                     if prev_be_status != 'ACTIVE':
                         try:
                             remaining_qty = float(qty)
@@ -3556,7 +3593,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-        # 5) Trailing après BE actif
+        # ----------- Trailing live après BE (style trailing-stop exchange) ----------
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
             try:
                 min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
@@ -3568,80 +3605,32 @@ def manage_open_positions(ex: ccxt.Exchange):
                 min_move_atr_k = 0.25
 
             mark_now = _current_mark_price(ex, symbol)
-
-            try:
-                tp_pos = float(pos.get('tp_price') or 0.0)
-                entry_px = float(pos.get('entry_price') or 0.0)
-            except Exception:
-                tp_pos, entry_px = 0.0, 0.0
-
-            progress = _progress_to_tp(entry_px, tp_pos, mark_now, is_long)
-
-            try:
-                act_prog = float(database.get_setting('TRAIL_PROGRESS_ACTIVATION', 0.60))
-            except Exception:
-                act_prog = 0.60
-            try:
-                tight_prog = float(database.get_setting('TRAIL_PROGRESS_TIGHT', 0.85))
-            except Exception:
-                tight_prog = 0.85
-
-            if progress < act_prog:
+            if not mark_now or mark_now <= 0:
                 continue
 
+            # SL "idéal" à distance max(d%, k*ATR) du prix courant
             try:
-                base_pct = float(database.get_setting('TRAIL_PCT', 0.0035))
+                want_sl = _compute_trailing_sl(mark_now, ('buy' if is_long else 'sell'), last_atr)
             except Exception:
-                base_pct = 0.0035
-            try:
-                base_k = float(database.get_setting('TRAIL_ATR_K', 1.0))
-            except Exception:
-                base_k = 1.0
-            try:
-                near_pct = float(database.get_setting('TRAIL_NEAR_TP_PCT', 0.0020))
-            except Exception:
-                near_pct = 0.0020
-            try:
-                near_k = float(database.get_setting('TRAIL_NEAR_TP_ATR_K', 0.7))
-            except Exception:
-                near_k = 0.7
-            try:
-                ultra_pct = float(database.get_setting('TRAIL_ULTRA_NEAR_TP_PCT', 0.0010))
-            except Exception:
-                ultra_pct = 0.0010
-            try:
-                ultra_k = float(database.get_setting('TRAIL_ULTRA_NEAR_TP_ATR_K', 0.5))
-            except Exception:
-                ultra_k = 0.5
+                continue
 
-            d_pct = base_pct
-            k_atr = base_k
-            if progress >= tight_prog:
-                d_pct = ultra_pct
-                k_atr = ultra_k
-            elif progress >= act_prog:
-                d_pct = near_pct
-                k_atr = near_k
-
-            dist_pct = abs(d_pct) * mark_now
-            dist_atr = abs(k_atr) * last_atr
-            dist = max(dist_pct, dist_atr)
-
-            if is_long:
-                want_sl = max(0.0, mark_now - dist)
-            else:
-                want_sl = max(0.0, mark_now + dist)
-
+            # Ne jamais reculer le SL
             if is_long and want_sl <= sl_current:
                 continue
             if (not is_long) and want_sl >= sl_current:
                 continue
 
-            min_move_abs = max(min_move_pct * mark_now, min_move_atr_k * last_atr)
-            if abs(want_sl - sl_current) < max(min_move_abs, tick_size):
+            # Mouvement minimum requis (en prix absolu) pour limiter le spam d'ordres
+            min_move_abs = max(min_move_pct * mark_now, min_move_atr_k * last_atr, tick_size)
+            if abs(want_sl - sl_current) < min_move_abs:
                 continue
 
-            want_sl = _validate_sl_for_side(('buy' if is_long else 'sell'), float(want_sl), mark_now, tick_size)
+            want_sl = _validate_sl_for_side(
+                ('buy' if is_long else 'sell'),
+                float(want_sl),
+                mark_now,
+                tick_size
+            )
             try:
                 want_sl = float(ex.price_to_precision(symbol, want_sl))
             except Exception:
@@ -3661,6 +3650,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 pos['breakeven_status'] = 'ACTIVE'
             except Exception:
                 pass
+
 
 
 
