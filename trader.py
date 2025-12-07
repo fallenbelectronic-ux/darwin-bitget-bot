@@ -1212,7 +1212,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reaction_result = find_reaction_pattern(df, contact_idx, 'long')
             
             if not reaction_result['valid']:
-                # Pas de pattern valide, skip
                 return None
             
             reaction_idx = reaction_result['reaction_idx']
@@ -1222,11 +1221,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
-                # Pas de réintégration, skip
-                try:
-                    notifier.tg_send(f"⚠️ {symbol} LONG Tendance rejeté\n{reintegration_result['reason']}")
-                except:
-                    pass
+                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1292,10 +1287,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
-                try:
-                    notifier.tg_send(f"⚠️ {symbol} SHORT Tendance rejeté\n{reintegration_result['reason']}")
-                except:
-                    pass
+                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1364,10 +1356,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
-                try:
-                    notifier.tg_send(f"⚠️ {symbol} LONG CT rejeté\n{reintegration_result['reason']}")
-                except:
-                    pass
+                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1432,10 +1421,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
-                try:
-                    notifier.tg_send(f"⚠️ {symbol} SHORT CT rejeté\n{reintegration_result['reason']}")
-                except:
-                    pass
+                # PAS DE NOTIFICATION (supprimé)
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
@@ -1470,7 +1456,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'rr': rr_final
                 }
     
-    return None
     return None
 
 
