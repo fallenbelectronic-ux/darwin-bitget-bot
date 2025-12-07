@@ -264,6 +264,7 @@ def get_universe_by_market_cap(ex, universe_size):
 def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 200) -> Optional[pd.DataFrame]:
     """
     Récupère l'OHLCV et calcule:
+      - MM(80):   mm80 (moyenne mobile simple 80 périodes)
       - BB(20,2): bb20_up, bb20_mid, bb20_lo
       - BB(80,2): bb80_up, bb80_mid, bb80_lo
       - ATR(14):  atr
@@ -294,17 +295,30 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # Calculs indicateurs
+        # ========================================================================
+        # CALCUL MOYENNE MOBILE 80 (mm80) - AJOUTÉ
+        # ========================================================================
+        df["mm80"] = df["close"].rolling(window=80).mean()
+
+        # ========================================================================
+        # CALCUL BOLLINGER BANDS 20
+        # ========================================================================
         bb20 = BollingerBands(close=df["close"], window=20, window_dev=2)
         df["bb20_up"]  = bb20.bollinger_hband()
         df["bb20_mid"] = bb20.bollinger_mavg()
         df["bb20_lo"]  = bb20.bollinger_lband()
 
+        # ========================================================================
+        # CALCUL BOLLINGER BANDS 80
+        # ========================================================================
         bb80 = BollingerBands(close=df["close"], window=80, window_dev=2)
         df["bb80_up"]  = bb80.bollinger_hband()
         df["bb80_mid"] = bb80.bollinger_mavg()
         df["bb80_lo"]  = bb80.bollinger_lband()
 
+        # ========================================================================
+        # CALCUL ATR 14
+        # ========================================================================
         atr = AverageTrueRange(
             high=df["high"], low=df["low"], close=df["close"], window=14
         ).average_true_range()
@@ -320,7 +334,6 @@ def fetch_and_prepare_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: 
     except Exception as e:
         print(f"fetch_and_prepare_df error on {symbol} {timeframe}: {e}")
         return None
-
         
 def _safe_fetch_ohlcv_with_retries(ex, symbol: str, timeframe: str, limit: int = 200, params: Optional[dict] = None):
     """
