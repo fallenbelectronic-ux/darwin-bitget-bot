@@ -9,13 +9,18 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
        - BB20 turquoise (lignes pleines) + MM20 turquoise pointillé
        - BB80 bleu (plus épais)      + MM80 bleu pointillé
        - Lignes Entrée / SL / TP
-       - Marqueurs verticaux + flèches : Contact / Réaction / Entrée
-       Retourne un io.BytesIO prêt pour Telegram."""
+       - Bloc vert/rouge Entrée-TP / Entrée-SL (sur toute la fenêtre)
+       - Marqueurs verticaux + flèches : Contact / Réaction / Entrée (si dans la fenêtre)
+       Retourne un io.BytesIO prêt pour Telegram.
+    """
     try:
         import matplotlib.pyplot as plt
+        from matplotlib import dates as mdates
+        from matplotlib.patches import Rectangle
 
         # Colonnes nécessaires (inclut bb20_mid pour tracer la MM20)
-        required_cols = ['bb20_up', 'bb20_mid', 'bb20_lo', 'bb80_up', 'bb80_mid', 'bb80_lo']
+        required_cols = ['bb20_up', 'bb20_mid', 'bb20_lo',
+                         'bb80_up', 'bb80_mid', 'bb80_lo']
         if not all(col in df.columns for col in required_cols):
             print("Erreur graphique: le DataFrame ne contient pas toutes les colonnes de BB nécessaires.")
             return None
@@ -77,8 +82,9 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             mpf.make_addplot(df['bb80_mid'].iloc[seg], color=col_blue, linestyle='--', width=1.2),
         ]
 
-        # Lignes horizontales Entrée / SL / TP
+        # --- Lignes horizontales Entrée / SL / TP (comme la version de base) ---
         h_prices = [float(signal['entry']), float(signal['sl']), float(signal['tp'])]
+        entry_price, sl_price, tp_price = h_prices
         h_colors = ['#60a5fa', '#ef4444', '#22c55e']  # bleu, rouge, vert
         h_widths = [1.2, 1.2, 1.2]
 
@@ -89,26 +95,66 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             title=f"Setup de Trade: {symbol} ({signal['regime']})",
             ylabel='Prix (USDT)',
             addplot=plots,
-            hlines=dict(hlines=h_prices, colors=h_colors, linewidths=h_widths, alpha=0.95),
+            hlines=dict(hlines=h_prices, colors=h_colors,
+                        linewidths=h_widths, alpha=0.95),
             returnfig=True,
             figsize=(12, 7)
         )
 
-        # --- AXE principal ---
+        # Axe principal
         try:
             ax = axes[0]
         except TypeError:
             ax = axes
 
-        # ========= AJOUT : marqueurs Contact / Réaction / Entrée =========
+        # -------------------------
+        # Bloc position Entrée-TP / Entrée-SL
+        # -------------------------
+        x_left, x_right = ax.get_xlim()
+        width = max(x_right - x_left, 0.0)
+
+        def _add_box(y1: float, y2: float, color: str, alpha: float) -> None:
+            if width <= 0:
+                return
+            y_bottom = min(y1, y2)
+            height = abs(y2 - y1)
+            if height <= 0:
+                return
+            rect = Rectangle(
+                (x_left, y_bottom),
+                width,
+                height,
+                facecolor=color,
+                edgecolor=color,
+                alpha=alpha,
+                linewidth=1.0,
+                zorder=1
+            )
+            ax.add_patch(rect)
+
+        # LONG ou SHORT
+        if tp_price > entry_price:
+            # LONG
+            _add_box(entry_price, tp_price, '#22c55e', 0.16)   # profit
+            _add_box(sl_price, entry_price, '#ef4444', 0.18)   # perte
+        else:
+            # SHORT
+            _add_box(tp_price, entry_price, '#22c55e', 0.16)   # profit
+            _add_box(entry_price, sl_price, '#ef4444', 0.18)   # perte
+
+        # -------------------------
+        # Marqueurs Contact / Réaction / Entrée
+        # -------------------------
+        y_min, y_max = ax.get_ylim()
+        y_range = max(y_max - y_min, 1e-9)
 
         def _resolve_bar_position(base_key: str) -> Optional[int]:
             """
             Renvoie l'indice (0..len(df_plot)-1) de la bougie 'base_key'
-            (contact / reaction / entry) SI elle est dans les 20 dernières
-            bougies. Sinon -> None (on ne dessine rien).
+            (contact / reaction / entry) si elle est dans les 20 dernières
+            bougies. Sinon -> None.
             """
-            # 1) via index dans df complet
+            # via index sur df complet
             idx_keys = [f"{base_key}_index", f"{base_key}_idx", f"{base_key}_bar"]
             for k in idx_keys:
                 if k in signal and signal[k] is not None:
@@ -127,17 +173,15 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
                             loc = loc[0]
                         return int(loc)
                     except Exception:
-                        # pas dans la fenêtre df_plot
                         continue
 
-            # 2) via timestamp (optionnel)
+            # via timestamp (optionnel)
             ts_keys = [f"{base_key}_ts", f"{base_key}_time", f"{base_key}_timestamp"]
             for k in ts_keys:
                 if k in signal and signal[k] is not None:
                     raw = signal[k]
                     try:
                         if isinstance(raw, (int, float)):
-                            # heuristique ms / s
                             if raw > 1e12:
                                 ts = pd.to_datetime(int(raw), unit='ms', utc=True)
                             else:
@@ -146,7 +190,6 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
                             ts = pd.to_datetime(raw, utc=True)
                     except Exception:
                         continue
-                    # on ne dessine que si le timestamp est dans la fenêtre
                     if ts < df_plot.index[0] or ts > df_plot.index[-1]:
                         continue
                     try:
@@ -158,13 +201,9 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
 
             return None
 
-        # positions éventuelles dans df_plot
         contact_pos  = _resolve_bar_position('contact')
         reaction_pos = _resolve_bar_position('reaction')
         entry_pos    = _resolve_bar_position('entry')
-
-        y_min, y_max = ax.get_ylim()
-        y_range = max(y_max - y_min, 1e-9)
 
         markers = [
             ("Contact",  contact_pos,  '#f97316'),
@@ -174,7 +213,6 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
 
         label_idx = 0
         for name, pos, color in markers:
-            # si la bougie n'est pas dans les 20 dernières -> on ne dessine rien
             if pos is None or pos < 0 or pos >= len(df_plot):
                 continue
 
@@ -183,14 +221,14 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             # ligne verticale
             ax.axvline(x_dt, color=color, linestyle='--', linewidth=1.1, alpha=0.95)
 
-            # haut de la bougie pour la flèche
+            # haut de la bougie
             try:
                 row = df_plot.iloc[pos]
                 y_candle = float(row['High'])
             except Exception:
                 y_candle = y_max - 0.2 * y_range
 
-            # texte au-dessus + flèche vers la bougie
+            # texte + flèche
             y_text = y_max - 0.04 * y_range * (label_idx + 1)
             ax.annotate(
                 name,
@@ -211,9 +249,9 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             )
             label_idx += 1
 
-        # ========= FIN AJOUT =========
-
-        # Annotations à droite (version d'origine)
+        # -------------------------
+        # Annotations texte à droite (version de base)
+        # -------------------------
         last_x = ax.get_xlim()[1]
         labels = ['Entrée', 'SL', 'TP']
         for y, label, color in zip(h_prices, labels, h_colors):
@@ -227,12 +265,7 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
         fig.savefig(buf, format='png', bbox_inches='tight', dpi=110)
         buf.seek(0)
 
-        # Clean
-        try:
-            plt.close(fig)
-        except Exception:
-            fig.clf()
-
+        plt.close(fig)
         return buf
 
     except Exception as e:
