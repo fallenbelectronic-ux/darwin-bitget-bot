@@ -40,7 +40,7 @@ BE_BUFFER_USDT  = float(os.getenv("BE_BUFFER_USDT","0.0"))     # buffer absolu o
 def create_exchange():
     ex = ccxt.bitget({
         'apiKey': os.getenv('BITGET_API_KEY'),
-        'secret': os.getenv('BITGET_SECRET'),
+        'secret': os.getenv('BITGET_API_SECRET'),
         'password': os.getenv('BITGET_PASSPHRASE'),
         'options': {
             'defaultType': 'swap',
