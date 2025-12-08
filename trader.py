@@ -3270,6 +3270,111 @@ def _check_reaction_before_entry(df: pd.DataFrame, signal: Dict[str, Any], is_lo
 
     return False
 
+def _recalc_sl_tp_live(
+    df: pd.DataFrame,
+    side: str,
+    regime: str,
+    entry_price: float,
+    symbol: str,
+    timeframe: str
+) -> Tuple[float, float, Optional[str]]:
+    """
+    Recalcule SL/TP live au moment de l'exécution selon la stratégie Darwin.
+    
+    TENDANCE :
+    - SL = BB20 + offset
+    - TP = BB80 opposée + offset
+    
+    CONTRE-TENDANCE :
+    - SL = BB80 + offset
+    - TP = BB20_mid + offset
+    
+    Returns:
+        (sl_price, tp_price, error_message)
+    """
+    try:
+        if df is None or len(df) < 3:
+            return 0.0, 0.0, "df_insufficient"
+        
+        last = df.iloc[-1]
+        is_long = (str(side).lower() == 'buy')
+        
+        # Récupérer les BB
+        try:
+            bb20_up = float(last['bb20_up'])
+            bb20_lo = float(last['bb20_lo'])
+            bb20_mid = float(last['bb20_mid'])
+            bb80_up = float(last['bb80_up'])
+            bb80_lo = float(last['bb80_lo'])
+            atr = float(last.get('atr', 0.0))
+        except Exception as e:
+            return 0.0, 0.0, f"bb_missing:{e}"
+        
+        # === TENDANCE ===
+        if regime == 'Tendance':
+            if is_long:
+                # LONG Tendance : SL = BB20_lo, TP = BB80_up
+                sl_raw = bb20_lo
+                tp_raw = bb80_up
+                
+                sl = adjust_sl_for_offset(sl_raw, 'buy', atr, ref_price=sl_raw)
+                tp = adjust_tp_for_bb_offset(tp_raw, 'buy', atr, ref_price=tp_raw)
+            
+            else:
+                # SHORT Tendance : SL = BB20_up, TP = BB80_lo
+                sl_raw = bb20_up
+                tp_raw = bb80_lo
+                
+                sl = adjust_sl_for_offset(sl_raw, 'sell', atr, ref_price=sl_raw)
+                tp = adjust_tp_for_bb_offset(tp_raw, 'sell', atr, ref_price=tp_raw)
+        
+        # === CONTRE-TENDANCE ===
+        else:
+            if is_long:
+                # LONG CT : SL = BB80_lo, TP = BB20_mid
+                sl_raw = bb80_lo
+                tp_raw = bb20_mid
+                
+                sl = adjust_sl_for_offset(sl_raw, 'buy', atr, ref_price=sl_raw)
+                tp = adjust_tp_for_bb_offset(tp_raw, 'buy', atr, ref_price=tp_raw)
+            
+            else:
+                # SHORT CT : SL = BB80_up, TP = BB20_mid
+                sl_raw = bb80_up
+                tp_raw = bb20_mid
+                
+                sl = adjust_sl_for_offset(sl_raw, 'sell', atr, ref_price=sl_raw)
+                tp = adjust_tp_for_bb_offset(tp_raw, 'sell', atr, ref_price=tp_raw)
+        
+        # === VALIDATIONS ===
+        
+        # 1. SL ne doit pas être du mauvais côté de l'entry
+        if is_long and sl >= entry_price:
+            return 0.0, 0.0, f"sl_above_entry_long:sl={sl:.4f},entry={entry_price:.4f}"
+        
+        if not is_long and sl <= entry_price:
+            return 0.0, 0.0, f"sl_below_entry_short:sl={sl:.4f},entry={entry_price:.4f}"
+        
+        # 2. TP ne doit pas être du mauvais côté de l'entry
+        if is_long and tp <= entry_price:
+            return 0.0, 0.0, f"tp_below_entry_long:tp={tp:.4f},entry={entry_price:.4f}"
+        
+        if not is_long and tp >= entry_price:
+            return 0.0, 0.0, f"tp_above_entry_short:tp={tp:.4f},entry={entry_price:.4f}"
+        
+        # 3. SL ne doit pas être au-delà du TP
+        if is_long and sl >= tp:
+            return 0.0, 0.0, f"sl_beyond_tp_long:sl={sl:.4f},tp={tp:.4f}"
+        
+        if not is_long and sl <= tp:
+            return 0.0, 0.0, f"sl_beyond_tp_short:sl={sl:.4f},tp={tp:.4f}"
+        
+        return float(sl), float(tp), None
+    
+    except Exception as e:
+        return 0.0, 0.0, f"recalc_error:{e}"
+
+
 def execute_signal_with_gates(
     ex: ccxt.Exchange,
     symbol: str,
@@ -3288,9 +3393,10 @@ def execute_signal_with_gates(
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
         return False, "Rejeté: données insuffisantes pour valider l'entrée."
 
-    # --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
+# --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
     # Sans bougie de réaction valide avant l'entrée, on NE prend PAS le trade.
-    passed_reaction, msg_react = _gate_reaction_obligatoire(df, is_long, regime)
+    passed_reaction = _check_reaction_before_entry(df, signal, is_long)
+    msg_react = "no_reaction_pattern" if not passed_reaction else "reaction_found"
     if not passed_reaction:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=msg_react)
         return False, msg_react
@@ -3310,12 +3416,12 @@ def execute_signal_with_gates(
 
     # --- GATE RR MINIMUM ---
     rr_calc = abs((tp - entry_px) / (entry_px - sl + 1e-8))
-    if rr_calc < MIN_RR_RATIO:
+    if rr_calc < MIN_RR:
         _update_signal_state(
             symbol, timeframe, signal, entry_px, "SKIPPED",
-            reason=f"RR={rr_calc:.2f} < {MIN_RR_RATIO}"
+            reason=f"RR={rr_calc:.2f} < {MIN_RR}"
         )
-        return False, f"Rejeté: RR={rr_calc:.2f} < {MIN_RR_RATIO}."
+        return False, f"Rejeté: RR={rr_calc:.2f} < {MIN_RR}."
 
     # --- CALCUL QTÉ ---
     # Récupérer le solde
