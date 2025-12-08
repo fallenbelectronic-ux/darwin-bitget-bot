@@ -2098,180 +2098,91 @@ def record_signal_from_trader(
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
 
-        
-# Cache global pour la balance (évite les appels API excessifs)
-_BALANCE_CACHE = {
-    'value': None,
-    'timestamp': 0
-}
-
-def get_account_balance_usdt(ex=None, force_refresh: bool = False, cache_duration: int = 10) -> Optional[float]:
+def get_account_balance_usdt(ex=None) -> Optional[float]:
     """
     Retourne le solde total en USDT (et le met en cache dans settings.CURRENT_BALANCE_USDT).
     Supporte Bybit/Bitget via ccxt.fetchBalance().
-    
-    Args:
-        ex: Exchange ccxt (si None, créé via create_exchange())
-        force_refresh: Force un appel API même si cache valide
-        cache_duration: Durée du cache en secondes (défaut 10s)
-    
-    Returns:
-        float: Solde USDT disponible, ou None en cas d'échec
     """
-    import time
-    
-    global _BALANCE_CACHE
-    
-    # Vérifier cache (évite les appels API excessifs)
-    if not force_refresh:
-        cache_age = time.time() - _BALANCE_CACHE['timestamp']
-        if cache_age < cache_duration and _BALANCE_CACHE['value'] is not None:
-            print(f"[Balance] Cache hit ({cache_age:.1f}s) : {_BALANCE_CACHE['value']} USDT")
-            return _BALANCE_CACHE['value']
-    
     try:
-        # Créer exchange si nécessaire
         if ex is None and hasattr(globals(), "create_exchange"):
             ex = create_exchange()
         if ex is None:
-            print("[Balance] ❌ Exchange non disponible")
-            return _BALANCE_CACHE.get('value')
-        
-        # Retry avec backoff
-        max_retries = 3
-        retry_delays = [1, 2, 5]
-        
-        for attempt in range(max_retries):
+            return None
+
+        bal = ex.fetch_balance()
+        if bal is None:
+            return None
+
+        total = None
+
+        # Méthode 1 : Essais robustes sur clés standard
+        for key in ("USDT", "usdT", "usdt"):
             try:
-                # ✅ FIX CRITIQUE : Paramètres complets Bitget
-                params = {
-                    'type': 'swap',
-                    'productType': 'USDT-FUTURES',
-                    'marginCoin': 'USDT'
-                }
-                
-                bal = ex.fetch_balance(params=params)
-                
-                if bal is None:
-                    raise ValueError("fetch_balance() a retourné None")
-                
-                total = None
-                
-                # Méthode 1 : Clés standard CCXT
-                for key in ("USDT", "usdT", "usdt"):
-                    try:
-                        wallet = bal.get(key) or {}
-                        total = wallet.get("total") or wallet.get("free") or wallet.get("used")
-                        if total is not None:
-                            total = float(total)
-                            print(f"[Balance] ✅ Méthode 1 ({key}) : {total} USDT")
-                            break
-                    except Exception:
-                        continue
-                
-                # Méthode 2 : Bitget structure 'info'
-                if total is None:
-                    info = bal.get("info") or {}
-                    
-                    # Bitget v2: data list
-                    try:
-                        data = info.get("data")
-                        if isinstance(data, list):
-                            for acc in data:
-                                if str(acc.get("marginCoin", "")).upper() == "USDT":
-                                    available = float(acc.get("available", 0))
-                                    frozen = float(acc.get("frozen", 0))
-                                    total = available + frozen
-                                    print(f"[Balance] ✅ Méthode 2 (Bitget data) : {total} USDT (available={available}, frozen={frozen})")
-                                    break
-                    except Exception:
-                        pass
-                    
-                    # Bybit v5: result.list
-                    if total is None:
-                        try:
-                            if isinstance(info, dict) and "result" in info:
-                                result = info["result"]
-                                if isinstance(result, dict) and "list" in result:
-                                    for acc in result["list"]:
-                                        if str(acc.get("coin", "")).upper() == "USDT":
-                                            total = float(acc.get("walletBalance", 0))
-                                            print(f"[Balance] ✅ Méthode 2 (Bybit) : {total} USDT")
-                                            break
-                        except Exception:
-                            pass
-                
-                # Si toujours None après toutes les méthodes
-                if total is None:
-                    print(f"[Balance] ⚠️ Tentative {attempt + 1}/{max_retries} : Structure balance inconnue")
-                    print(f"[Balance] Debug bal.keys(): {list(bal.keys())}")
-                    print(f"[Balance] Debug info keys: {list(bal.get('info', {}).keys())}")
-                    
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delays[attempt])
-                        continue
-                    else:
-                        print(f"[Balance] ❌ Échec après {max_retries} tentatives")
-                        return _BALANCE_CACHE.get('value')
-                
-                # Succès : mettre à jour cache et DB
-                total = float(total)
-                _BALANCE_CACHE['value'] = total
-                _BALANCE_CACHE['timestamp'] = time.time()
-                
+                wallet = bal.get(key) or {}
+                total = wallet.get("total") or wallet.get("free") or wallet.get("used")
+                if total is not None:
+                    total = float(total)
+                    break
+            except Exception:
+                continue
+
+        # Méthode 2 : Bitget/Bybit dérivés via 'info'
+        if total is None:
+            info = bal.get("info") or {}
+            
+            # Bybit v5: result.list
+            try:
+                if isinstance(info, dict) and "result" in info:
+                    result = info["result"]
+                    if isinstance(result, dict) and "list" in result:
+                        for acc in result["list"]:
+                            if str(acc.get("coin", "")).upper() == "USDT":
+                                total = float(acc.get("walletBalance", 0))
+                                break
+            except Exception:
+                pass
+            
+            # Bitget: data list
+            if total is None:
                 try:
-                    database.set_setting('CURRENT_BALANCE_USDT', f"{total:.6f}")
-                except Exception as e:
-                    print(f"[Balance] ⚠️ Échec sauvegarde DB : {e}")
-                
-                return total
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                
-                # Rate limit : attendre plus longtemps
-                if 'rate' in error_msg or 'limit' in error_msg:
-                    wait_time = retry_delays[attempt] * 2
-                    print(f"[Balance] ⚠️ Rate limit détecté, attente {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                
-                # Erreur credentials : STOP immédiatement (pas de retry)
-                if 'secret' in error_msg or 'credential' in error_msg or 'apikey' in error_msg:
-                    print(f"[Balance] ❌ ERREUR CREDENTIALS : {e}")
-                    print("[Balance] Vérifiez vos clés API dans les variables d'environnement")
-                    return _BALANCE_CACHE.get('value')
-                
-                # Autres erreurs
-                print(f"[Balance] ⚠️ Tentative {attempt + 1}/{max_retries} échouée : {e}")
-                
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delays[attempt])
-                    continue
-                else:
-                    print(f"[Balance] ❌ Échec définitif après {max_retries} tentatives")
-                    return _BALANCE_CACHE.get('value')
+                    data = info.get("data") if isinstance(info, dict) else None
+                    if isinstance(data, list):
+                        for acc in data:
+                            if str(acc.get("marginCoin", "")).upper() == "USDT":
+                                available = float(acc.get("available", 0))
+                                frozen = float(acc.get("frozen", 0))
+                                total = available + frozen
+                                break
+                except Exception:
+                    pass
+            
+            # Bitget: info direct (alternative)
+            if total is None and isinstance(info, dict):
+                try:
+                    # Certaines versions Bitget retournent directement
+                    if "availableBalance" in info:
+                        total = float(info["availableBalance"])
+                    elif "equity" in info:
+                        total = float(info["equity"])
+                except Exception:
+                    pass
+
+        if total is None:
+            return None
+
+        total = float(total)
         
-        # Si on arrive ici, toutes les tentatives ont échoué
-        return _BALANCE_CACHE.get('value')
-        
+        try:
+            database.set_setting('CURRENT_BALANCE_USDT', f"{total:.6f}")
+        except Exception:
+            pass
+
+        return total
+
     except Exception as e:
-        print(f"[Balance] ❌ Erreur critique : {e}")
-        import traceback
-        traceback.print_exc()
-        return _BALANCE_CACHE.get('value')
+        print(f"Erreur get_account_balance_usdt: {e}")
+        return None
         
-
-def clear_balance_cache() -> None:
-    """
-    Invalide le cache de balance (à appeler après ouverture/fermeture de trade).
-    Force le prochain appel à get_account_balance_usdt() à récupérer les données actualisées.
-    """
-    global _BALANCE_CACHE
-    _BALANCE_CACHE['timestamp'] = 0
-    print("[Balance] Cache invalidé - prochain appel sera un refresh")
-
-
 
 def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, quantity: float, entry_px: float) -> None:
     """
