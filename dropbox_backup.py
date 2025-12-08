@@ -1,7 +1,6 @@
 #dropbox_backup.py
 """
-Backup automatique de la DB trading vers Dropbox
-Version SIMPLIFIÉE - Prêt à l'emploi
+Backup automatique DB Render (Disque Persistant /var/data)
 """
 import os
 import glob
@@ -14,126 +13,139 @@ import sys
 # CONFIGURATION
 # ============================================================================
 
-# Token Dropbox (configuré dans Render Environment Variables)
-DROPBOX_TOKEN = os.getenv('DROPBOX_TOKEN', '')
+# Chemin DB (changez selon votre nom exact)
+DB_PATH_OVERRIDE = None  # None = recherche auto, ou "/var/data/votre_db.db"
 
-# Dossier Dropbox où sauvegarder (sera créé automatiquement)
+DROPBOX_TOKEN = os.getenv('DROPBOX_TOKEN', '')
 DROPBOX_FOLDER = '/TradingBot_Backups'
 
-# Types d'export
-EXPORT_DB = True      # DB complète
-EXPORT_CSV = True     # CSV des trades
-EXPORT_SUMMARY = True # Résumé texte
+EXPORT_DB = True
+EXPORT_CSV = True
+EXPORT_SUMMARY = True
 
 # ============================================================================
 # FONCTIONS
 # ============================================================================
 
 def find_db():
-    """Trouve automatiquement le fichier DB."""
-    db_files = glob.glob("*.db")
-    if not db_files:
-        db_files = glob.glob("**/*.db", recursive=True)
-    return db_files[0] if db_files else None
+    """Trouve DB sur disque persistant /var/data."""
+    
+    priority_paths = [
+        "/var/data",
+        "/var/data/database",
+        "/var/data/db",
+        ".",
+    ]
+    
+    db_patterns = ["*.db", "trading*.db", "bot*.db"]
+    
+    print("🔍 Recherche DB...")
+    
+    for base_path in priority_paths:
+        if not os.path.exists(base_path):
+            continue
+        
+        print(f"   📂 {base_path}")
+        
+        for pattern in db_patterns:
+            search_pattern = os.path.join(base_path, pattern)
+            db_files = glob.glob(search_pattern)
+            
+            if db_files:
+                db_path = db_files[0]
+                db_size = os.path.getsize(db_path)
+                print(f"   ✅ Trouvée : {os.path.basename(db_path)} ({db_size/1024:.1f} KB)")
+                return db_path
+    
+    # Debug : lister /var/data
+    print("\n📋 Contenu /var/data :")
+    try:
+        if os.path.exists("/var/data"):
+            items = os.listdir("/var/data")
+            if items:
+                for item in items:
+                    print(f"   • {item}")
+            else:
+                print("   (vide)")
+    except Exception as e:
+        print(f"   ⚠️ {e}")
+    
+    return None
 
 def init_dropbox():
-    """Initialise la connexion Dropbox."""
+    """Initialise Dropbox."""
     try:
         import dropbox
         
         if not DROPBOX_TOKEN:
-            print("❌ DROPBOX_TOKEN non configuré")
-            print("👉 Configurez-le dans Render Environment Variables")
+            print("❌ DROPBOX_TOKEN manquant")
             return None
         
         dbx = dropbox.Dropbox(DROPBOX_TOKEN)
-        
-        # Tester la connexion
-        try:
-            account = dbx.users_get_current_account()
-            print(f"✅ Connecté à Dropbox : {account.email}")
-            return dbx
-        except Exception as e:
-            print(f"❌ Token Dropbox invalide : {e}")
-            return None
+        account = dbx.users_get_current_account()
+        print(f"✅ Dropbox connecté : {account.email}")
+        return dbx
     
     except ImportError:
-        print("❌ Module 'dropbox' non installé")
-        print("👉 Ajoutez 'dropbox' dans requirements.txt")
+        print("❌ Module dropbox manquant")
+        return None
+    except Exception as e:
+        print(f"❌ Erreur Dropbox : {e}")
         return None
 
 def create_dropbox_folder(dbx, folder_path):
-    """Crée le dossier Dropbox s'il n'existe pas."""
+    """Crée dossier Dropbox."""
     try:
         dbx.files_get_metadata(folder_path)
-        print(f"✅ Dossier existe : {folder_path}")
-    except Exception:
+    except:
         try:
             dbx.files_create_folder_v2(folder_path)
             print(f"✅ Dossier créé : {folder_path}")
-        except Exception as e:
-            print(f"⚠️ Erreur création dossier : {e}")
+        except:
+            pass
 
-def upload_to_dropbox(dbx, local_file: str, dropbox_path: str):
-    """Upload un fichier vers Dropbox."""
+def upload_to_dropbox(dbx, local_file, dropbox_path):
+    """Upload vers Dropbox."""
     try:
         with open(local_file, 'rb') as f:
-            file_data = f.read()
+            dbx.files_upload(
+                f.read(),
+                dropbox_path,
+                mode=dropbox.files.WriteMode.overwrite
+            )
         
-        # Upload avec mode overwrite
-        dbx.files_upload(
-            file_data,
-            dropbox_path,
-            mode=dropbox.files.WriteMode.overwrite
-        )
+        print(f"   ☁️ Uploadé : {os.path.basename(dropbox_path)}")
         
-        print(f"☁️ Uploadé : {dropbox_path}")
-        
-        # Générer lien de partage
         try:
-            shared_link = dbx.sharing_create_shared_link_with_settings(dropbox_path)
-            print(f"🔗 Lien : {shared_link.url}")
-            return shared_link.url
-        except Exception:
-            # Lien existe déjà
+            link = dbx.sharing_create_shared_link_with_settings(dropbox_path)
+            return link.url
+        except:
             try:
                 links = dbx.sharing_list_shared_links(path=dropbox_path).links
-                if links:
-                    print(f"🔗 Lien : {links[0].url}")
-                    return links[0].url
+                return links[0].url if links else True
             except:
-                pass
-        
-        return True
+                return True
     
     except Exception as e:
-        print(f"❌ Erreur upload : {e}")
+        print(f"   ❌ Erreur upload : {e}")
         return False
 
-def export_csv_from_db(db_path: str, output_file: str):
-    """Exporte les trades en CSV."""
+def export_csv_from_db(db_path, output_file):
+    """Export CSV."""
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT 
-                id, symbol, side, regime, 
-                entry_price, sl_price, tp_price, quantity,
-                status, profit, 
-                open_timestamp, close_timestamp,
-                pyramid_count, partial_exits, breakeven_status,
-                management_strategy, entry_atr, entry_rsi
-            FROM trades
-            ORDER BY open_timestamp DESC
+            SELECT * FROM trades 
+            ORDER BY open_timestamp DESC 
             LIMIT 1000
         """)
         
         trades = cursor.fetchall()
         
         if not trades:
-            print("⚠️ Aucun trade à exporter")
             conn.close()
             return False
         
@@ -144,249 +156,126 @@ def export_csv_from_db(db_path: str, output_file: str):
                 writer.writerow(dict(trade))
         
         conn.close()
-        print(f"✅ CSV créé : {output_file} ({len(trades)} trades)")
+        print(f"   ✅ CSV créé ({len(trades)} trades)")
         return True
     
     except Exception as e:
-        print(f"❌ Erreur export CSV : {e}")
+        print(f"   ❌ Erreur CSV : {e}")
         return False
 
-def export_summary_from_db(db_path: str, output_file: str):
-    """Génère un résumé texte des stats."""
+def export_summary_from_db(db_path, output_file):
+    """Export résumé."""
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Stats globales
         cursor.execute("""
             SELECT 
                 COUNT(*) as total,
                 SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN profit < 0 THEN 1 ELSE 0 END) as losses,
-                AVG(profit) as avg_profit,
                 SUM(profit) as total_profit,
-                MAX(profit) as best,
-                MIN(profit) as worst
+                AVG(profit) as avg_profit
             FROM trades
             WHERE status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
         """)
         
-        row = cursor.fetchone()
-        total, wins, losses, avg_profit, total_profit, best, worst = row or (0,0,0,0,0,0,0)
-        
+        total, wins, total_profit, avg_profit = cursor.fetchone() or (0,0,0,0)
         winrate = (wins / total * 100) if total > 0 else 0
-        
-        # Stats 30 jours
-        cutoff_30d = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
-        
-        cursor.execute("""
-            SELECT 
-                COUNT(*) as total_30d,
-                SUM(profit) as profit_30d
-            FROM trades
-            WHERE status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
-            AND open_timestamp > ?
-        """, (cutoff_30d,))
-        
-        total_30d, profit_30d = cursor.fetchone() or (0, 0)
-        
-        # Pyramiding
-        cursor.execute("""
-            SELECT 
-                COUNT(*) as with_pyramid,
-                AVG(profit) as avg_profit_pyramid
-            FROM trades
-            WHERE pyramid_count > 0
-            AND status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
-        """)
-        
-        with_pyramid, avg_profit_pyramid = cursor.fetchone() or (0, 0)
-        
-        # Partial exits
-        cursor.execute("""
-            SELECT COUNT(*) as with_partial
-            FROM trades
-            WHERE partial_exits IS NOT NULL
-            AND status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
-        """)
-        
-        with_partial = cursor.fetchone()[0] or 0
-        
-        # Positions ouvertes
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
-        open_pos = cursor.fetchone()[0] or 0
         
         conn.close()
         
-        # Générer rapport
         report = f"""
-╔══════════════════════════════════════════════════════════════╗
-║         RAPPORT DE TRADING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}       ║
-╚══════════════════════════════════════════════════════════════╝
+═══════════════════════════════════════════════════════
+   RAPPORT DE TRADING - {datetime.now().strftime('%Y-%m-%d %H:%M')}
+═══════════════════════════════════════════════════════
 
-📊 STATISTIQUES GLOBALES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Total Trades  : {total}
+Wins          : {wins}
+Winrate       : {winrate:.2f}%
+Profit Total  : {total_profit:.2f} USDT
+Profit Moyen  : {avg_profit:.2f} USDT
 
-Total Trades         : {total}
-Positions Ouvertes   : {open_pos}
-
-Wins                 : {wins}
-Losses               : {losses}
-Winrate              : {winrate:.2f}%
-
-Profit Total         : {total_profit:.2f} USDT
-Profit Moyen         : {avg_profit:.2f} USDT
-Meilleur Trade       : {best:.2f} USDT
-Pire Trade           : {worst:.2f} USDT
-
-
-📈 PERFORMANCE 30 DERNIERS JOURS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Trades               : {total_30d}
-Profit               : {profit_30d:.2f} USDT
-Profit par trade     : {(profit_30d / total_30d if total_30d > 0 else 0):.2f} USDT
-
-
-🎯 FEATURES AVANCÉES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Pyramiding
-  Trades avec pyramid : {with_pyramid}
-  Profit moyen        : {(avg_profit_pyramid or 0):.2f} USDT
-  
-Partial Exits
-  Trades avec partial : {with_partial}
-
-
-═══════════════════════════════════════════════════════════════
-📦 Fichiers disponibles sur Dropbox :
-   • trading_bot_YYYYMMDD_HHMMSS.db  (DB complète)
-   • trades_export_YYYYMMDD_HHMMSS.csv  (données détaillées)
-   • stats_summary_YYYYMMDD_HHMMSS.txt  (ce fichier)
-
-🔗 Téléchargez depuis : https://www.dropbox.com/home{DROPBOX_FOLDER}
-═══════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════
 """
         
-        with open(output_file, 'w', encoding='utf-8') as f:
+        with open(output_file, 'w') as f:
             f.write(report)
         
-        print(f"✅ Résumé créé : {output_file}")
+        print(f"   ✅ Résumé créé")
         return True
     
     except Exception as e:
-        print(f"❌ Erreur export summary : {e}")
+        print(f"   ❌ Erreur résumé : {e}")
         return False
 
 def run_backup():
-    """Exécute le backup complet."""
+    """Backup complet."""
     
-    print("=" * 80)
-    print("☁️  BACKUP AUTOMATIQUE VERS DROPBOX")
-    print("=" * 80)
-    print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 80)
-    print()
+    print("=" * 70)
+    print("☁️  BACKUP DROPBOX")
+    print("=" * 70)
     
-    # 1. Trouver la DB
-    print("🔍 Recherche de la DB...")
-    db_path = find_db()
+    # 1. Trouver DB
+    if DB_PATH_OVERRIDE:
+        print(f"📍 Chemin forcé : {DB_PATH_OVERRIDE}")
+        db_path = DB_PATH_OVERRIDE if os.path.exists(DB_PATH_OVERRIDE) else None
+    else:
+        db_path = find_db()
     
     if not db_path:
-        print("❌ Aucune DB trouvée")
+        print("\n❌ ÉCHEC : DB introuvable")
         return False
     
-    print(f"✅ DB trouvée : {db_path}")
-    
-    # Taille de la DB
     db_size = os.path.getsize(db_path)
-    print(f"📏 Taille : {db_size / 1024:.2f} KB ({db_size / (1024*1024):.2f} MB)")
+    print(f"📏 Taille : {db_size/1024:.1f} KB")
     
-    # 2. Connexion Dropbox
-    print("\n🔐 Connexion à Dropbox...")
+    # 2. Dropbox
+    print("\n🔐 Connexion Dropbox...")
     dbx = init_dropbox()
-    
     if not dbx:
         return False
     
-    # 3. Créer dossier si nécessaire
     create_dropbox_folder(dbx, DROPBOX_FOLDER)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    success_count = 0
-    links = []
+    success = 0
     
-    # 4. Export DB complète
+    # 3. Uploads
+    print(f"\n📦 Exports...")
+    
     if EXPORT_DB:
-        print("\n📦 Export DB complète...")
-        dropbox_path = f"{DROPBOX_FOLDER}/trading_bot_{timestamp}.db"
-        
-        result = upload_to_dropbox(dbx, db_path, dropbox_path)
-        if result:
-            success_count += 1
-            if isinstance(result, str):
-                links.append(('DB', result))
+        print("• DB complète...")
+        if upload_to_dropbox(dbx, db_path, f"{DROPBOX_FOLDER}/trading_bot_{timestamp}.db"):
+            success += 1
     
-    # 5. Export CSV
     if EXPORT_CSV:
-        print("\n📊 Export CSV...")
-        csv_file = f"trades_export_{timestamp}.csv"
-        
+        print("• CSV...")
+        csv_file = f"trades_{timestamp}.csv"
         if export_csv_from_db(db_path, csv_file):
-            dropbox_path = f"{DROPBOX_FOLDER}/{csv_file}"
-            result = upload_to_dropbox(dbx, csv_file, dropbox_path)
-            
-            if result:
-                success_count += 1
-                if isinstance(result, str):
-                    links.append(('CSV', result))
-                # Nettoyer fichier local
-                try:
-                    os.remove(csv_file)
-                except:
-                    pass
+            if upload_to_dropbox(dbx, csv_file, f"{DROPBOX_FOLDER}/{csv_file}"):
+                success += 1
+            try: os.remove(csv_file)
+            except: pass
     
-    # 6. Export Summary
     if EXPORT_SUMMARY:
-        print("\n📋 Export résumé...")
-        summary_file = f"stats_summary_{timestamp}.txt"
-        
+        print("• Résumé...")
+        summary_file = f"summary_{timestamp}.txt"
         if export_summary_from_db(db_path, summary_file):
-            dropbox_path = f"{DROPBOX_FOLDER}/{summary_file}"
-            result = upload_to_dropbox(dbx, summary_file, dropbox_path)
-            
-            if result:
-                success_count += 1
-                if isinstance(result, str):
-                    links.append(('Summary', result))
-                # Nettoyer fichier local
-                try:
-                    os.remove(summary_file)
-                except:
-                    pass
+            if upload_to_dropbox(dbx, summary_file, f"{DROPBOX_FOLDER}/{summary_file}"):
+                success += 1
+            try: os.remove(summary_file)
+            except: pass
     
-    # 7. Résultat final
-    print("\n" + "=" * 80)
-    if success_count > 0:
-        print(f"✅ BACKUP TERMINÉ : {success_count} fichiers uploadés")
-        print(f"📁 Dossier Dropbox : {DROPBOX_FOLDER}")
-        
-        if links:
-            print("\n🔗 LIENS DE TÉLÉCHARGEMENT :")
-            for name, link in links:
-                # Convertir en lien de téléchargement direct
-                download_link = link.replace('?dl=0', '?dl=1')
-                print(f"   • {name:10s} : {download_link}")
-        
-        print("\n💡 Accédez à vos fichiers :")
-        print(f"   👉 https://www.dropbox.com/home{DROPBOX_FOLDER}")
-        print("=" * 80)
-        return True
+    # 4. Résultat
+    print("\n" + "=" * 70)
+    if success > 0:
+        print(f"✅ TERMINÉ : {success} fichiers uploadés")
+        print(f"📁 https://www.dropbox.com/home{DROPBOX_FOLDER}")
     else:
-        print("❌ BACKUP ÉCHOUÉ : Aucun fichier uploadé")
-        print("=" * 80)
-        return False
+        print("❌ ÉCHEC : Aucun fichier uploadé")
+    print("=" * 70)
+    
+    return success > 0
 
 # ============================================================================
 # MAIN
@@ -397,10 +286,10 @@ if __name__ == "__main__":
         success = run_backup()
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
-        print("\n⛔ Arrêt demandé")
+        print("\n⛔ Arrêt")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ ERREUR FATALE : {e}")
+        print(f"\n❌ ERREUR : {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
