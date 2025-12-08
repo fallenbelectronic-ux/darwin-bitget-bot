@@ -65,6 +65,163 @@ def get_universe_size() -> int:
         except Exception:
             return 500
 
+def is_tradeable_symbol(ex, symbol: str) -> bool:
+    """
+    Filtre minimaliste et robuste.
+    
+    CRITÈRES :
+    1. Dans l'univers Top market cap (déjà filtré en amont)
+    2. OU dans whitelist manuelle
+    3. Spread bid/ask acceptable (< 0.2%)
+    
+    PAS de check volume (manipulable, instable).
+    
+    Args:
+        ex: Exchange
+        symbol: Paire à vérifier (ex: 'SOL/USDT:USDT')
+    
+    Returns:
+        True si tradeable
+    """
+    try:
+        base = symbol.split('/')[0].upper()
+        
+        # ====== WHITELIST (bypass tous les checks) ======
+        try:
+            whitelist_str = database.get_setting('SYMBOL_WHITELIST', '')
+            if whitelist_str:
+                whitelist = [s.strip().upper() for s in whitelist_str.split(',')]
+                if base in whitelist:
+                    print(f"✅ {base} dans whitelist")
+                    return True
+        except Exception:
+            pass
+        
+        # ====== SPREAD BID/ASK (indicateur liquidité RÉEL) ======
+        try:
+            ticker = ex.fetch_ticker(symbol)
+            
+            bid = float(ticker.get('bid', 0))
+            ask = float(ticker.get('ask', 0))
+            
+            if bid <= 0 or ask <= 0:
+                print(f"❌ {base} : Pas de bid/ask valide")
+                return False
+            
+            spread_pct = ((ask - bid) / bid) * 100
+            
+            # Seuil configurable
+            try:
+                max_spread = float(database.get_setting('MAX_SPREAD_PCT', '0.2'))
+            except Exception:
+                max_spread = 0.2  # 0.2% par défaut
+            
+            if spread_pct > max_spread:
+                print(f"❌ {base} spread trop large : {spread_pct:.3f}% > {max_spread}%")
+                return False
+            
+            print(f"✅ {base} spread OK : {spread_pct:.3f}%")
+            return True
+        
+        except Exception as e:
+            print(f"❌ {base} erreur spread check : {e}")
+            return False
+    
+    except Exception as e:
+        print(f"❌ Erreur is_tradeable_symbol : {e}")
+        return False
+
+def check_correlation_risk(ex, new_symbol: str, new_side: str) -> bool:
+    """
+    Évite sur-exposition même sur paires "décorrélées".
+    
+    RÈGLE PRO :
+    - Max 3 positions LONG en même temps (toutes paires confondues)
+    - Max 3 positions SHORT en même temps
+    - Max 2 dans le même secteur (L1, DeFi, Meme...)
+    
+    POURQUOI ?
+    - Lors d'un crash BTC -10%, TOUT dump ensemble
+    - SOL "décorrélée" peut dumper -15% quand même
+    - 3 LONGS = 3x l'exposition au risque systémique
+    
+    Args:
+        ex: Exchange
+        new_symbol: Symbole du nouveau trade
+        new_side: 'buy' ou 'sell'
+    
+    Returns:
+        True si risque acceptable, False si rejet
+    """
+    try:
+        open_positions = database.get_open_positions()
+        
+        # ====== LIMITE GLOBALE PAR DIRECTION ======
+        same_direction_count = sum(
+            1 for pos in open_positions 
+            if pos.get('side') == new_side
+        )
+        
+        try:
+            max_same_direction = int(database.get_setting('MAX_SAME_DIRECTION', '3'))
+        except Exception:
+            max_same_direction = 3
+        
+        if same_direction_count >= max_same_direction:
+            notifier.tg_send(
+                f"⚠️ Trade {new_symbol} {new_side.upper()} rejeté\n"
+                f"Déjà {same_direction_count} positions {new_side.upper()} ouvertes\n"
+                f"Max autorisé : {max_same_direction}\n"
+                f"➡️ Risque systémique trop élevé"
+            )
+            return False
+        
+        # ====== LIMITE PAR SECTEUR (bonus) ======
+        correlated_groups = {
+            'L1_ALTS': ['SOL', 'AVAX', 'NEAR', 'FTM', 'ATOM', 'DOT', 'ADA', 'ALGO', 'TIA'],
+            'DEFI': ['UNI', 'AAVE', 'SNX', 'COMP', 'MKR', 'CRV', 'SUSHI', 'BAL', 'YFI'],
+            'MEME': ['DOGE', 'SHIB', 'PEPE', 'FLOKI', 'WIF', 'BONK'],
+            'GAMING': ['AXS', 'SAND', 'MANA', 'ENJ', 'GALA', 'IMX', 'BEAM'],
+            'LAYER2': ['ARB', 'OP', 'MATIC', 'LRC', 'METIS', 'STRK'],
+            'AI': ['FET', 'AGIX', 'RNDR', 'GRT', 'OCEAN'],
+        }
+        
+        new_base = new_symbol.split('/')[0].upper()
+        
+        # Trouver groupe du nouveau trade
+        new_group = None
+        for group_name, symbols in correlated_groups.items():
+            if new_base in symbols:
+                new_group = group_name
+                break
+        
+        if new_group:
+            # Compter positions dans le même groupe + même direction
+            same_sector_count = sum(
+                1 for pos in open_positions
+                if pos.get('side') == new_side and 
+                   pos.get('symbol', '').split('/')[0].upper() in correlated_groups[new_group]
+            )
+            
+            try:
+                max_per_sector = int(database.get_setting('MAX_PER_SECTOR', '2'))
+            except Exception:
+                max_per_sector = 2
+            
+            if same_sector_count >= max_per_sector:
+                notifier.tg_send(
+                    f"⚠️ Trade {new_symbol} rejeté\n"
+                    f"Déjà {same_sector_count} positions dans secteur {new_group}\n"
+                    f"➡️ Diversification insuffisante"
+                )
+                return False
+        
+        return True
+    
+    except Exception as e:
+        print(f"Erreur check_correlation_risk: {e}")
+        return True
+
 def get_universe_by_market_cap(ex: ccxt.Exchange, size: int) -> List[str]:
     """
     Retourne la liste des paires futures USDT Bitget (format CCXT) triées par market cap (CoinGecko),
@@ -237,6 +394,238 @@ def _coingecko_market_caps_for_symbols(bases: list, sym_to_ids: dict) -> dict:
 
     return result
 
+def detect_market_regime(ex) -> str:
+    """
+    Détecte le régime macro du marché crypto.
+    
+    Analyse BTC (leader du marché) sur timeframe 1d pour déterminer :
+    - Tendance (BULL/BEAR/RANGE)
+    - Volatilité (NORMAL/HIGH)
+    
+    RÉGIMES :
+    - BULL_STABLE : Tendance haussière + volatilité normale (meilleur)
+    - BULL_VOLATILE : Tendance haussière + forte volatilité (prudence)
+    - BEAR : Tendance baissière (réduire exposition)
+    - RANGE : Sideways (scalp uniquement)
+    - NEUTRAL : Impossible déterminer (défaut safe)
+    
+    Returns:
+        String du régime détecté
+    """
+    try:
+        # Feature activée ?
+        try:
+            enable_regime = str(database.get_setting('ENABLE_REGIME_DETECTION', 'true')).lower() == 'true'
+        except Exception:
+            enable_regime = True
+        
+        if not enable_regime:
+            return 'NEUTRAL'
+        
+        # Analyser BTC sur 1d
+        try:
+            btc_df = utils.fetch_and_prepare_df(ex, 'BTC/USDT:USDT', '1d')
+        except Exception:
+            btc_df = None
+        
+        if btc_df is None or len(btc_df) < 50:
+            print("⚠️ Impossible analyser BTC pour régime marché")
+            return 'NEUTRAL'
+        
+        last = btc_df.iloc[-1]
+        close = float(last['close'])
+        
+        # Calculer SMA20 et SMA50
+        try:
+            sma20 = float(btc_df['close'].rolling(20).mean().iloc[-1])
+            sma50 = float(btc_df['close'].rolling(50).mean().iloc[-1])
+        except Exception:
+            return 'NEUTRAL'
+        
+        # ====== DÉTERMINER TENDANCE BTC ======
+        if close > sma20 > sma50:
+            btc_trend = 'BULL'
+        elif close < sma20 < sma50:
+            btc_trend = 'BEAR'
+        else:
+            btc_trend = 'RANGE'
+        
+        # ====== DÉTERMINER VOLATILITÉ ======
+        try:
+            atr_current = float(last.get('atr', 0))
+            atr_mean = float(btc_df['atr'].tail(20).mean())
+            
+            if atr_current > atr_mean * 1.5:
+                volatility = 'HIGH'
+            else:
+                volatility = 'NORMAL'
+        except Exception:
+            volatility = 'NORMAL'
+        
+        # ====== COMBINER RÉGIME FINAL ======
+        if btc_trend == 'BULL' and volatility == 'NORMAL':
+            regime = 'BULL_STABLE'
+        elif btc_trend == 'BULL' and volatility == 'HIGH':
+            regime = 'BULL_VOLATILE'
+        elif btc_trend == 'BEAR':
+            regime = 'BEAR'
+        elif btc_trend == 'RANGE':
+            regime = 'RANGE'
+        else:
+            regime = 'NEUTRAL'
+        
+        # Mémoriser en cache
+        try:
+            database.set_setting('CURRENT_MARKET_REGIME', regime)
+        except Exception:
+            pass
+        
+        print(f"📊 Régime marché détecté : {regime} (BTC: {btc_trend}, Vol: {volatility})")
+        
+        return regime
+    
+    except Exception as e:
+        print(f"Erreur detect_market_regime: {e}")
+        return 'NEUTRAL'
+
+
+def adapt_strategy_to_regime(regime: str) -> dict:
+    """
+    Adapte les paramètres de trading selon le régime de marché.
+    
+    Args:
+        regime: Régime détecté par detect_market_regime()
+    
+    Returns:
+        Dict avec paramètres adaptés (max_pos, min_rr, etc.)
+    """
+    try:
+        params = {
+            'max_positions': 3,
+            'min_rr': 3.0,
+            'risk_pct': 2.0,
+            'enable_ct': True,
+        }
+        
+        if regime == 'BEAR':
+            # Mode défensif
+            params['max_positions'] = 2
+            params['min_rr'] = 4.0
+            params['risk_pct'] = 1.5
+            params['enable_ct'] = False  # Pas de contre-tendance en bear
+            print("🛡️ Mode BEAR : Paramètres défensifs activés")
+        
+        elif regime == 'BULL_STABLE':
+            # Mode agressif
+            params['max_positions'] = 5
+            params['min_rr'] = 2.5
+            params['risk_pct'] = 2.0
+            params['enable_ct'] = True
+            print("🚀 Mode BULL_STABLE : Paramètres agressifs activés")
+        
+        elif regime == 'BULL_VOLATILE':
+            # Mode prudent
+            params['max_positions'] = 3
+            params['min_rr'] = 3.5
+            params['risk_pct'] = 1.5
+            params['enable_ct'] = True
+            print("⚠️ Mode BULL_VOLATILE : Paramètres prudents activés")
+        
+        elif regime == 'RANGE':
+            # Mode scalp
+            params['max_positions'] = 2
+            params['min_rr'] = 3.0
+            params['risk_pct'] = 1.0
+            params['enable_ct'] = True  # CT meilleur en range
+            print("📊 Mode RANGE : Paramètres scalp activés")
+        
+        else:  # NEUTRAL
+            # Paramètres standards (défaut)
+            print("🔄 Mode NEUTRAL : Paramètres standards")
+        
+        return params
+    
+    except Exception as e:
+        print(f"Erreur adapt_strategy_to_regime: {e}")
+        return {
+            'max_positions': 3,
+            'min_rr': 3.0,
+            'risk_pct': 2.0,
+            'enable_ct': True,
+        }
+
+def is_good_trading_session() -> bool:
+    """
+    Filtre les sessions de trading optimales.
+    
+    ÉVITE :
+    - Weekend (volume -60%, spreads x3)
+    - Asia solo 2h-7h UTC (faible liquidité, manipulations)
+    
+    PRÉFÈRE :
+    - London 8h-12h UTC
+    - US 13h-17h UTC
+    - Europe/US overlap 13h-16h UTC (meilleur)
+    
+    POURQUOI ÉVITER ASIA/WEEKEND :
+    - Volume -60% → Whales manipulent facilement
+    - Spreads x3 → Slippage énorme
+    - Faux breakouts +45%
+    - Stop hunts agressifs
+    - Winrate -20% mesuré
+    
+    Returns:
+        True si bonne session, False si pause recommandée
+    """
+    import datetime
+    
+    try:
+        # Feature activée ?
+        try:
+            enable_filter = str(database.get_setting('ENABLE_SESSION_FILTER', 'true')).lower() == 'true'
+        except Exception:
+            enable_filter = True
+        
+        if not enable_filter:
+            return True
+        
+        now = datetime.datetime.utcnow()
+        hour = now.hour
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+        
+        # ====== WEEKEND FILTER ======
+        if weekday >= 5:  # Saturday=5, Sunday=6
+            print(f"⏸️ Weekend détecté ({weekday}) → Pause trading")
+            return False
+        
+        # ====== ASIA SOLO FILTER (2h-7h UTC) ======
+        try:
+            avoid_start = int(database.get_setting('AVOID_HOURS_START', '2'))
+            avoid_end = int(database.get_setting('AVOID_HOURS_END', '8'))
+        except Exception:
+            avoid_start = 2
+            avoid_end = 8
+        
+        if avoid_start <= hour < avoid_end:
+            print(f"⏸️ Asia session solo ({hour}h UTC) → Pause trading")
+            return False
+        
+        # ====== SESSIONS PREMIUM ======
+        if 13 <= hour < 17:
+            print(f"✅ US session ({hour}h UTC) → Trading actif")
+            return True
+        
+        if 8 <= hour < 12:
+            print(f"✅ London session ({hour}h UTC) → Trading actif")
+            return True
+        
+        # Autres heures : OK mais moins optimal
+        print(f"✅ Session acceptable ({hour}h UTC)")
+        return True
+    
+    except Exception as e:
+        print(f"Erreur is_good_trading_session: {e}")
+        return True  # Fail-safe : ne pas bloquer le trading
 
 def _inside(val: float, lo: float, up: float) -> bool:
     return float(lo) <= float(val) <= float(up)
@@ -3705,6 +4094,723 @@ def _find_last_swing_anchor(df: pd.DataFrame, is_long: bool, max_lookback: int =
 
     return None
 
+def should_pyramid_position(ex, pos: dict, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Détermine si on peut ajouter à une position gagnante (pyramiding).
+    
+    RÈGLES DARWIN PYRAMIDING :
+    1. Position en profit > seuil minimum (défaut 2%)
+    2. Breakout confirmé d'un niveau clé (BB80 ou swing high/low)
+    3. Maximum 2 ajouts par position (total 3 entrées)
+    4. Volume en augmentation (confirmation tendance)
+    5. Pas de pyramiding si déjà en BE ou trailing actif
+    
+    Args:
+        ex: Exchange
+        pos: Position DB
+        df: DataFrame du symbole
+    
+    Returns:
+        Dict avec infos pyramiding si conditions OK, sinon None
+    """
+    try:
+        # ====== VÉRIFICATIONS PRÉLIMINAIRES ======
+        
+        # 1. Feature activée ?
+        try:
+            enable_pyramiding = str(database.get_setting('ENABLE_PYRAMIDING', 'false')).lower() == 'true'
+        except Exception:
+            enable_pyramiding = False
+        
+        if not enable_pyramiding:
+            return None
+        
+        # 2. Nombre d'ajouts déjà effectués
+        pyramid_count = int(pos.get('pyramid_count', 0))
+        try:
+            max_pyramids = int(database.get_setting('MAX_PYRAMIDS', '2'))
+        except Exception:
+            max_pyramids = 2
+        
+        if pyramid_count >= max_pyramids:
+            return None
+        
+        # 3. Pas de pyramiding si BE/trailing actif (trop tard)
+        be_status = str(pos.get('breakeven_status', '')).upper()
+        if be_status == 'ACTIVE':
+            return None
+        
+        # ====== CALCUL PROFIT ACTUEL ======
+        
+        symbol = pos['symbol']
+        entry_price = float(pos['entry_price'])
+        is_long = (pos['side'] == 'buy')
+        
+        if df is None or len(df) < 2:
+            return None
+        
+        last = df.iloc[-1]
+        current_price = float(last['close'])
+        
+        # Profit en %
+        if is_long:
+            profit_pct = ((current_price - entry_price) / entry_price) * 100
+        else:
+            profit_pct = ((entry_price - current_price) / entry_price) * 100
+        
+        # 4. Profit minimum requis
+        try:
+            min_profit_for_pyramid = float(database.get_setting('PYRAMID_MIN_PROFIT_PCT', '2.0'))
+        except Exception:
+            min_profit_for_pyramid = 2.0
+        
+        if profit_pct < min_profit_for_pyramid:
+            return None
+        
+        # ====== DÉTECTION BREAKOUT NIVEAU CLÉ ======
+        
+        bb80_up = float(last['bb80_up'])
+        bb80_lo = float(last['bb80_lo'])
+        bb20_up = float(last['bb20_up'])
+        bb20_lo = float(last['bb20_lo'])
+        
+        breakout_detected = False
+        breakout_level = None
+        
+        if is_long:
+            # LONG : Chercher breakout au-dessus BB80 ou swing high
+            prev = df.iloc[-2]
+            prev_high = float(prev['high'])
+            curr_high = float(last['high'])
+            
+            # Breakout BB80
+            if prev_high <= bb80_up and curr_high > bb80_up:
+                breakout_detected = True
+                breakout_level = 'BB80_UP'
+            
+            # OU breakout swing high récent
+            else:
+                try:
+                    lookback = min(10, len(df) - 1)
+                    window = df.iloc[-lookback:-1]
+                    swing_high = window['high'].max()
+                    
+                    if prev_high <= swing_high and curr_high > swing_high:
+                        breakout_detected = True
+                        breakout_level = f'SWING_HIGH_{swing_high:.4f}'
+                except Exception:
+                    pass
+        
+        else:  # SHORT
+            # SHORT : Chercher breakout en-dessous BB80 ou swing low
+            prev = df.iloc[-2]
+            prev_low = float(prev['low'])
+            curr_low = float(last['low'])
+            
+            # Breakout BB80
+            if prev_low >= bb80_lo and curr_low < bb80_lo:
+                breakout_detected = True
+                breakout_level = 'BB80_LO'
+            
+            # OU breakout swing low récent
+            else:
+                try:
+                    lookback = min(10, len(df) - 1)
+                    window = df.iloc[-lookback:-1]
+                    swing_low = window['low'].min()
+                    
+                    if prev_low >= swing_low and curr_low < swing_low:
+                        breakout_detected = True
+                        breakout_level = f'SWING_LOW_{swing_low:.4f}'
+                except Exception:
+                    pass
+        
+        if not breakout_detected:
+            return None
+        
+        # ====== CONFIRMATION VOLUME (optionnel) ======
+        
+        try:
+            volume_confirm = str(database.get_setting('PYRAMID_VOLUME_CONFIRM', 'true')).lower() == 'true'
+            
+            if volume_confirm:
+                curr_vol = float(last.get('volume', 0))
+                avg_vol = df['volume'].tail(20).mean()
+                
+                if curr_vol < avg_vol * 0.8:
+                    return None
+        except Exception:
+            pass
+        
+        # ====== CALCUL TAILLE AJOUT ======
+        
+        try:
+            pyramid_size_pct = float(database.get_setting('PYRAMID_SIZE_PCT', '50'))
+        except Exception:
+            pyramid_size_pct = 50.0
+        
+        initial_qty = float(pos['quantity'])
+        add_qty = initial_qty * (pyramid_size_pct / 100.0)
+        
+        try:
+            add_qty = float(ex.amount_to_precision(symbol, add_qty))
+        except Exception:
+            pass
+        
+        if add_qty <= 0:
+            return None
+        
+        # ====== RETOUR INFOS PYRAMIDING ======
+        
+        return {
+            'symbol': symbol,
+            'side': pos['side'],
+            'add_qty': add_qty,
+            'current_price': current_price,
+            'profit_pct': profit_pct,
+            'breakout_level': breakout_level,
+            'pyramid_count': pyramid_count,
+            'position_id': pos['id']
+        }
+    
+    except Exception as e:
+        print(f"Erreur should_pyramid_position: {e}")
+        return None
+
+
+def execute_pyramid_add(ex, pyramid_info: Dict[str, Any]) -> bool:
+    """
+    Exécute l'ajout pyramiding sur une position gagnante.
+    
+    ACTIONS :
+    1. Ouvrir position additionnelle
+    2. Recalculer prix d'entrée moyen
+    3. Ajuster SL (ne jamais reculer)
+    4. Mettre à jour DB
+    5. Notifier
+    
+    Args:
+        ex: Exchange
+        pyramid_info: Dict retourné par should_pyramid_position()
+    
+    Returns:
+        True si succès
+    """
+    _ensure_bitget_mix_options(ex)
+    
+    try:
+        symbol = pyramid_info['symbol']
+        side = pyramid_info['side']
+        add_qty = pyramid_info['add_qty']
+        current_price = pyramid_info['current_price']
+        position_id = pyramid_info['position_id']
+        
+        is_long = (side == 'buy')
+        
+        # ====== 1. OUVRIR POSITION ADDITIONNELLE ======
+        
+        common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+        
+        try:
+            ex.set_leverage(LEVERAGE, symbol)
+            try:
+                ex.set_margin_mode('cross', symbol)
+            except Exception:
+                pass
+            try:
+                ex.set_position_mode(False, symbol)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        
+        order = create_market_order_smart(
+            ex, symbol, side, add_qty, 
+            ref_price=current_price, 
+            params=common_params
+        )
+        
+        if not order:
+            raise Exception("Ordre pyramiding échoué")
+        
+        filled_price = float(order.get('price', current_price))
+        
+        clear_balance_cache()
+        
+        # ====== 2. RÉCUPÉRER POSITION DB ======
+        
+        pos = database.get_trade_by_id(position_id)
+        if not pos:
+            raise Exception("Position introuvable en DB")
+        
+        old_qty = float(pos['quantity'])
+        old_entry = float(pos['entry_price'])
+        old_sl = float(pos.get('sl_price', old_entry))
+        old_tp = float(pos.get('tp_price', old_entry))
+        
+        # ====== 3. CALCULER NOUVEAU PRIX MOYEN ======
+        
+        total_qty = old_qty + add_qty
+        new_avg_entry = ((old_qty * old_entry) + (add_qty * filled_price)) / total_qty
+        
+        # ====== 4. AJUSTER SL (ne jamais reculer) ======
+        
+        new_sl = old_entry
+        
+        try:
+            pyramid_sl_offset = float(database.get_setting('PYRAMID_SL_OFFSET_PCT', '1.0'))
+        except Exception:
+            pyramid_sl_offset = 1.0
+        
+        if is_long:
+            proposed_sl = new_avg_entry * (1 - pyramid_sl_offset / 100)
+            new_sl = max(old_sl, proposed_sl)
+        else:
+            proposed_sl = new_avg_entry * (1 + pyramid_sl_offset / 100)
+            new_sl = min(old_sl, proposed_sl)
+        
+        # ====== 5. GARDER TP INITIAL (ou ajuster) ======
+        
+        new_tp = old_tp
+        
+        try:
+            extend_tp = str(database.get_setting('PYRAMID_EXTEND_TP', 'false')).lower() == 'true'
+            
+            if extend_tp:
+                tp_extension = float(database.get_setting('PYRAMID_TP_EXTENSION_PCT', '5.0'))
+                
+                if is_long:
+                    new_tp = old_tp * (1 + tp_extension / 100)
+                else:
+                    new_tp = old_tp * (1 - tp_extension / 100)
+        except Exception:
+            pass
+        
+        # ====== 6. METTRE À JOUR EXCHANGE (SL/TP) ======
+        
+        close_side = 'sell' if is_long else 'buy'
+        
+        try:
+            market = ex.market(symbol) or {}
+            tick_size = _bitget_tick_size(market)
+            
+            mark_now = _current_mark_price(ex, symbol)
+            new_sl = _validate_sl_for_side(side, float(new_sl), mark_now, tick_size)
+            
+            try:
+                new_tp = _prepare_validated_tp(ex, symbol, close_side, float(new_tp))
+            except Exception:
+                pass
+            
+            try:
+                new_sl = float(ex.price_to_precision(symbol, new_sl))
+                new_tp = float(ex.price_to_precision(symbol, new_tp))
+                total_qty = float(ex.amount_to_precision(symbol, total_qty))
+            except Exception:
+                pass
+            
+            ex.create_order(
+                symbol, 'market', close_side, total_qty, price=None,
+                params={**common_params, 'stopLossPrice': float(new_sl), 'reduceOnly': True, 'triggerType': 'mark'}
+            )
+            ex.create_order(
+                symbol, 'market', close_side, total_qty, price=None,
+                params={**common_params, 'takeProfitPrice': float(new_tp), 'reduceOnly': True, 'triggerType': 'mark'}
+            )
+        
+        except Exception as e:
+            print(f"Erreur placement SL/TP pyramiding: {e}")
+        
+        # ====== 7. METTRE À JOUR DB ======
+        
+        pyramid_count = int(pos.get('pyramid_count', 0)) + 1
+        
+        try:
+            database.update_trade_pyramid(
+                trade_id=position_id,
+                new_quantity=float(total_qty),
+                new_avg_entry=float(new_avg_entry),
+                new_sl=float(new_sl),
+                new_tp=float(new_tp),
+                pyramid_count=pyramid_count
+            )
+        except AttributeError:
+            try:
+                database.update_trade_core(
+                    trade_id=position_id,
+                    side=side,
+                    entry_price=float(new_avg_entry),
+                    quantity=float(total_qty),
+                    regime=pos.get('regime', 'Tendance')
+                )
+                database.update_trade_sl(position_id, float(new_sl))
+                database.update_trade_tp(position_id, float(new_tp))
+            except Exception:
+                pass
+        
+        # ====== 8. NOTIFICATION ======
+        
+        try:
+            notifier.tg_send(
+                f"📈 **PYRAMIDING AJOUTÉ**\n\n"
+                f"🎯 {symbol} {side.upper()}\n"
+                f"➕ Ajout #{pyramid_count}\n"
+                f"📊 Breakout : {pyramid_info['breakout_level']}\n"
+                f"💰 Profit actuel : +{pyramid_info['profit_pct']:.2f}%\n\n"
+                f"📦 Quantité :\n"
+                f"  • Avant : {old_qty:.6f}\n"
+                f"  • Ajout : +{add_qty:.6f}\n"
+                f"  • Total : {total_qty:.6f}\n\n"
+                f"💵 Prix d'entrée :\n"
+                f"  • Initial : {old_entry:.4f}\n"
+                f"  • Ajout : {filled_price:.4f}\n"
+                f"  • Moyen : {new_avg_entry:.4f}\n\n"
+                f"🛡️ Nouveau SL : {new_sl:.4f}\n"
+                f"🎯 TP : {new_tp:.4f}"
+            )
+        except Exception:
+            pass
+        
+        return True
+    
+    except Exception as e:
+        try:
+            notifier.tg_send(f"❌ Erreur pyramiding {pyramid_info['symbol']}: {e}")
+        except Exception:
+            pass
+        print(f"Erreur execute_pyramid_add: {e}")
+        return False
+
+def should_take_partial_profit(pos: dict, current_price: float) -> Optional[Dict[str, Any]]:
+    """
+    Détermine si on doit prendre un profit partiel.
+    
+    PALIERS DARWIN :
+    - 50% du chemin vers TP → Close 40% position
+    - 75% du chemin vers TP → Close 30% additionnel (70% total)
+    - 100% TP → Close le reste (100%)
+    
+    Args:
+        pos: Position DB
+        current_price: Prix actuel
+    
+    Returns:
+        Dict avec infos partial exit si conditions OK, sinon None
+    """
+    try:
+        # ====== FEATURE ACTIVÉE ? ======
+        
+        try:
+            enable_partial = str(database.get_setting('ENABLE_PARTIAL_EXITS', 'false')).lower() == 'true'
+        except Exception:
+            enable_partial = False
+        
+        if not enable_partial:
+            return None
+        
+        # ====== RÉCUPÉRER INFOS POSITION ======
+        
+        entry_price = float(pos['entry_price'])
+        tp_price = float(pos.get('tp_price', 0))
+        qty_remaining = float(pos.get('quantity', 0))
+        is_long = (pos['side'] == 'buy')
+        
+        if tp_price <= 0 or qty_remaining <= 0:
+            return None
+        
+        # ====== CALCULER PROGRESSION VERS TP ======
+        
+        if is_long:
+            if tp_price <= entry_price or current_price <= entry_price:
+                return None
+            if current_price >= tp_price:
+                progress = 1.0
+            else:
+                progress = (current_price - entry_price) / (tp_price - entry_price)
+        else:
+            if tp_price >= entry_price or current_price >= entry_price:
+                return None
+            if current_price <= tp_price:
+                progress = 1.0
+            else:
+                progress = (entry_price - current_price) / (entry_price - tp_price)
+        
+        progress = max(0.0, min(1.0, progress))
+        
+        # ====== VÉRIFIER PALIERS ======
+        
+        try:
+            partial_exits = pos.get('partial_exits', {})
+            if isinstance(partial_exits, str):
+                import json
+                partial_exits = json.loads(partial_exits)
+        except Exception:
+            partial_exits = {}
+        
+        try:
+            palier_50_pct = float(database.get_setting('PARTIAL_EXIT_50_PCT', '40'))
+            palier_75_pct = float(database.get_setting('PARTIAL_EXIT_75_PCT', '30'))
+        except Exception:
+            palier_50_pct = 40.0
+            palier_75_pct = 30.0
+        
+        exit_info = None
+        
+        if progress >= 0.75 and not partial_exits.get('75'):
+            exit_info = {
+                'palier': '75',
+                'progress': progress,
+                'close_pct': palier_75_pct,
+                'close_qty': qty_remaining * (palier_75_pct / 100.0),
+                'reason': '75% du TP atteint'
+            }
+        
+        elif progress >= 0.50 and not partial_exits.get('50'):
+            exit_info = {
+                'palier': '50',
+                'progress': progress,
+                'close_pct': palier_50_pct,
+                'close_qty': qty_remaining * (palier_50_pct / 100.0),
+                'reason': '50% du TP atteint'
+            }
+        
+        if not exit_info:
+            return None
+        
+        # ====== CALCULER PROFIT RÉALISÉ ======
+        
+        if is_long:
+            profit_per_unit = current_price - entry_price
+        else:
+            profit_per_unit = entry_price - current_price
+        
+        profit_usdt = exit_info['close_qty'] * profit_per_unit
+        
+        exit_info.update({
+            'symbol': pos['symbol'],
+            'side': pos['side'],
+            'position_id': pos['id'],
+            'current_price': current_price,
+            'entry_price': entry_price,
+            'profit_usdt': profit_usdt,
+            'profit_pct': (profit_per_unit / entry_price) * 100,
+            'qty_remaining_after': qty_remaining - exit_info['close_qty']
+        })
+        
+        return exit_info
+    
+    except Exception as e:
+        print(f"Erreur should_take_partial_profit: {e}")
+        return None
+
+
+def execute_partial_exit(ex, exit_info: Dict[str, Any]) -> bool:
+    """
+    Exécute une sortie partielle.
+    
+    ACTIONS :
+    1. Close X% de la position
+    2. Mettre à jour quantité DB
+    3. Ajuster SL (plus serré sur reste)
+    4. Enregistrer le palier atteint
+    5. Notifier
+    
+    Args:
+        ex: Exchange
+        exit_info: Dict retourné par should_take_partial_profit()
+    
+    Returns:
+        True si succès
+    """
+    _ensure_bitget_mix_options(ex)
+    
+    try:
+        symbol = exit_info['symbol']
+        side = exit_info['side']
+        close_qty = exit_info['close_qty']
+        position_id = exit_info['position_id']
+        palier = exit_info['palier']
+        
+        is_long = (side == 'buy')
+        close_side = 'sell' if is_long else 'buy'
+        
+        # ====== 1. ARRONDIR QUANTITÉ ======
+        
+        try:
+            close_qty = float(ex.amount_to_precision(symbol, close_qty))
+        except Exception:
+            pass
+        
+        if close_qty <= 0:
+            return False
+        
+        # ====== 2. FERMER PARTIELLEMENT ======
+        
+        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+        
+        try:
+            ex.set_leverage(LEVERAGE, symbol)
+            try:
+                ex.set_margin_mode('cross', symbol)
+            except Exception:
+                pass
+            try:
+                ex.set_position_mode(False, symbol)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        
+        try:
+            t = ex.fetch_ticker(symbol) or {}
+            ref_px = float(t.get('last') or t.get('close') or exit_info['current_price'])
+        except Exception:
+            ref_px = exit_info['current_price']
+        
+        order = create_market_order_smart(
+            ex, symbol, close_side, close_qty,
+            ref_price=ref_px,
+            params=common_params
+        )
+        
+        if not order:
+            raise Exception("Ordre partial exit échoué")
+        
+        exit_price = float(order.get('price', ref_px))
+        
+        clear_balance_cache()
+        
+        # ====== 3. METTRE À JOUR DB ======
+        
+        pos = database.get_trade_by_id(position_id)
+        if not pos:
+            raise Exception("Position introuvable")
+        
+        old_qty = float(pos['quantity'])
+        new_qty = old_qty - close_qty
+        
+        if new_qty < 0:
+            new_qty = 0
+        
+        try:
+            database.update_trade_quantity(position_id, float(new_qty))
+        except AttributeError:
+            try:
+                database.update_trade_core(
+                    trade_id=position_id,
+                    side=side,
+                    entry_price=float(pos['entry_price']),
+                    quantity=float(new_qty),
+                    regime=pos.get('regime', 'Tendance')
+                )
+            except Exception:
+                pass
+        
+        try:
+            partial_exits = pos.get('partial_exits', {})
+            if isinstance(partial_exits, str):
+                import json
+                partial_exits = json.loads(partial_exits)
+            
+            partial_exits[palier] = {
+                'qty_closed': close_qty,
+                'exit_price': exit_price,
+                'profit_usdt': exit_info['profit_usdt'],
+                'timestamp': int(time.time())
+            }
+            
+            database.update_trade_meta(position_id, {'partial_exits': partial_exits})
+        except Exception as e:
+            print(f"Erreur enregistrement partial_exits: {e}")
+        
+        # ====== 4. AJUSTER SL (plus serré sur reste) ======
+        
+        if new_qty > 0:
+            try:
+                entry = float(pos['entry_price'])
+                old_sl = float(pos.get('sl_price', entry))
+                tp = float(pos.get('tp_price', entry))
+                
+                try:
+                    sl_tighten_pct = float(database.get_setting('PARTIAL_EXIT_SL_TIGHTEN_PCT', '50'))
+                except Exception:
+                    sl_tighten_pct = 50.0
+                
+                profit_range = exit_info['current_price'] - entry if is_long else entry - exit_info['current_price']
+                
+                if is_long:
+                    new_sl = entry + (profit_range * sl_tighten_pct / 100)
+                    new_sl = max(old_sl, new_sl)
+                else:
+                    new_sl = entry - (profit_range * sl_tighten_pct / 100)
+                    new_sl = min(old_sl, new_sl)
+                
+                market = ex.market(symbol) or {}
+                tick_size = _bitget_tick_size(market)
+                mark_now = _current_mark_price(ex, symbol)
+                
+                new_sl = _validate_sl_for_side(side, float(new_sl), mark_now, tick_size)
+                
+                try:
+                    new_sl = float(ex.price_to_precision(symbol, new_sl))
+                    new_qty_prec = float(ex.amount_to_precision(symbol, new_qty))
+                except Exception:
+                    new_qty_prec = new_qty
+                
+                ex.create_order(
+                    symbol, 'market', close_side, new_qty_prec, price=None,
+                    params={**common_params, 'stopLossPrice': float(new_sl), 'triggerType': 'mark'}
+                )
+                ex.create_order(
+                    symbol, 'market', close_side, new_qty_prec, price=None,
+                    params={**common_params, 'takeProfitPrice': float(tp), 'triggerType': 'mark'}
+                )
+                
+                try:
+                    database.update_trade_sl(position_id, float(new_sl))
+                except Exception:
+                    pass
+            
+            except Exception as e:
+                print(f"Erreur ajustement SL après partial exit: {e}")
+        
+        # ====== 5. SI POSITION ENTIÈREMENT FERMÉE ======
+        
+        if new_qty <= 0:
+            try:
+                database.close_trade(position_id, status='CLOSED_PARTIAL_COMPLETE', pnl=0.0)
+            except Exception:
+                pass
+        
+        # ====== 6. NOTIFICATION ======
+        
+        try:
+            remaining_pct = (new_qty / old_qty) * 100 if old_qty > 0 else 0
+            
+            notifier.tg_send(
+                f"💰 **PROFIT PARTIEL #{palier}%**\n\n"
+                f"🎯 {symbol} {side.upper()}\n"
+                f"📊 Progression : {exit_info['progress']*100:.1f}%\n\n"
+                f"✂️ Fermeture partielle :\n"
+                f"  • Fermé : {close_qty:.6f} ({exit_info['close_pct']:.0f}%)\n"
+                f"  • Reste : {new_qty:.6f} ({remaining_pct:.0f}%)\n\n"
+                f"💵 Prix de sortie : {exit_price:.4f}\n"
+                f"💰 Profit réalisé : +{exit_info['profit_usdt']:.2f} USDT\n"
+                f"📈 Profit % : +{exit_info['profit_pct']:.2f}%\n\n"
+                f"🛡️ SL resserré sur reste"
+            )
+        except Exception:
+            pass
+        
+        return True
+    
+    except Exception as e:
+        try:
+            notifier.tg_send(f"❌ Erreur partial exit {exit_info['symbol']}: {e}")
+        except Exception:
+            pass
+        print(f"Erreur execute_partial_exit: {e}")
+        return False
 
 def manage_open_positions(ex: ccxt.Exchange):
     """
@@ -3712,19 +4818,13 @@ def manage_open_positions(ex: ccxt.Exchange):
     
     SUPPORTE MAINTENANT LES TRADES MANUELS (importés depuis exchange).
     
-    SYSTÈME À 3 NIVEAUX :
+    SYSTÈME À 5 NIVEAUX (MODIFIÉ) :
     
-    1. BE DYNAMIQUE (Contact BB20_mid)
-       - SL → BE avec protection swing low/high
-    
-    2. TRAILING PAR PALIERS (Progression vers TP)
-       - 25% → SL à Entry + 10% profit
-       - 50% → SL à Entry + 35% profit  
-       - 75% → SL à Entry + 60% profit
-    
-    3. TRAILING FINAL SERRÉ (>90% du TP)
-       - Distance = 0.5x ATR (très serré)
-       - Maximise les profits près du TP
+    1. PYRAMIDING (ajout position gagnante) 🆕
+    2. PARTIAL EXITS (sorties partielles) 🆕
+    3. BE DYNAMIQUE (Contact BB20_mid)
+    4. TRAILING PAR PALIERS (Progression vers TP)
+    5. TRAILING FINAL SERRÉ (>90% du TP)
     
     + TP dynamique (BB80 pour Tendance, BB20 pour CT)
     + Fonctionne sur trades bot ET trades manuels
@@ -3825,10 +4925,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     pass
                 try:
                     database.close_trade(pos['id'], status='CLOSED_BY_EXCHANGE', pnl=0.0)
-                    
-                    # ✅ AJOUT : Invalider cache après fermeture détectée sur exchange
                     clear_balance_cache()
-                    
                     notifier.tg_send(
                         f"✅ Fermeture auto (exchange) détectée sur {symbol} — "
                         f"Trade #{pos['id']} clôturé en DB et ordres annulés."
@@ -3849,17 +4946,14 @@ def manage_open_positions(ex: ccxt.Exchange):
         regime_raw = pos.get('regime', 'Tendance')
         is_manual_trade = isinstance(regime_raw, str) and regime_raw.lower().startswith('import')
 
-        # Setting pour activer trailing sur trades manuels
         try:
             enable_trailing_manual = str(database.get_setting('ENABLE_TRAILING_MANUAL', 'true')).lower() == 'true'
         except Exception:
-            enable_trailing_manual = True  # Activé par défaut
+            enable_trailing_manual = True
 
-        # Si trade manuel ET trailing désactivé → skip
         if is_manual_trade and not enable_trailing_manual:
             continue
 
-        # VALIDATION DES DONNÉES pour trades manuels
         if is_manual_trade:
             try:
                 entry_check = float(pos.get('entry_price', 0))
@@ -3867,11 +4961,9 @@ def manage_open_positions(ex: ccxt.Exchange):
                 tp_check = float(pos.get('tp_price', 0))
                 
                 if entry_check <= 0:
-                    # Pas de prix d'entrée valide → skip ce trade
                     print(f"[manage_open_positions] Trade manuel {symbol} ignoré (entry_price invalide)")
                     continue
                 
-                # Si pas de SL/TP définis, essayer de les récupérer depuis l'exchange
                 if sl_check <= 0 or tp_check <= 0:
                     try:
                         tp_ex, sl_ex = _fetch_existing_tp_sl(ex, symbol)
@@ -3891,7 +4983,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                     except Exception as e:
                         print(f"[manage_open_positions] Erreur récupération SL/TP exchange: {e}")
                 
-                # Si toujours pas de TP valide, utiliser un TP par défaut
                 if float(pos.get('tp_price', 0)) <= 0:
                     try:
                         default_tp_pct = float(database.get_setting('MANUAL_DEFAULT_TP_PCT', '5.0'))
@@ -3916,7 +5007,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                     print(f"[manage_open_positions] TP par défaut créé pour {symbol}: {default_tp}")
             
             except Exception as e:
-                # Données incomplètes/corrompues → skip ce trade
                 print(f"[manage_open_positions] Trade manuel {symbol} ignoré (erreur validation): {e}")
                 continue
 
@@ -3926,7 +5016,6 @@ def manage_open_positions(ex: ccxt.Exchange):
 
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
-        # Contexte marge/levier
         try:
             ex.set_leverage(LEVERAGE, symbol)
             try:
@@ -3940,7 +5029,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             pass
 
-        # Suivi manuel
         try:
             FOLLOW_MANUAL_SL_WITH_TRAILING = str(
                 database.get_setting('FOLLOW_MANUAL_SL_WITH_TRAILING', 'true')
@@ -3948,7 +5036,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             FOLLOW_MANUAL_SL_WITH_TRAILING = True
 
-        # Tick size
         try:
             market = ex.market(symbol) or {}
             tick_size = _bitget_tick_size(market)
@@ -3975,8 +5062,10 @@ def manage_open_positions(ex: ccxt.Exchange):
         bb80_lo = float(last['bb80_lo'])
         last_atr = float(last.get('atr', 0.0))
 
-        # ---------- TP DYNAMIQUE ----------
-        # Ne s'applique PAS aux trades manuels (ils gardent leur TP fixe)
+        # ========================================================================
+        # TP DYNAMIQUE (Ne s'applique PAS aux trades manuels)
+        # ========================================================================
+        
         if not is_manual_trade:
             try:
                 regime = pos.get('regime', 'Tendance')
@@ -4060,8 +5149,53 @@ def manage_open_positions(ex: ccxt.Exchange):
             except Exception as e:
                 print(f"Erreur TP dynamique {symbol}: {e}")
 
-        # ---------- TRAILING STOP PRO (3 NIVEAUX) ----------
-        # S'APPLIQUE AUX TRADES BOT ET MANUELS
+        # ========================================================================
+        # 🆕 NIVEAU 1 : PYRAMIDING (Ajout à position gagnante)
+        # ========================================================================
+        
+        try:
+            pyramid_info = should_pyramid_position(ex, pos, df)
+            
+            if pyramid_info:
+                success = execute_pyramid_add(ex, pyramid_info)
+                
+                if success:
+                    # Position modifiée → recharger
+                    pos = database.get_trade_by_id(pos['id'])
+                    if not pos:
+                        continue
+        
+        except Exception as e:
+            print(f"Erreur pyramiding {symbol}: {e}")
+        
+        # ========================================================================
+        # 🆕 NIVEAU 2 : PARTIAL EXITS (Sorties partielles)
+        # ========================================================================
+        
+        try:
+            # Prix actuel pour partial exits
+            try:
+                mark_now_partial = _current_mark_price(ex, symbol)
+            except Exception:
+                mark_now_partial = last_close
+            
+            exit_info = should_take_partial_profit(pos, mark_now_partial)
+            
+            if exit_info:
+                success = execute_partial_exit(ex, exit_info)
+                
+                if success:
+                    # Position modifiée → recharger
+                    pos = database.get_trade_by_id(pos['id'])
+                    if not pos or pos.get('status') != 'OPEN':
+                        continue  # Position fermée complètement
+        
+        except Exception as e:
+            print(f"Erreur partial exits {symbol}: {e}")
+        
+        # ========================================================================
+        # NIVEAU 3 : BE DYNAMIQUE + TRAILING (3 niveaux)
+        # ========================================================================
         
         if skip_sl_updates:
             continue
@@ -4085,7 +5219,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             mark_now = last_close
 
-        # Calculer progression vers TP (0.0 → 1.0)
+        # Calculer progression vers TP
         if is_long:
             if tp_price <= entry_price:
                 progress = 0.0
@@ -4108,7 +5242,7 @@ def manage_open_positions(ex: ccxt.Exchange):
         progress = max(0.0, min(1.0, progress))
 
         # ========================================================================
-        # NIVEAU 1 : BE DYNAMIQUE (Contact BB20_mid)
+        # NIVEAU 3A : BE DYNAMIQUE (Contact BB20_mid)
         # ========================================================================
         
         be_trigger = False
@@ -4152,7 +5286,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if (not is_long) and last_close <= bb20_mid:
                     be_trigger = True
 
-        # BE avec protection swing
         try:
             be_price_theo = compute_fee_safe_be_price(
                 entry=float(pos['entry_price']),
@@ -4235,7 +5368,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                                 else:
                                     pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
                             
-                            # Notification différenciée pour trades manuels
                             if is_manual_trade:
                                 notifier.tg_send(
                                     f"🔵 **Trade Manuel → BE Activé**\n\n"
@@ -4255,36 +5387,32 @@ def manage_open_positions(ex: ccxt.Exchange):
                     pass
 
         # ========================================================================
-        # NIVEAU 2 : TRAILING PAR PALIERS
+        # NIVEAU 3B : TRAILING PAR PALIERS
         # ========================================================================
         
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
             
-            # Paramètres des paliers
             try:
                 use_stepped = str(database.get_setting('TRAIL_USE_STEPPED', 'true')).lower() == 'true'
             except Exception:
                 use_stepped = True
             
             if use_stepped and progress < 0.90:
-                # Paliers de trailing
                 paliers = [
-                    (0.25, 0.10),  # 25% du chemin → protège 10% du profit
-                    (0.50, 0.35),  # 50% → protège 35%
-                    (0.75, 0.60),  # 75% → protège 60%
+                    (0.25, 0.10),
+                    (0.50, 0.35),
+                    (0.75, 0.60),
                 ]
                 
                 profit_total = tp_price - entry_price if is_long else entry_price - tp_price
                 
                 for threshold, protect_ratio in paliers:
                     if progress >= threshold:
-                        # SL cible = Entry + (protect_ratio * profit_total)
                         if is_long:
                             target_sl = entry_price + (protect_ratio * profit_total)
                         else:
                             target_sl = entry_price - (protect_ratio * profit_total)
                         
-                        # Appliquer seulement si amélioration
                         improve = (is_long and target_sl > sl_current) or ((not is_long) and target_sl < sl_current)
                         
                         if improve:
@@ -4309,33 +5437,29 @@ def manage_open_positions(ex: ccxt.Exchange):
                                 pos['sl_price'] = float(target_sl)
                             except Exception:
                                 pass
-                            break  # Un seul palier à la fois
+                            break
         
         # ========================================================================
-        # NIVEAU 3 : TRAILING FINAL SERRÉ (>90% du TP)
+        # NIVEAU 3C : TRAILING FINAL SERRÉ (>90% du TP)
         # ========================================================================
         
         if progress >= 0.90:
             try:
-                # Distance très serrée : 0.5x ATR
                 try:
                     final_atr_k = float(database.get_setting('TRAIL_FINAL_ATR_K', 0.5))
                 except Exception:
                     final_atr_k = 0.5
                 
-                # SL idéal à distance réduite
                 if is_long:
                     want_sl = mark_now - (final_atr_k * last_atr)
                 else:
                     want_sl = mark_now + (final_atr_k * last_atr)
                 
-                # Ne jamais reculer le SL
                 if is_long and want_sl <= sl_current:
                     continue
                 if (not is_long) and want_sl >= sl_current:
                     continue
                 
-                # Mouvement minimum pour limiter spam
                 try:
                     min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
                 except Exception:
@@ -4368,7 +5492,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                     pass
             except Exception as e:
                 print(f"Erreur trailing final {symbol}: {e}")
-
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
