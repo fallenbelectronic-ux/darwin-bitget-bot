@@ -36,6 +36,21 @@ BE_BUFFER_USDT  = float(os.getenv("BE_BUFFER_USDT","0.0"))     # buffer absolu o
 # ==============================================================================
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
 # ==============================================================================
+
+def create_exchange():
+    ex = ccxt.bitget({
+        'apiKey': os.getenv('BITGET_API_KEY'),
+        'secret': os.getenv('BITGET_SECRET'),
+        'password': os.getenv('BITGET_PASSPHRASE'),
+        'options': {
+            'defaultType': 'swap',
+            'defaultSubType': 'linear',
+        },
+        'timeout': 15000,  # 15 secondes
+        'enableRateLimit': True,  # ← IMPORTANT
+    })
+    return ex
+
 def get_universe_size() -> int:
     """
     Lit UNIVERSE_SIZE depuis la base (fallback sur l'env, défaut 500).
@@ -1398,7 +1413,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegrated_bb80 = False
             
             # Vérifier dans les 1-3 bougies après réaction
-            for i in range(reaction_idx, min(reaction_idx + 4, len(df))):
+            for i in range(reaction_idx, min(reaction_idx + 3, len(df))):
                 bar = df.iloc[i]
                 try:
                     c = float(bar['close'])
@@ -1499,7 +1514,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegrated_bb20 = False
             reintegrated_bb80 = False
             
-            for i in range(reaction_idx, min(reaction_idx + 4, len(df))):
+            for i in range(reaction_idx, min(reaction_idx + 3, len(df))):
                 bar = df.iloc[i]
                 try:
                     c = float(bar['close'])
@@ -1693,67 +1708,205 @@ def record_signal_from_trader(
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
-def get_account_balance_usdt(ex=None) -> Optional[float]:
+# Cache global pour éviter trop d'appels API
+_BALANCE_CACHE = {
+    'value': None,
+    'timestamp': 0,
+    'ttl': 10  # secondes
+}
+
+def get_account_balance_usdt(ex=None, force_refresh: bool = False) -> Optional[float]:
     """
     Retourne le solde total en USDT (et le met en cache dans settings.CURRENT_BALANCE_USDT).
     Supporte Bybit/Bitget via ccxt.fetchBalance().
+    
+    AMÉLIORATIONS :
+    - Cache 10 secondes pour éviter rate limit
+    - Retry 3x avec backoff
+    - Paramètres spécifiques Bitget
+    - Logs détaillés
+    
+    Args:
+        ex: Exchange ccxt (créé automatiquement si None)
+        force_refresh: Forcer la récupération (ignorer cache)
+    
+    Returns:
+        Solde USDT total ou None si erreur
     """
+    global _BALANCE_CACHE
+    
+    # Vérifier cache
+    if not force_refresh:
+        now = time.time()
+        if _BALANCE_CACHE['value'] is not None and (now - _BALANCE_CACHE['timestamp']) < _BALANCE_CACHE['ttl']:
+            return _BALANCE_CACHE['value']
+    
     try:
         if ex is None and hasattr(globals(), "create_exchange"):
             ex = create_exchange()
         if ex is None:
             return None
-
-        bal = ex.fetch_balance()  # ccxt unified
-        total = None
-
-        # Essais robustes
-        for key in ("USDT", "usdT", "usdt"):
+        
+        # Tentatives avec retry
+        max_retries = 3
+        backoff_delays = [1, 2, 5]
+        
+        for attempt in range(max_retries):
             try:
-                wallet = bal.get(key) or {}
-                total = wallet.get("total") or wallet.get("free") or wallet.get("used")
-                if total is not None:
-                    total = float(total)
-                    break
-            except Exception:
-                continue
-
-        # Bitget Bybit dérivés: parfois balance['info'] contient la valeur
-        if total is None:
-            info = bal.get("info") or {}
-            # Bybit v5: list
-            try:
-                if isinstance(info, dict) and "result" in info:
-                    result = info["result"]
-                    if isinstance(result, dict) and "list" in result:
-                        for acc in result["list"]:
-                            if str(acc.get("coin", "")).upper() == "USDT":
-                                total = float(acc.get("walletBalance"))
-                                break
-            except Exception:
-                pass
-            # Bitget: data list
-            if total is None:
+                # Détecter type exchange
+                exchange_id = ex.id.lower() if hasattr(ex, 'id') else 'unknown'
+                
+                # Params spécifiques selon exchange
+                if 'bitget' in exchange_id:
+                    # Bitget : essayer AVEC params puis SANS
+                    try:
+                        bal = ex.fetch_balance({
+                            'type': 'swap',
+                            'marginCoin': 'USDT'
+                        })
+                    except Exception as e:
+                        print(f"[Balance] Bitget avec params échoué : {e}")
+                        # Fallback sans params
+                        bal = ex.fetch_balance({'type': 'swap'})
+                
+                elif 'bybit' in exchange_id:
+                    bal = ex.fetch_balance({'type': 'swap'})
+                
+                else:
+                    # Exchange générique
+                    bal = ex.fetch_balance()
+                
+                # Extraction solde (votre logique existante améliorée)
+                total = None
+                
+                # Méthode 1 : Clés USDT classiques
+                for key in ("USDT", "usdT", "usdt"):
+                    try:
+                        wallet = bal.get(key) or {}
+                        total = wallet.get("total") or wallet.get("free") or wallet.get("used")
+                        if total is not None:
+                            total = float(total)
+                            break
+                    except Exception:
+                        continue
+                
+                # Méthode 2 : Bybit v5 (votre code existant)
+                if total is None:
+                    info = bal.get("info") or {}
+                    try:
+                        if isinstance(info, dict) and "result" in info:
+                            result = info["result"]
+                            if isinstance(result, dict) and "list" in result:
+                                for acc in result["list"]:
+                                    if str(acc.get("coin", "")).upper() == "USDT":
+                                        total = float(acc.get("walletBalance", 0))
+                                        break
+                    except Exception:
+                        pass
+                
+                # Méthode 3 : Bitget data list (votre code existant amélioré)
+                if total is None:
+                    try:
+                        info = bal.get("info") or {}
+                        data = info.get("data") if isinstance(info, dict) else None
+                        
+                        if isinstance(data, list):
+                            for acc in data:
+                                if str(acc.get("marginCoin", "")).upper() == "USDT":
+                                    available = float(acc.get("available", 0))
+                                    frozen = float(acc.get("frozen", 0))
+                                    locked = float(acc.get("locked", 0))
+                                    total = available + frozen + locked
+                                    break
+                        
+                        # Bitget format alternatif (dict direct)
+                        elif isinstance(data, dict):
+                            if str(data.get("marginCoin", "")).upper() == "USDT":
+                                available = float(data.get("available", 0))
+                                frozen = float(data.get("frozen", 0))
+                                locked = float(data.get("locked", 0))
+                                total = available + frozen + locked
+                    
+                    except Exception as e:
+                        print(f"[Balance] Erreur extraction Bitget : {e}")
+                
+                # Méthode 4 : Bitget via 'available' direct dans info
+                if total is None:
+                    try:
+                        info = bal.get("info") or {}
+                        if isinstance(info, dict):
+                            available = info.get("available", info.get("availableBalance"))
+                            if available is not None:
+                                total = float(available)
+                    except Exception:
+                        pass
+                
+                # Valider résultat
+                if total is None:
+                    raise ValueError("Solde USDT non trouvé dans la réponse")
+                
+                total = float(total)
+                
+                # Mise à jour cache et DB
+                _BALANCE_CACHE['value'] = total
+                _BALANCE_CACHE['timestamp'] = time.time()
+                
                 try:
-                    data = info.get("data") if isinstance(info, dict) else None
-                    if isinstance(data, list):
-                        for acc in data:
-                            if str(acc.get("marginCoin", "")).upper() == "USDT":
-                                total = float(acc.get("available")) + float(acc.get("frozen", 0))
-                                break
+                    database.set_setting('CURRENT_BALANCE_USDT', f"{total:.6f}")
                 except Exception:
                     pass
-
-        if total is None:
-            return None
-
-        try:
-            database.set_setting('CURRENT_BALANCE_USDT', f"{total:.6f}")
-        except Exception:
-            pass
-        return float(total)
-    except Exception:
+                
+                return total
+            
+            except ccxt.RateLimitExceeded as e:
+                if attempt < max_retries - 1:
+                    delay = backoff_delays[attempt]
+                    print(f"[Balance] Rate limit, retry dans {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print(f"[Balance] Rate limit persistant après {max_retries} tentatives")
+                    # Retourner cache si disponible
+                    if _BALANCE_CACHE['value'] is not None:
+                        return _BALANCE_CACHE['value']
+                    return None
+            
+            except ccxt.NetworkError as e:
+                if attempt < max_retries - 1:
+                    delay = backoff_delays[attempt]
+                    print(f"[Balance] Erreur réseau, retry dans {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print(f"[Balance] Erreur réseau persistante")
+                    if _BALANCE_CACHE['value'] is not None:
+                        return _BALANCE_CACHE['value']
+                    return None
+            
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = backoff_delays[attempt]
+                    print(f"[Balance] Erreur : {e}, retry dans {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    print(f"[Balance] Échec après {max_retries} tentatives : {e}")
+                    if _BALANCE_CACHE['value'] is not None:
+                        print(f"[Balance] Utilisation cache : {_BALANCE_CACHE['value']} USDT")
+                        return _BALANCE_CACHE['value']
+                    return None
+        
         return None
+    
+    except Exception as e:
+        print(f"[Balance] Erreur fatale : {e}")
+        return None
+
+
+def clear_balance_cache():
+    """Invalide le cache du solde (à appeler après un trade)."""
+    global _BALANCE_CACHE
+    _BALANCE_CACHE['timestamp'] = 0
 
 def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, quantity: float, entry_px: float) -> None:
     """
@@ -2856,14 +3009,14 @@ def execute_signal_with_gates(
 
     if df is None or len(df) < 3:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
-        return False, "Rejeté: données insuffisantes pour valider l’entrée."
+        return False, "Rejeté: données insuffisantes pour valider l'entrée."
 
     # --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
     # Sans bougie de réaction valide avant l'entrée, on NE prend PAS le trade.
     try:
         if not _check_reaction_before_entry(df, signal, is_long):
             _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="no_reaction_candle")
-            return False, "Rejeté: aucune bougie de réaction valide avant l’entrée."
+            return False, "Rejeté: aucune bougie de réaction valide avant l'entrée."
     except Exception:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="reaction_check_error")
         return False, "Rejeté: erreur lors du contrôle de la bougie de réaction."
@@ -3001,6 +3154,10 @@ def execute_signal_with_gates(
                 if not pos_side or pos_side == side:
                     continue
                 close_position_manually(ex, int(pos_open['id']))
+                
+                # ✅ MODIFICATION 1 : Invalider cache après fermeture position inverse
+                clear_balance_cache()
+                
             except Exception:
                 continue
     except Exception:
@@ -3147,6 +3304,9 @@ def execute_signal_with_gates(
             )
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
+            
+            # ✅ MODIFICATION 2 : Invalider cache solde après ouverture position
+            clear_balance_cache()
 
             # --- RÉCUPÉRATION DE LA TAILLE RÉELLE SUR L'EXCHANGE ---
             # (permet d'avoir SL/TP exactement sur la taille exécutée)
@@ -3199,6 +3359,10 @@ def execute_signal_with_gates(
                     ex, symbol, close_side, quantity, ref_price=final_entry_price,
                     params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
                 )
+                
+                # ✅ MODIFICATION 3 : Invalider cache après fermeture d'urgence
+                clear_balance_cache()
+                
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
@@ -3661,6 +3825,10 @@ def manage_open_positions(ex: ccxt.Exchange):
                     pass
                 try:
                     database.close_trade(pos['id'], status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                    
+                    # ✅ AJOUT : Invalider cache après fermeture détectée sur exchange
+                    clear_balance_cache()
+                    
                     notifier.tg_send(
                         f"✅ Fermeture auto (exchange) détectée sur {symbol} — "
                         f"Trade #{pos['id']} clôturé en DB et ordres annulés."
@@ -4283,10 +4451,12 @@ def calculate_position_size(balance: float, risk_percent: float, entry_price: fl
     price_diff_per_unit = abs(entry_price - sl_price)
     return risk_amount_usdt / price_diff_per_unit if price_diff_per_unit > 0 else 0.0
 
+
 def close_position_manually(ex: ccxt.Exchange, trade_id: int):
     """(MODIFIÉ) Clôture manuelle robuste :
     - utilise create_market_order_smart() pour BUY et SELL
     - annule tous les ordres restants (TP/SL/BE) sur le symbole après fermeture.
+    - invalide le cache solde après fermeture
     """
     _ensure_bitget_mix_options(ex)
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
@@ -4342,6 +4512,10 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             except Exception:
                 pass
             database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
+            
+            # ✅ MODIFICATION 1 : Invalider cache (position déjà fermée côté exchange)
+            clear_balance_cache()
+            
             return notifier.tg_send(
                 f"ℹ️ Aucune position ouverte détectée pour {symbol}. "
                 f"Trade #{trade_id} marqué fermé et ordres annulés."
@@ -4358,6 +4532,10 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             except Exception:
                 pass
             database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
+            
+            # ✅ MODIFICATION 2 : Invalider cache (quantité nulle = position fermée)
+            clear_balance_cache()
+            
             return notifier.tg_send(
                 f"ℹ️ Quantité nulle à clôturer sur {symbol}. "
                 f"Trade #{trade_id} marqué fermé et ordres annulés."
@@ -4378,6 +4556,9 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
             create_market_order_smart(
                 ex, symbol, close_side, qty_to_close, ref_price=ref_px, params=params
             )
+            
+            # ✅ MODIFICATION 3 : Invalider cache APRÈS fermeture position (CRITIQUE)
+            clear_balance_cache()
 
             # 🧹 Après fermeture de la position, on enlève tous les ordres restants (TP/SL/BE)
             try:
@@ -4393,6 +4574,10 @@ def close_position_manually(ex: ccxt.Exchange, trade_id: int):
                 pass
 
         database.close_trade(trade_id, status='CLOSED_MANUAL', pnl=0.0)
+        
+        # ✅ MODIFICATION 4 : Invalider cache après close en DB (sécurité finale)
+        clear_balance_cache()
+        
         notifier.tg_send(f"✅ Position sur {symbol} (Trade #{trade_id}) fermée manuellement (qty={qty_to_close}).")
 
     except Exception as e:
