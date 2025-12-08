@@ -41,7 +41,7 @@ def create_exchange():
     ex = ccxt.bitget({
         'apiKey': os.getenv('BITGET_API_KEY'),
         'secret': os.getenv('BITGET_API_SECRET'),
-        'password': os.getenv('BITGET_PASSPHRASE'),
+        'password': os.getenv('BITGET_PASSPHRASSE'),
         'options': {
             'defaultType': 'swap',
             'defaultSubType': 'linear',
