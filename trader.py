@@ -1134,17 +1134,23 @@ def validate_double_extreme_ct(df: pd.DataFrame, contact_idx: int) -> bool:
     return bb20_touched and bb80_touched
 
 
-
-
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
-    Détecte un signal Darwin (Tendance ou CT) avec validation stricte.
+    Détecte un signal Darwin (Tendance ou CT) avec VALIDATION STRICTE OBLIGATOIRE.
     
-    SÉQUENCE OBLIGATOIRE (slides Darwin) :
-    1. Contact BB
-    2. Réaction 1-2 bougies (pattern 30%)
-    3. RÉINTÉGRATION BB20 ← CRITIQUE
-    4. Entrée bougie suivante
+    RÈGLES DARWIN OBLIGATOIRES :
+    
+    TENDANCE :
+    1. Contact BB20
+    2. Pattern de réaction 30% OBLIGATOIRE (pinbar/wick/marubozu/gap)
+    3. Réintégration BB20 OBLIGATOIRE
+    4. RR >= MIN_RR
+    
+    CONTRE-TENDANCE :
+    1. Double extrême BB20 + BB80 OBLIGATOIRE
+    2. Pattern de réaction 30% OBLIGATOIRE
+    3. Réintégration BB20 + BB80 OBLIGATOIRE (les DEUX)
+    4. RR >= MIN_RR
     
     Args:
         symbol: Symbole à analyser
@@ -1182,73 +1188,82 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         mm80 = float(current['mm80'])
         bb20_up = float(current['bb20_up'])
         bb20_lo = float(current['bb20_lo'])
+        bb20_mid = float(current['bb20_mid'])
         bb80_up = float(current['bb80_up'])
         bb80_lo = float(current['bb80_lo'])
-    except (KeyError, ValueError, TypeError) as e:
+        bb80_mid = float(current['bb80_mid'])
+    except (KeyError, ValueError, TypeError):
         return None
     
     # ========================================================================
-    # DÉTECTION TENDANCE
+    # DÉTECTION TENDANCE HAUSSIÈRE (LONG)
     # ========================================================================
     
     is_above_mm80 = close > mm80
     is_below_mm80 = close < mm80
     
-    # LONG en tendance haussière
     if is_above_mm80:
-        # Chercher contact BB20_lo dans les dernières bougies
+        # Chercher contact BB20_lo dans les 6 dernières bougies
         contact_idx = None
         for i in range(len(df) - 6, len(df) - 1):
             if i < 0:
                 continue
             bar = df.iloc[i]
-            # Contact = mèche touche ou traverse BB20_lo
-            if bar['low'] <= bar['bb20_lo']:
+            # Contact = low touche ou traverse BB20_lo
+            if float(bar['low']) <= float(bar['bb20_lo']):
                 contact_idx = i
                 break
         
         if contact_idx is not None:
-            # VALIDATION RÉACTION
+            # VALIDATION PATTERN 30% OBLIGATOIRE
             reaction_result = find_reaction_pattern(df, contact_idx, 'long')
             
             if not reaction_result['valid']:
+                # Pas de pattern 30% valide → rejet
                 return None
             
             reaction_idx = reaction_result['reaction_idx']
             pattern = reaction_result['pattern']
             
-            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
+            # VALIDATION RÉINTÉGRATION BB20 OBLIGATOIRE
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
+                # Pas de réintégration BB20 → rejet
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
             
-            # Si on est ici, le setup est VALIDE
-            # Calculer SL/TP
+            # Setup VALIDE → Calculer SL/TP
             entry_price = close
             
-            # SL = BB20_lo avec offset
             try:
                 sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
             except:
                 sl_offset_pct = 0.003
             sl_price = bb20_lo * (1 - sl_offset_pct)
             
-            # TP = calculé pour RR >= MIN_RR
             try:
                 min_rr = float(database.get_setting('MIN_RR', '3.0'))
             except:
                 min_rr = 3.0
+            
             risk = entry_price - sl_price
-            tp_price = entry_price + (risk * min_rr)
+            
+            # TP = BB80 opposée pour Tendance
+            try:
+                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
+            except:
+                tp_offset_pct = 0.003
+            tp_price = bb80_up * (1 - tp_offset_pct)
             
             # Vérifier RR
-            rr_final = (tp_price - entry_price) / (entry_price - sl_price) if (entry_price - sl_price) > 0 else 0
+            if risk > 0:
+                rr_final = (tp_price - entry_price) / risk
+            else:
+                rr_final = 0
             
             if rr_final >= min_rr:
-                # Index d'entrée = dernière bougie
                 entry_idx = len(df) - 1
                 
                 return {
@@ -1257,33 +1272,35 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'regime': 'Tendance',
                     'pattern': pattern,
                     'entry_price': entry_price,
-                    'entry': entry_price,  # alias pour compatibilité
+                    'entry': entry_price,
                     'sl_price': sl_price,
-                    'sl': sl_price,  # alias
+                    'sl': sl_price,
                     'tp_price': tp_price,
-                    'tp': tp_price,  # alias
+                    'tp': tp_price,
                     'rr': rr_final,
-                    # INDICES POUR GRAPHIQUE
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx
                 }
     
-    # SHORT en tendance baissière
+    # ========================================================================
+    # DÉTECTION TENDANCE BAISSIÈRE (SHORT)
+    # ========================================================================
+    
     if is_below_mm80:
-        # Chercher contact BB20_up dans les dernières bougies
+        # Chercher contact BB20_up dans les 6 dernières bougies
         contact_idx = None
         for i in range(len(df) - 6, len(df) - 1):
             if i < 0:
                 continue
             bar = df.iloc[i]
-            # Contact = mèche touche ou traverse BB20_up
-            if bar['high'] >= bar['bb20_up']:
+            # Contact = high touche ou traverse BB20_up
+            if float(bar['high']) >= float(bar['bb20_up']):
                 contact_idx = i
                 break
         
         if contact_idx is not None:
-            # VALIDATION RÉACTION
+            # VALIDATION PATTERN 30% OBLIGATOIRE
             reaction_result = find_reaction_pattern(df, contact_idx, 'short')
             
             if not reaction_result['valid']:
@@ -1292,7 +1309,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reaction_idx = reaction_result['reaction_idx']
             pattern = reaction_result['pattern']
             
-            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
+            # VALIDATION RÉINTÉGRATION BB20 OBLIGATOIRE
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
             
             if not reintegration_result['valid']:
@@ -1313,10 +1330,19 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 min_rr = float(database.get_setting('MIN_RR', '3.0'))
             except:
                 min_rr = 3.0
-            risk = sl_price - entry_price
-            tp_price = entry_price - (risk * min_rr)
             
-            rr_final = (entry_price - tp_price) / (sl_price - entry_price) if (sl_price - entry_price) > 0 else 0
+            risk = sl_price - entry_price
+            
+            try:
+                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
+            except:
+                tp_offset_pct = 0.003
+            tp_price = bb80_lo * (1 + tp_offset_pct)
+            
+            if risk > 0:
+                rr_final = (entry_price - tp_price) / risk
+            else:
+                rr_final = 0
             
             if rr_final >= min_rr:
                 entry_idx = len(df) - 1
@@ -1333,34 +1359,32 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'tp_price': tp_price,
                     'tp': tp_price,
                     'rr': rr_final,
-                    # INDICES POUR GRAPHIQUE
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx
                 }
     
     # ========================================================================
-    # DÉTECTION CONTRE-TENDANCE
+    # DÉTECTION CONTRE-TENDANCE LONG (prix sous MM80, rebond vers le haut)
     # ========================================================================
     
-    # LONG CT (prix sous MM80, double extrême bas)
     if is_below_mm80:
-        # Chercher double extrême (BB20 + BB80 touchées)
+        # Chercher double extrême bas (BB20 + BB80 touchées)
         contact_idx = None
         for i in range(len(df) - 6, len(df) - 1):
             if i < 0:
                 continue
             
-            # Vérifier double extrême
+            # VALIDATION DOUBLE EXTRÊME STRICT (BB20 ET BB80)
             if validate_double_extreme_ct(df, i):
                 bar = df.iloc[i]
                 # Contact BB20_lo ou BB80_lo
-                if bar['low'] <= bar['bb20_lo'] or bar['low'] <= bar['bb80_lo']:
+                if float(bar['low']) <= float(bar['bb20_lo']) or float(bar['low']) <= float(bar['bb80_lo']):
                     contact_idx = i
                     break
         
         if contact_idx is not None:
-            # VALIDATION RÉACTION
+            # VALIDATION PATTERN 30% OBLIGATOIRE
             reaction_result = find_reaction_pattern(df, contact_idx, 'long')
             
             if not reaction_result['valid']:
@@ -1369,13 +1393,31 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reaction_idx = reaction_result['reaction_idx']
             pattern = reaction_result['pattern']
             
-            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
-            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
+            # VALIDATION RÉINTÉGRATION BB20 + BB80 OBLIGATOIRE (slides Darwin CT)
+            reintegrated_bb20 = False
+            reintegrated_bb80 = False
             
-            if not reintegration_result['valid']:
+            # Vérifier dans les 1-3 bougies après réaction
+            for i in range(reaction_idx, min(reaction_idx + 4, len(df))):
+                bar = df.iloc[i]
+                try:
+                    c = float(bar['close'])
+                    bb20_lo_bar = float(bar['bb20_lo'])
+                    bb20_up_bar = float(bar['bb20_up'])
+                    bb80_lo_bar = float(bar['bb80_lo'])
+                    bb80_up_bar = float(bar['bb80_up'])
+                    
+                    # Réintégration = close à l'intérieur des bandes
+                    if bb20_lo_bar <= c <= bb20_up_bar:
+                        reintegrated_bb20 = True
+                    if bb80_lo_bar <= c <= bb80_up_bar:
+                        reintegrated_bb80 = True
+                except:
+                    continue
+            
+            # CT : Les DEUX réintégrations OBLIGATOIRES (slides Darwin)
+            if not (reintegrated_bb20 and reintegrated_bb80):
                 return None
-            
-            reintegration_idx = reintegration_result['reintegration_idx']
             
             # Setup CT VALIDE
             entry_price = close
@@ -1386,16 +1428,25 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 sl_offset_pct = 0.003
             sl_price = bb80_lo * (1 - sl_offset_pct)
             
+            # TP = MM80 pour CT
+            try:
+                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
+            except:
+                tp_offset_pct = 0.003
+            tp_price = mm80 * (1 - tp_offset_pct)
+            
             try:
                 min_rr = float(database.get_setting('MIN_RR', '3.0'))
             except:
                 min_rr = 3.0
-            risk = entry_price - sl_price
-            tp_price = mm80  # TP = MM80 pour CT
             
-            # Vérifier RR
-            if risk > 0 and (tp_price - entry_price) / risk >= min_rr:
+            risk = entry_price - sl_price
+            if risk > 0:
                 rr_final = (tp_price - entry_price) / risk
+            else:
+                rr_final = 0
+            
+            if rr_final >= min_rr:
                 entry_idx = len(df) - 1
                 
                 return {
@@ -1410,29 +1461,32 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'tp_price': tp_price,
                     'tp': tp_price,
                     'rr': rr_final,
-                    # INDICES POUR GRAPHIQUE
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx
                 }
     
-    # SHORT CT (prix au-dessus MM80, double extrême haut)
+    # ========================================================================
+    # DÉTECTION CONTRE-TENDANCE SHORT (prix au-dessus MM80, rebond vers le bas)
+    # ========================================================================
+    
     if is_above_mm80:
-        # Chercher double extrême (BB20 + BB80 touchées)
+        # Chercher double extrême haut (BB20 + BB80 touchées)
         contact_idx = None
         for i in range(len(df) - 6, len(df) - 1):
             if i < 0:
                 continue
             
+            # VALIDATION DOUBLE EXTRÊME STRICT
             if validate_double_extreme_ct(df, i):
                 bar = df.iloc[i]
                 # Contact BB20_up ou BB80_up
-                if bar['high'] >= bar['bb20_up'] or bar['high'] >= bar['bb80_up']:
+                if float(bar['high']) >= float(bar['bb20_up']) or float(bar['high']) >= float(bar['bb80_up']):
                     contact_idx = i
                     break
         
         if contact_idx is not None:
-            # VALIDATION RÉACTION
+            # VALIDATION PATTERN 30% OBLIGATOIRE
             reaction_result = find_reaction_pattern(df, contact_idx, 'short')
             
             if not reaction_result['valid']:
@@ -1441,13 +1495,29 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reaction_idx = reaction_result['reaction_idx']
             pattern = reaction_result['pattern']
             
-            # VALIDATION RÉINTÉGRATION BB20 (CRITIQUE)
-            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
+            # VALIDATION RÉINTÉGRATION BB20 + BB80 OBLIGATOIRE
+            reintegrated_bb20 = False
+            reintegrated_bb80 = False
             
-            if not reintegration_result['valid']:
+            for i in range(reaction_idx, min(reaction_idx + 4, len(df))):
+                bar = df.iloc[i]
+                try:
+                    c = float(bar['close'])
+                    bb20_lo_bar = float(bar['bb20_lo'])
+                    bb20_up_bar = float(bar['bb20_up'])
+                    bb80_lo_bar = float(bar['bb80_lo'])
+                    bb80_up_bar = float(bar['bb80_up'])
+                    
+                    if bb20_lo_bar <= c <= bb20_up_bar:
+                        reintegrated_bb20 = True
+                    if bb80_lo_bar <= c <= bb80_up_bar:
+                        reintegrated_bb80 = True
+                except:
+                    continue
+            
+            # CT : Les DEUX réintégrations OBLIGATOIRES
+            if not (reintegrated_bb20 and reintegrated_bb80):
                 return None
-            
-            reintegration_idx = reintegration_result['reintegration_idx']
             
             # Setup CT VALIDE
             entry_price = close
@@ -1458,15 +1528,25 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 sl_offset_pct = 0.003
             sl_price = bb80_up * (1 + sl_offset_pct)
             
+            # TP = MM80 pour CT
+            try:
+                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
+            except:
+                tp_offset_pct = 0.003
+            tp_price = mm80 * (1 + tp_offset_pct)
+            
             try:
                 min_rr = float(database.get_setting('MIN_RR', '3.0'))
             except:
                 min_rr = 3.0
-            risk = sl_price - entry_price
-            tp_price = mm80  # TP = MM80 pour CT
             
-            if risk > 0 and (entry_price - tp_price) / risk >= min_rr:
+            risk = sl_price - entry_price
+            if risk > 0:
                 rr_final = (entry_price - tp_price) / risk
+            else:
+                rr_final = 0
+            
+            if rr_final >= min_rr:
                 entry_idx = len(df) - 1
                 
                 return {
@@ -1481,14 +1561,13 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'tp_price': tp_price,
                     'tp': tp_price,
                     'rr': rr_final,
-                    # INDICES POUR GRAPHIQUE
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx
                 }
     
     return None
-
+    
 def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
     """
     Charge le DF préparé, appelle detect_signal(), enregistre le signal et notifie.
