@@ -8,3 +8,4 @@ mplfinance
 pytz
 tabulate
 scipy
+dropbox==11.36.2
