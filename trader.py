@@ -829,84 +829,6 @@ def _is_double_marubozu(prev: pd.Series, cur: pd.Series, side: str) -> bool:
 
     return True
 
-def _anchor_sl_from_extreme(df: pd.DataFrame, side: str) -> float:
-    """
-    (MISE À JOUR) SL depuis l’ancre avec offset hybride = max(% , ATR*k).
-      - Short : SL = HIGH_ancre * (1 + eff_pct)
-      - Long  : SL = LOW_ancre  * (1 - eff_pct)
-    """
-    if df is None or len(df) < 3:
-        return 0.0
-
-    # % de base (historique)
-    try:
-        pct = float(database.get_setting('SL_OFFSET_PCT', 0.006))
-    except Exception:
-        pct = 0.006
-    # ATR*k pour SL
-    try:
-        atr_k = float(database.get_setting('SL_ATR_K', 1.00))
-    except Exception:
-        atr_k = 1.00
-
-    # fenêtre d’ancre
-    try:
-        window = int(database.get_setting('ANCHOR_WINDOW', 3))
-    except Exception:
-        window = 3
-    window = max(1, min(window, len(df) - 1))
-    search = df.iloc[-(window+1):-1].copy()
-    if len(search) == 0:
-        search = df.iloc[:-1]
-        if len(search) == 0:
-            return 0.0
-
-    # ATR courant pour convertir en %
-    try:
-        last_atr = float(df.iloc[-1].get('atr', 0.0))
-    except Exception:
-        last_atr = 0.0
-
-    # Helpers mèche
-    def wick_high(row):
-        o, c, h = float(row['open']), float(row['close']), float(row['high'])
-        body_top = max(o, c)
-        return max(0.0, h - body_top)
-
-    def wick_low(row):
-        o, c, l = float(row['open']), float(row['close']), float(row['low'])
-        body_bot = min(o, c)
-        return max(0.0, body_bot - l)
-
-    if side == 'sell':
-        idx_max_high = search['high'].astype(float).idxmax()
-        candidate = search.loc[idx_max_high]
-        same_high = search[search['high'].astype(float) == float(candidate['high'])]
-        if len(same_high) > 1:
-            idx = same_high.apply(wick_high, axis=1).astype(float).idxmax()
-            anchor = same_high.loc[idx]
-        else:
-            anchor = candidate
-
-        high_anchor = float(anchor['high'])
-        # eff_pct hybride
-        eff_pct = max(pct, (atr_k * last_atr) / high_anchor if high_anchor > 0 else pct)
-        return high_anchor * (1.0 + eff_pct)
-
-    else:  # side == 'buy'
-        idx_min_low = search['low'].astype(float).idxmin()
-        candidate = search.loc[idx_min_low]
-        same_low = search[search['low'].astype(float) == float(candidate['low'])]
-        if len(same_low) > 1:
-            idx = same_low.apply(wick_low, axis=1).astype(float).idxmax()
-            anchor = same_low.loc[idx]
-        else:
-            anchor = candidate
-
-        low_anchor = float(anchor['low'])
-        eff_pct = max(pct, (atr_k * last_atr) / low_anchor if low_anchor > 0 else pct)
-        return low_anchor * (1.0 - eff_pct)
-
 def _is_valid_reaction(df: pd.DataFrame, i: int, direction: str) -> bool:
     """
     Valide la 'bougie de réaction' selon le preset Balanced, pour LONG et SHORT.
@@ -2116,7 +2038,23 @@ def get_account_balance_usdt(ex=None) -> Optional[float]:
     except Exception as e:
         print(f"Erreur get_account_balance_usdt: {e}")
         return None
-        
+
+def clear_balance_cache():
+    """
+    Invalide le cache du solde USDT stocké en DB.
+    
+    Appelé après:
+    - Ouverture position (capital utilisé)
+    - Fermeture position (capital libéré)
+    - Pyramiding (ajout capital)
+    - Partial exit (récupération partielle capital)
+    
+    Force un recalcul frais lors du prochain appel à get_account_balance_usdt().
+    """
+    try:
+        database.set_setting('CURRENT_BALANCE_USDT', '0.0')
+    except Exception:
+        pass        
 
 def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, quantity: float, entry_px: float) -> None:
     """
@@ -3047,7 +2985,6 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
     return float(raw_sl)
 
 
-
 def _update_signal_state(
     symbol: str,
     timeframe: str,
@@ -3058,31 +2995,29 @@ def _update_signal_state(
     tp: Optional[float] = None,
     sl: Optional[float] = None,
 ) -> None:
-    """Met à jour l’état d’un signal déjà persisté via record_signal_from_trader()."""
+    """Met à jour l'état d'un signal déjà persisté."""
     try:
         ts_sig = int(signal.get("ts", 0) or 0)
         if ts_sig <= 0:
             return
-        meta: Dict[str, Any] = {}
-        if tp is not None:
-            meta["tp"] = float(tp)
-        if sl is not None:
-            meta["sl"] = float(sl)
-        if reason:
-            meta["reason"] = str(reason)
-
-        record_signal_from_trader(
-            symbol=symbol,
-            side=(signal.get("side") or "-"),
-            timeframe=timeframe,
-            ts=ts_sig,
-            price=float(entry_price),
-            rr=float(signal.get("rr", 0.0)),
-            regime=str(signal.get("regime", "-")),
-            pattern="AUTO",
-            status=state,
-            meta=meta,
-        )
+        
+        # ✅ CORRECTION: Utiliser database.insert_signal() au lieu de record_signal_from_trader()
+        try:
+            database.insert_signal(
+                symbol=symbol,
+                side=signal.get("side", "-"),
+                timeframe=timeframe,
+                ts=ts_sig,
+                regime=str(signal.get("regime", "-")),
+                entry=float(entry_price),
+                sl=float(sl or signal.get("sl", 0.0)),
+                tp=float(tp or signal.get("tp", 0.0)),
+                rr=float(signal.get("rr", 0.0)),
+                state=state
+            )
+        except Exception:
+            pass
+        
     except Exception:
         pass
         
