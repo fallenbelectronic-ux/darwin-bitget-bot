@@ -3543,27 +3543,31 @@ def _find_last_swing_anchor(df: pd.DataFrame, is_long: bool, max_lookback: int =
 
 
 def manage_open_positions(ex: ccxt.Exchange):
-    """TP dynamique (tendance→BB80 opposée ; CT→BB20 up/lo) + Break-Even + Trailing live après BE.
-    Règles BE:
-      • Tendance: BE autorisé UNIQUEMENT si stratégie SPLIT.
-      • CT: BE autorisé même sans SPLIT.
-      • Déclencheur BE: franchissement OU contact de la BB20_mid.
-      • Prix BE: entry ajusté frais/buffer via compute_fee_safe_be_price().
-    Trailing (MIS À JOUR):
-      • Actif dès que le BE est armé (ou que le SL est déjà au-delà du BE).
-      • Fonctionne comme un trailing-stop d’exchange: distance = max(%, k*ATR) autour du prix courant.
-      • Paramètres configurables via la DB:
-          - TRAIL_PCT (def 0.0035)
-          - TRAIL_ATR_K (def 1.0)
-          - TRAIL_MIN_MOVE_PCT   (def 0.001)
-          - TRAIL_MIN_MOVE_ATR_K (def 0.25)
-      • Ne recule jamais le SL ; mise à jour live à chaque boucle.
-      • Conserve le TP (les deux coexistent).
-      • Si override manuel et FOLLOW_MANUAL_SL_WITH_TRAILING=false, on n’y touche pas.
+    """
+    Gestion avancée des positions ouvertes avec système TRAILING STOP PRO.
+    
+    SUPPORTE MAINTENANT LES TRADES MANUELS (importés depuis exchange).
+    
+    SYSTÈME À 3 NIVEAUX :
+    
+    1. BE DYNAMIQUE (Contact BB20_mid)
+       - SL → BE avec protection swing low/high
+    
+    2. TRAILING PAR PALIERS (Progression vers TP)
+       - 25% → SL à Entry + 10% profit
+       - 50% → SL à Entry + 35% profit  
+       - 75% → SL à Entry + 60% profit
+    
+    3. TRAILING FINAL SERRÉ (>90% du TP)
+       - Distance = 0.5x ATR (très serré)
+       - Maximise les profits près du TP
+    
+    + TP dynamique (BB80 pour Tendance, BB20 pour CT)
+    + Fonctionne sur trades bot ET trades manuels
     """
     _ensure_bitget_mix_options(ex)
 
-    # Sync (optionnel) avant gestion
+    # Sync optionnelle
     try:
         need_sync = str(database.get_setting('SYNC_BEFORE_MANAGE', 'true')).lower() == 'true'
     except Exception:
@@ -3575,7 +3579,7 @@ def manage_open_positions(ex: ccxt.Exchange):
     if not open_positions:
         return
 
-    # --- Sélection d'un trade ACTIF par symbole (le plus récent) ---
+    # Sélection d'un trade ACTIF par symbole (le plus récent)
     latest_by_symbol: Dict[str, Dict[str, Any]] = {}
     for p in open_positions:
         sym = p.get('symbol')
@@ -3583,24 +3587,19 @@ def manage_open_positions(ex: ccxt.Exchange):
             continue
         try:
             cur_ts = int(p.get('open_timestamp') or 0)
-        except Exception:
-            cur_ts = 0
-        try:
             cur_id = int(p.get('id') or 0)
         except Exception:
-            cur_id = 0
+            cur_ts, cur_id = 0, 0
+        
         ref = latest_by_symbol.get(sym)
         if ref is None:
             latest_by_symbol[sym] = p
         else:
             try:
                 ref_ts = int(ref.get('open_timestamp') or 0)
-            except Exception:
-                ref_ts = 0
-            try:
                 ref_id = int(ref.get('id') or 0)
             except Exception:
-                ref_id = 0
+                ref_ts, ref_id = 0, 0
             if (cur_ts, cur_id) > (ref_ts, ref_id):
                 latest_by_symbol[sym] = p
 
@@ -3633,7 +3632,7 @@ def manage_open_positions(ex: ccxt.Exchange):
     if not open_positions:
         return
 
-    # Carte des positions réelles (pour fermer en DB si plus ouvertes)
+    # Carte des positions réelles
     try:
         symbols = list({p['symbol'] for p in open_positions})
         ex_pos_list = _fetch_positions_safe(ex, symbols)
@@ -3652,7 +3651,7 @@ def manage_open_positions(ex: ccxt.Exchange):
     for pos in open_positions:
         symbol = pos['symbol']
 
-        # Vérification que la position est toujours ouverte côté exchange
+        # Vérifier position toujours ouverte
         try:
             real_qty = float(live_map.get(symbol, 0.0))
             if real_qty <= 0:
@@ -3675,14 +3674,91 @@ def manage_open_positions(ex: ccxt.Exchange):
         is_long = (pos['side'] == 'buy')
         close_side = 'sell' if is_long else 'buy'
 
-        # On ignore les trades d'import legacy
+        # ========================================================================
+        # GESTION DES TRADES MANUELS (IMPORTÉS)
+        # ========================================================================
+        
         regime_raw = pos.get('regime', 'Tendance')
-        if isinstance(regime_raw, str) and regime_raw.lower().startswith('import'):
+        is_manual_trade = isinstance(regime_raw, str) and regime_raw.lower().startswith('import')
+
+        # Setting pour activer trailing sur trades manuels
+        try:
+            enable_trailing_manual = str(database.get_setting('ENABLE_TRAILING_MANUAL', 'true')).lower() == 'true'
+        except Exception:
+            enable_trailing_manual = True  # Activé par défaut
+
+        # Si trade manuel ET trailing désactivé → skip
+        if is_manual_trade and not enable_trailing_manual:
             continue
+
+        # VALIDATION DES DONNÉES pour trades manuels
+        if is_manual_trade:
+            try:
+                entry_check = float(pos.get('entry_price', 0))
+                sl_check = float(pos.get('sl_price', 0))
+                tp_check = float(pos.get('tp_price', 0))
+                
+                if entry_check <= 0:
+                    # Pas de prix d'entrée valide → skip ce trade
+                    print(f"[manage_open_positions] Trade manuel {symbol} ignoré (entry_price invalide)")
+                    continue
+                
+                # Si pas de SL/TP définis, essayer de les récupérer depuis l'exchange
+                if sl_check <= 0 or tp_check <= 0:
+                    try:
+                        tp_ex, sl_ex = _fetch_existing_tp_sl(ex, symbol)
+                        
+                        if tp_ex and tp_check <= 0:
+                            database.update_trade_tp(pos['id'], float(tp_ex))
+                            pos['tp_price'] = float(tp_ex)
+                            print(f"[manage_open_positions] TP récupéré exchange pour {symbol}: {tp_ex}")
+                        
+                        if sl_ex and sl_check <= 0:
+                            try:
+                                database.update_trade_sl(pos['id'], float(sl_ex))
+                            except AttributeError:
+                                database.update_trade_to_breakeven(pos['id'], float(pos['quantity']), float(sl_ex))
+                            pos['sl_price'] = float(sl_ex)
+                            print(f"[manage_open_positions] SL récupéré exchange pour {symbol}: {sl_ex}")
+                    except Exception as e:
+                        print(f"[manage_open_positions] Erreur récupération SL/TP exchange: {e}")
+                
+                # Si toujours pas de TP valide, utiliser un TP par défaut
+                if float(pos.get('tp_price', 0)) <= 0:
+                    try:
+                        default_tp_pct = float(database.get_setting('MANUAL_DEFAULT_TP_PCT', '5.0'))
+                    except Exception:
+                        default_tp_pct = 5.0
+                    
+                    is_long_manual = (pos['side'] == 'buy')
+                    default_tp = entry_check * (1.0 + default_tp_pct/100.0 if is_long_manual else 1.0 - default_tp_pct/100.0)
+                    
+                    database.update_trade_tp(pos['id'], float(default_tp))
+                    pos['tp_price'] = float(default_tp)
+                    
+                    try:
+                        notifier.tg_send(
+                            f"ℹ️ **Trade manuel {symbol}**\n"
+                            f"TP automatique défini à {default_tp:.4f}\n"
+                            f"(Entry {'+' if is_long_manual else '-'} {default_tp_pct}%)"
+                        )
+                    except Exception:
+                        pass
+                    
+                    print(f"[manage_open_positions] TP par défaut créé pour {symbol}: {default_tp}")
+            
+            except Exception as e:
+                # Données incomplètes/corrompues → skip ce trade
+                print(f"[manage_open_positions] Trade manuel {symbol} ignoré (erreur validation): {e}")
+                continue
+
+        # ========================================================================
+        # FIN GESTION TRADES MANUELS
+        # ========================================================================
 
         common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
 
-        # Contexte marge / levier
+        # Contexte marge/levier
         try:
             ex.set_leverage(LEVERAGE, symbol)
             try:
@@ -3722,118 +3798,151 @@ def manage_open_positions(ex: ccxt.Exchange):
         if df is None or len(df) < 2:
             continue
 
-        last      = df.iloc[-1]
+        last = df.iloc[-1]
         last_close = float(last['close'])
-        bb20_mid   = float(last['bb20_mid'])
-        bb20_up    = float(last['bb20_up'])
-        bb20_lo    = float(last['bb20_lo'])
-        bb80_up    = float(last['bb80_up'])
-        bb80_lo    = float(last['bb80_lo'])
-        last_atr   = float(last.get('atr', 0.0))
+        bb20_mid = float(last['bb20_mid'])
+        bb20_up = float(last['bb20_up'])
+        bb20_lo = float(last['bb20_lo'])
+        bb80_up = float(last['bb80_up'])
+        bb80_lo = float(last['bb80_lo'])
+        last_atr = float(last.get('atr', 0.0))
 
-        # ---------- TP dynamique ----------
-        try:
-            regime = pos.get('regime', 'Tendance')
-            offset_pct = get_tp_offset_pct()
+        # ---------- TP DYNAMIQUE ----------
+        # Ne s'applique PAS aux trades manuels (ils gardent leur TP fixe)
+        if not is_manual_trade:
             try:
-                tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
-            except Exception:
-                tp_atr_k = 0.50
-            try:
-                tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', 0.0005))
-            except Exception:
-                tp_update_eps = 0.0005
-
-            if regime == 'Tendance':
-                ref = bb80_up if is_long else bb80_lo
-            else:
-                ref = bb20_up if is_long else bb20_lo
-
-            eff_pct = max(offset_pct, (tp_atr_k * last_atr) / ref if ref > 0 else offset_pct)
-            target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
-
-            current_tp = float(pos['tp_price'])
-            improve = (is_long and (target_tp < current_tp * (1.0 - tp_update_eps))) or \
-                      ((not is_long) and (target_tp > current_tp * (1.0 + tp_update_eps)))
-
-            if improve:
+                regime = pos.get('regime', 'Tendance')
+                offset_pct = get_tp_offset_pct()
                 try:
-                    tkr = ex.fetch_ticker(symbol) or {}
-                    last_px = float(tkr.get('last') or tkr.get('close') or pos['entry_price'])
+                    tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
                 except Exception:
-                    last_px = float(pos['entry_price'])
+                    tp_atr_k = 0.50
                 try:
-                    gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
+                    tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', 0.0005))
                 except Exception:
-                    gap_pct = 0.0003
+                    tp_update_eps = 0.0005
 
-                sl_price = float(pos.get('sl_price') or pos['entry_price'])
-                if is_long and sl_price >= last_px:
-                    sl_price = last_px * (1.0 - gap_pct)
-                if (not is_long) and sl_price <= last_px:
-                    sl_price = last_px * (1.0 + gap_pct)
+                if regime == 'Tendance':
+                    ref = bb80_up if is_long else bb80_lo
+                else:
+                    ref = bb20_up if is_long else bb20_lo
 
-                try:
-                    side_for_tp = ('buy' if is_long else 'sell')
-                    target_tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(target_tp))
-                except Exception:
-                    if is_long and target_tp <= last_px:
-                        target_tp = last_px * (1.0 + gap_pct)
-                    if (not is_long) and target_tp >= last_px:
-                        target_tp = last_px * (1.0 - gap_pct)
+                eff_pct = max(offset_pct, (tp_atr_k * last_atr) / ref if ref > 0 else offset_pct)
+                target_tp = (ref * (1.0 - eff_pct)) if is_long else (ref * (1.0 + eff_pct))
 
-                qty = float(pos['quantity'])
-                try:
-                    qty = float(ex.amount_to_precision(symbol, qty))
-                    target_tp = float(ex.price_to_precision(symbol, target_tp))
-                    sl_price  = float(ex.price_to_precision(symbol, sl_price))
-                except Exception:
-                    pass
+                current_tp = float(pos['tp_price'])
+                improve = (is_long and (target_tp < current_tp * (1.0 - tp_update_eps))) or \
+                          ((not is_long) and (target_tp > current_tp * (1.0 + tp_update_eps)))
 
-                if qty > 0:
-                    mark_now_tp = _current_mark_price(ex, symbol)
-                    sl_price = _validate_sl_for_side(
-                        ('buy' if is_long else 'sell'),
-                        float(sl_price),
-                        mark_now_tp,
-                        tick_size
-                    )
-
-                    ex.create_order(
-                        symbol,
-                        'market',
-                        close_side,
-                        qty,
-                        price=None,
-                        params={**common_params, 'stopLossPrice': float(sl_price), 'triggerType': 'mark'}
-                    )
-                    ex.create_order(
-                        symbol,
-                        'market',
-                        close_side,
-                        qty,
-                        price=None,
-                        params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'}
-                    )
+                if improve:
                     try:
-                        database.update_trade_tp(pos['id'], float(target_tp))
+                        tkr = ex.fetch_ticker(symbol) or {}
+                        last_px = float(tkr.get('last') or tkr.get('close') or pos['entry_price'])
+                    except Exception:
+                        last_px = float(pos['entry_price'])
+                    try:
+                        gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
+                    except Exception:
+                        gap_pct = 0.0003
+
+                    sl_price = float(pos.get('sl_price') or pos['entry_price'])
+                    if is_long and sl_price >= last_px:
+                        sl_price = last_px * (1.0 - gap_pct)
+                    if (not is_long) and sl_price <= last_px:
+                        sl_price = last_px * (1.0 + gap_pct)
+
+                    try:
+                        side_for_tp = ('buy' if is_long else 'sell')
+                        target_tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(target_tp))
+                    except Exception:
+                        if is_long and target_tp <= last_px:
+                            target_tp = last_px * (1.0 + gap_pct)
+                        if (not is_long) and target_tp >= last_px:
+                            target_tp = last_px * (1.0 - gap_pct)
+
+                    qty = float(pos['quantity'])
+                    try:
+                        qty = float(ex.amount_to_precision(symbol, qty))
+                        target_tp = float(ex.price_to_precision(symbol, target_tp))
+                        sl_price = float(ex.price_to_precision(symbol, sl_price))
                     except Exception:
                         pass
-        except Exception as e:
-            print(f"Erreur TP dynamique {symbol}: {e}")
 
-        # ---------- Break-Even & Trailing ----------
+                    if qty > 0:
+                        mark_now_tp = _current_mark_price(ex, symbol)
+                        sl_price = _validate_sl_for_side(
+                            ('buy' if is_long else 'sell'),
+                            float(sl_price),
+                            mark_now_tp,
+                            tick_size
+                        )
+
+                        ex.create_order(
+                            symbol, 'market', close_side, qty, price=None,
+                            params={**common_params, 'stopLossPrice': float(sl_price), 'triggerType': 'mark'}
+                        )
+                        ex.create_order(
+                            symbol, 'market', close_side, qty, price=None,
+                            params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'}
+                        )
+                        try:
+                            database.update_trade_tp(pos['id'], float(target_tp))
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"Erreur TP dynamique {symbol}: {e}")
+
+        # ---------- TRAILING STOP PRO (3 NIVEAUX) ----------
+        # S'APPLIQUE AUX TRADES BOT ET MANUELS
+        
         if skip_sl_updates:
             continue
 
-        strategy_mode = str(database.get_setting('STRATEGY_MODE', 'NORMAL')).upper()
-        regime = pos.get('regime', 'Tendance')
-        be_allowed = False
-        if regime == 'Tendance':
-            be_allowed = (strategy_mode == 'SPLIT')
-        else:
-            be_allowed = True
+        # Récupérer les prix
+        entry_price = float(pos['entry_price'])
+        tp_price = float(pos['tp_price'])
+        sl_current = float(pos.get('sl_price') or pos['entry_price'])
+        
+        try:
+            qty = float(ex.amount_to_precision(symbol, float(pos['quantity'])))
+        except Exception:
+            qty = float(pos['quantity'])
 
+        if qty <= 0:
+            continue
+
+        # Prix actuel (mark)
+        try:
+            mark_now = _current_mark_price(ex, symbol)
+        except Exception:
+            mark_now = last_close
+
+        # Calculer progression vers TP (0.0 → 1.0)
+        if is_long:
+            if tp_price <= entry_price:
+                progress = 0.0
+            elif mark_now <= entry_price:
+                progress = 0.0
+            elif mark_now >= tp_price:
+                progress = 1.0
+            else:
+                progress = (mark_now - entry_price) / (tp_price - entry_price)
+        else:
+            if tp_price >= entry_price:
+                progress = 0.0
+            elif mark_now >= entry_price:
+                progress = 0.0
+            elif mark_now <= tp_price:
+                progress = 1.0
+            else:
+                progress = (entry_price - mark_now) / (entry_price - tp_price)
+
+        progress = max(0.0, min(1.0, progress))
+
+        # ========================================================================
+        # NIVEAU 1 : BE DYNAMIQUE (Contact BB20_mid)
+        # ========================================================================
+        
         be_trigger = False
         try:
             try:
@@ -3875,6 +3984,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if (not is_long) and last_close <= bb20_mid:
                     be_trigger = True
 
+        # BE avec protection swing
         try:
             be_price_theo = compute_fee_safe_be_price(
                 entry=float(pos['entry_price']),
@@ -3888,20 +3998,13 @@ def manage_open_positions(ex: ccxt.Exchange):
         except Exception:
             be_price_theo = float(pos['entry_price'])
 
-        sl_current = float(pos.get('sl_price') or pos['entry_price'])
         try:
             prev_be_status = str(pos.get('breakeven_status', '')).upper()
         except Exception:
             prev_be_status = ''
         be_armed = (prev_be_status == 'ACTIVE')
 
-        try:
-            qty = float(ex.amount_to_precision(symbol, float(pos['quantity'])))
-        except Exception:
-            qty = float(pos['quantity'])
-
-        # ----------- BE basé sur swing + offset SL ----------
-        if be_allowed and be_trigger and qty > 0:
+        if be_trigger and not be_armed and qty > 0:
             swing_anchor = _find_last_swing_anchor(df, is_long, max_lookback=15)
 
             want_sl_from_swing = None
@@ -3929,7 +4032,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 try:
                     mark_now_be = _current_mark_price(ex, symbol)
                 except Exception:
-                    mark_now_be = None
+                    mark_now_be = mark_now
 
                 want_sl = _validate_sl_for_side(
                     ('buy' if is_long else 'sell'),
@@ -3943,11 +4046,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                     pass
 
                 ex.create_order(
-                    symbol,
-                    'market',
-                    close_side,
-                    qty,
-                    price=None,
+                    symbol, 'market', close_side, qty, price=None,
                     params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
                 )
                 try:
@@ -3955,19 +4054,11 @@ def manage_open_positions(ex: ccxt.Exchange):
                     sl_current = float(want_sl)
                     be_armed = True
 
-                    # Notification BE la première fois
                     if prev_be_status != 'ACTIVE':
                         try:
                             remaining_qty = float(qty)
                             entry_price_be = float(pos.get('entry_price') or 0.0)
-
                             curr = mark_now_be
-                            if curr is None:
-                                try:
-                                    curr = _current_mark_price(ex, symbol)
-                                except Exception:
-                                    curr = None
-
                             if curr is None or entry_price_be <= 0 or remaining_qty <= 0:
                                 pnl_realised = 0.0
                             else:
@@ -3975,76 +4066,140 @@ def manage_open_positions(ex: ccxt.Exchange):
                                     pnl_realised = max(0.0, (curr - entry_price_be) * remaining_qty)
                                 else:
                                     pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
-
-                            notifier.send_breakeven_notification(
-                                symbol=symbol,
-                                pnl_realised=float(pnl_realised),
-                                remaining_qty=float(remaining_qty)
-                            )
+                            
+                            # Notification différenciée pour trades manuels
+                            if is_manual_trade:
+                                notifier.tg_send(
+                                    f"🔵 **Trade Manuel → BE Activé**\n\n"
+                                    f"📊 {symbol} {pos['side'].upper()}\n"
+                                    f"💰 PnL sécurisé : {pnl_realised:.2f} USDT\n"
+                                    f"🛡️ SL déplacé au Break-Even"
+                                )
+                            else:
+                                notifier.send_breakeven_notification(
+                                    symbol=symbol,
+                                    pnl_realised=float(pnl_realised),
+                                    remaining_qty=float(remaining_qty)
+                                )
                         except Exception:
                             pass
                 except Exception:
                     pass
 
-        # ----------- Trailing live après BE (style trailing-stop exchange) ----------
+        # ========================================================================
+        # NIVEAU 2 : TRAILING PAR PALIERS
+        # ========================================================================
+        
         if be_armed or ((is_long and sl_current >= be_price_theo) or ((not is_long) and sl_current <= be_price_theo)):
+            
+            # Paramètres des paliers
             try:
-                min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
+                use_stepped = str(database.get_setting('TRAIL_USE_STEPPED', 'true')).lower() == 'true'
             except Exception:
-                min_move_pct = 0.001
+                use_stepped = True
+            
+            if use_stepped and progress < 0.90:
+                # Paliers de trailing
+                paliers = [
+                    (0.25, 0.10),  # 25% du chemin → protège 10% du profit
+                    (0.50, 0.35),  # 50% → protège 35%
+                    (0.75, 0.60),  # 75% → protège 60%
+                ]
+                
+                profit_total = tp_price - entry_price if is_long else entry_price - tp_price
+                
+                for threshold, protect_ratio in paliers:
+                    if progress >= threshold:
+                        # SL cible = Entry + (protect_ratio * profit_total)
+                        if is_long:
+                            target_sl = entry_price + (protect_ratio * profit_total)
+                        else:
+                            target_sl = entry_price - (protect_ratio * profit_total)
+                        
+                        # Appliquer seulement si amélioration
+                        improve = (is_long and target_sl > sl_current) or ((not is_long) and target_sl < sl_current)
+                        
+                        if improve:
+                            target_sl = _validate_sl_for_side(
+                                ('buy' if is_long else 'sell'),
+                                float(target_sl),
+                                mark_now,
+                                tick_size
+                            )
+                            try:
+                                target_sl = float(ex.price_to_precision(symbol, target_sl))
+                            except Exception:
+                                pass
+                            
+                            ex.create_order(
+                                symbol, 'market', close_side, qty, price=None,
+                                params={**common_params, 'stopLossPrice': float(target_sl), 'triggerType': 'mark'}
+                            )
+                            try:
+                                database.update_trade_sl(pos['id'], float(target_sl))
+                                sl_current = float(target_sl)
+                                pos['sl_price'] = float(target_sl)
+                            except Exception:
+                                pass
+                            break  # Un seul palier à la fois
+        
+        # ========================================================================
+        # NIVEAU 3 : TRAILING FINAL SERRÉ (>90% du TP)
+        # ========================================================================
+        
+        if progress >= 0.90:
             try:
-                min_move_atr_k = float(database.get_setting('TRAIL_MIN_MOVE_ATR_K', 0.25))
-            except Exception:
-                min_move_atr_k = 0.25
-
-            mark_now = _current_mark_price(ex, symbol)
-            if not mark_now or mark_now <= 0:
-                continue
-
-            # SL "idéal" à distance max(d%, k*ATR) du prix courant
-            try:
-                want_sl = _compute_trailing_sl(mark_now, ('buy' if is_long else 'sell'), last_atr)
-            except Exception:
-                continue
-
-            # Ne jamais reculer le SL
-            if is_long and want_sl <= sl_current:
-                continue
-            if (not is_long) and want_sl >= sl_current:
-                continue
-
-            # Mouvement minimum requis (en prix absolu) pour limiter le spam d'ordres
-            min_move_abs = max(min_move_pct * mark_now, min_move_atr_k * last_atr, tick_size)
-            if abs(want_sl - sl_current) < min_move_abs:
-                continue
-
-            want_sl = _validate_sl_for_side(
-                ('buy' if is_long else 'sell'),
-                float(want_sl),
-                mark_now,
-                tick_size
-            )
-            try:
-                want_sl = float(ex.price_to_precision(symbol, want_sl))
-            except Exception:
-                pass
-
-            ex.create_order(
-                symbol,
-                'market',
-                close_side,
-                qty,
-                price=None,
-                params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
-            )
-            try:
-                database.update_trade_sl(pos['id'], float(want_sl))
-                pos['sl_price'] = float(want_sl)
-                pos['breakeven_status'] = 'ACTIVE'
-            except Exception:
-                pass
-
-
+                # Distance très serrée : 0.5x ATR
+                try:
+                    final_atr_k = float(database.get_setting('TRAIL_FINAL_ATR_K', 0.5))
+                except Exception:
+                    final_atr_k = 0.5
+                
+                # SL idéal à distance réduite
+                if is_long:
+                    want_sl = mark_now - (final_atr_k * last_atr)
+                else:
+                    want_sl = mark_now + (final_atr_k * last_atr)
+                
+                # Ne jamais reculer le SL
+                if is_long and want_sl <= sl_current:
+                    continue
+                if (not is_long) and want_sl >= sl_current:
+                    continue
+                
+                # Mouvement minimum pour limiter spam
+                try:
+                    min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
+                except Exception:
+                    min_move_pct = 0.001
+                
+                min_move_abs = max(min_move_pct * mark_now, tick_size)
+                if abs(want_sl - sl_current) < min_move_abs:
+                    continue
+                
+                want_sl = _validate_sl_for_side(
+                    ('buy' if is_long else 'sell'),
+                    float(want_sl),
+                    mark_now,
+                    tick_size
+                )
+                try:
+                    want_sl = float(ex.price_to_precision(symbol, want_sl))
+                except Exception:
+                    pass
+                
+                ex.create_order(
+                    symbol, 'market', close_side, qty, price=None,
+                    params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
+                )
+                try:
+                    database.update_trade_sl(pos['id'], float(want_sl))
+                    pos['sl_price'] = float(want_sl)
+                    pos['breakeven_status'] = 'ACTIVE'
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Erreur trailing final {symbol}: {e}")
 
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
