@@ -2984,7 +2984,6 @@ def adjust_sl_for_offset(raw_sl: float, side: str, atr: float = 0.0, ref_price: 
         return float(raw_sl) * (1.0 + eff_pct)
     return float(raw_sl)
 
-
 def _update_signal_state(
     symbol: str,
     timeframe: str,
@@ -3020,6 +3019,7 @@ def _update_signal_state(
         
     except Exception:
         pass
+
         
 def _is_reaction_candle(row: pd.Series, is_long: bool) -> bool:
     """
