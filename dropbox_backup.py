@@ -150,8 +150,23 @@ def export_summary_from_db(db_path, output_file):
         
         if not profit_col:
             print(f"   ⚠️ Colonnes disponibles : {', '.join(columns)}")
-            print("   ⚠️ Aucune colonne profit trouvée, utilise 0")
-            profit_col = "0 as profit"  # Fallback
+            print("   ⚠️ Aucune colonne profit trouvée")
+            conn.close()
+            # Créer un résumé minimal sans stats de profit
+            report = f"""
+╔══════════════════════════════════════════════════════════════╗
+║         RAPPORT DARWIN BOT - {datetime.now().strftime('%Y-%m-%d %H:%M')}          ║
+╚══════════════════════════════════════════════════════════════╝
+
+⚠️ Statistiques de profit non disponibles
+   Colonnes détectées : {', '.join(columns)}
+
+═══════════════════════════════════════════════════════════════
+"""
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(report)
+            print(f"   ✅ Résumé créé (minimal)")
+            return True
         
         # 3. Stats globales
         query = f"""
@@ -168,9 +183,14 @@ def export_summary_from_db(db_path, output_file):
         
         cursor.execute(query)
         row = cursor.fetchone()
-        total, wins, total_profit, avg_profit, best, worst = row or (0,0,0,0,0,0)
+        total = row[0] or 0
+        wins = row[1] or 0
+        total_profit = row[2] or 0.0
+        avg_profit = row[3] or 0.0
+        best = row[4] or 0.0
+        worst = row[5] or 0.0
         
-        winrate = (wins / total * 100) if total > 0 else 0
+        winrate = (wins / total * 100) if total > 0 else 0.0
         
         # 4. Stats 30 jours
         cutoff_30d = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
@@ -185,7 +205,9 @@ def export_summary_from_db(db_path, output_file):
         """
         
         cursor.execute(query_30d, (cutoff_30d,))
-        total_30d, profit_30d = cursor.fetchone() or (0, 0)
+        row_30d = cursor.fetchone()
+        total_30d = row_30d[0] or 0
+        profit_30d = row_30d[1] or 0.0
         
         # 5. Positions ouvertes
         cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
@@ -193,40 +215,56 @@ def export_summary_from_db(db_path, output_file):
         
         conn.close()
         
-        # 6. Générer rapport
-        report = f"""
+        # 6. Générer rapport (CORRIGÉ - pas de f-string imbriqué)
+        profit_per_trade_30d = (profit_30d / total_30d) if total_30d > 0 else 0.0
+        
+        report = """
 ╔══════════════════════════════════════════════════════════════╗
-║         RAPPORT DARWIN BOT - {datetime.now().strftime('%Y-%m-%d %H:%M')}          ║
+║         RAPPORT DARWIN BOT - %s          ║
 ╚══════════════════════════════════════════════════════════════╝
 
 📊 STATISTIQUES GLOBALES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Total Trades         : {total}
-Positions Ouvertes   : {open_pos}
+Total Trades         : %d
+Positions Ouvertes   : %d
 
-Wins                 : {wins}
-Winrate              : {winrate:.2f}%
+Wins                 : %d
+Winrate              : %.2f%%
 
-Profit Total         : {total_profit:.2f} USDT
-Profit Moyen         : {avg_profit:.2f} USDT
-Meilleur Trade       : {best:.2f} USDT
-Pire Trade           : {worst:.2f} USDT
+Profit Total         : %.2f USDT
+Profit Moyen         : %.2f USDT
+Meilleur Trade       : %.2f USDT
+Pire Trade           : %.2f USDT
 
 
 📈 PERFORMANCE 30 DERNIERS JOURS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Trades               : {total_30d}
-Profit               : {profit_30d:.2f} USDT
-Profit par trade     : {(profit_30d / total_30d if total_30d > 0 else 0):.2f} USDT
+Trades               : %d
+Profit               : %.2f USDT
+Profit par trade     : %.2f USDT
 
 
 ═══════════════════════════════════════════════════════════════
 📦 Backup créé automatiquement
-🔗 Téléchargez depuis : https://www.dropbox.com/home{DROPBOX_FOLDER}
+🔗 Téléchargez depuis : https://www.dropbox.com/home%s
 ═══════════════════════════════════════════════════════════════
-"""
+""" % (
+            datetime.now().strftime('%Y-%m-%d %H:%M'),
+            total,
+            open_pos,
+            wins,
+            winrate,
+            total_profit,
+            avg_profit,
+            best,
+            worst,
+            total_30d,
+            profit_30d,
+            profit_per_trade_30d,
+            DROPBOX_FOLDER
+        )
         
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(report)
