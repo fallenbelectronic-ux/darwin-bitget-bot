@@ -2097,91 +2097,79 @@ def record_signal_from_trader(
 # ==============================================================================
 # LOGIQUE D'EXÉCUTION (Améliorée)
 # ==============================================================================
-# Cache global pour éviter trop d'appels API
+
+        
+# Cache global pour la balance (évite les appels API excessifs)
 _BALANCE_CACHE = {
     'value': None,
-    'timestamp': 0,
-    'ttl': 10  # secondes
+    'timestamp': 0
 }
 
-def get_account_balance_usdt(ex=None, force_refresh: bool = False) -> Optional[float]:
+def get_account_balance_usdt(ex=None, force_refresh: bool = False, cache_duration: int = 10) -> Optional[float]:
     """
     Retourne le solde total en USDT (et le met en cache dans settings.CURRENT_BALANCE_USDT).
     Supporte Bybit/Bitget via ccxt.fetchBalance().
     
-    AMÉLIORATIONS :
-    - Cache 10 secondes pour éviter rate limit
-    - Retry 3x avec backoff
-    - Paramètres spécifiques Bitget
-    - Logs détaillés
-    
     Args:
-        ex: Exchange ccxt (créé automatiquement si None)
-        force_refresh: Forcer la récupération (ignorer cache)
+        ex: Exchange ccxt (si None, créé via create_exchange())
+        force_refresh: Force un appel API même si cache valide
+        cache_duration: Durée du cache en secondes (défaut 10s)
     
     Returns:
-        Solde USDT total ou None si erreur
+        float: Solde USDT disponible, ou None en cas d'échec
     """
+    import time
+    
     global _BALANCE_CACHE
     
-    # Vérifier cache
+    # Vérifier cache (évite les appels API excessifs)
     if not force_refresh:
-        now = time.time()
-        if _BALANCE_CACHE['value'] is not None and (now - _BALANCE_CACHE['timestamp']) < _BALANCE_CACHE['ttl']:
+        cache_age = time.time() - _BALANCE_CACHE['timestamp']
+        if cache_age < cache_duration and _BALANCE_CACHE['value'] is not None:
+            print(f"[Balance] Utilisation cache ({cache_age:.1f}s) : {_BALANCE_CACHE['value']} USDT")
             return _BALANCE_CACHE['value']
     
     try:
+        # Créer exchange si nécessaire
         if ex is None and hasattr(globals(), "create_exchange"):
             ex = create_exchange()
         if ex is None:
-            return None
+            print("[Balance] ❌ Exchange non disponible")
+            return _BALANCE_CACHE.get('value')  # Retourner cache si disponible
         
-        # Tentatives avec retry
+        # Retry avec backoff
         max_retries = 3
-        backoff_delays = [1, 2, 5]
+        retry_delays = [1, 2, 5]  # secondes
         
         for attempt in range(max_retries):
             try:
-                # Détecter type exchange
-                exchange_id = ex.id.lower() if hasattr(ex, 'id') else 'unknown'
+                # CRITIQUE : Ajouter params spécifiques Bitget
+                params = {'type': 'swap'}  # Obligatoire pour Bitget
                 
-                # Params spécifiques selon exchange
-                if 'bitget' in exchange_id:
-                    # Bitget : essayer AVEC params puis SANS
-                    try:
-                        bal = ex.fetch_balance({
-                            'type': 'swap',
-                            'marginCoin': 'USDT'
-                        })
-                    except Exception as e:
-                        print(f"[Balance] Bitget avec params échoué : {e}")
-                        # Fallback sans params
-                        bal = ex.fetch_balance({'type': 'swap'})
+                bal = ex.fetch_balance(params=params)
                 
-                elif 'bybit' in exchange_id:
-                    bal = ex.fetch_balance({'type': 'swap'})
+                if bal is None:
+                    raise ValueError("fetch_balance() a retourné None")
                 
-                else:
-                    # Exchange générique
-                    bal = ex.fetch_balance()
-                
-                # Extraction solde (votre logique existante améliorée)
                 total = None
                 
-                # Méthode 1 : Clés USDT classiques
+                # Méthode 1 : Essais robustes sur clés standard
                 for key in ("USDT", "usdT", "usdt"):
                     try:
                         wallet = bal.get(key) or {}
                         total = wallet.get("total") or wallet.get("free") or wallet.get("used")
                         if total is not None:
                             total = float(total)
+                            print(f"[Balance] ✅ Méthode 1 ({key}) : {total} USDT")
                             break
-                    except Exception:
+                    except Exception as e:
                         continue
                 
-                # Méthode 2 : Bybit v5 (votre code existant)
+                # Méthode 2 : Bitget/Bybit dérivés via 'info'
                 if total is None:
                     info = bal.get("info") or {}
+                    
+                    # Bybit v5: result.list
                     try:
                         if isinstance(info, dict) and "result" in info:
                             result = info["result"]
@@ -2189,113 +2177,101 @@ def get_account_balance_usdt(ex=None, force_refresh: bool = False) -> Optional[f
                                 for acc in result["list"]:
                                     if str(acc.get("coin", "")).upper() == "USDT":
                                         total = float(acc.get("walletBalance", 0))
+                                        print(f"[Balance] ✅ Méthode 2 (Bybit) : {total} USDT")
                                         break
-                    except Exception:
-                        pass
-                
-                # Méthode 3 : Bitget data list (votre code existant amélioré)
-                if total is None:
-                    try:
-                        info = bal.get("info") or {}
-                        data = info.get("data") if isinstance(info, dict) else None
-                        
-                        if isinstance(data, list):
-                            for acc in data:
-                                if str(acc.get("marginCoin", "")).upper() == "USDT":
-                                    available = float(acc.get("available", 0))
-                                    frozen = float(acc.get("frozen", 0))
-                                    locked = float(acc.get("locked", 0))
-                                    total = available + frozen + locked
-                                    break
-                        
-                        # Bitget format alternatif (dict direct)
-                        elif isinstance(data, dict):
-                            if str(data.get("marginCoin", "")).upper() == "USDT":
-                                available = float(data.get("available", 0))
-                                frozen = float(data.get("frozen", 0))
-                                locked = float(data.get("locked", 0))
-                                total = available + frozen + locked
-                    
                     except Exception as e:
-                        print(f"[Balance] Erreur extraction Bitget : {e}")
-                
-                # Méthode 4 : Bitget via 'available' direct dans info
-                if total is None:
-                    try:
-                        info = bal.get("info") or {}
-                        if isinstance(info, dict):
-                            available = info.get("available", info.get("availableBalance"))
-                            if available is not None:
-                                total = float(available)
-                    except Exception:
                         pass
+                    
+                    # Bitget: data list
+                    if total is None:
+                        try:
+                            data = info.get("data") if isinstance(info, dict) else None
+                            if isinstance(data, list):
+                                for acc in data:
+                                    if str(acc.get("marginCoin", "")).upper() == "USDT":
+                                        available = float(acc.get("available", 0))
+                                        frozen = float(acc.get("frozen", 0))
+                                        total = available + frozen
+                                        print(f"[Balance] ✅ Méthode 2 (Bitget) : {total} USDT (available={available}, frozen={frozen})")
+                                        break
+                        except Exception as e:
+                            pass
+                    
+                    # Bitget: info direct (alternative)
+                    if total is None and isinstance(info, dict):
+                        try:
+                            # Certaines versions Bitget retournent directement
+                            if "availableBalance" in info:
+                                total = float(info["availableBalance"])
+                                print(f"[Balance] ✅ Méthode 3 (Bitget direct) : {total} USDT")
+                            elif "equity" in info:
+                                total = float(info["equity"])
+                                print(f"[Balance] ✅ Méthode 3 (equity) : {total} USDT")
+                        except Exception as e:
+                            pass
                 
-                # Valider résultat
+                # Si toujours None, échec
                 if total is None:
-                    raise ValueError("Solde USDT non trouvé dans la réponse")
+                    print(f"[Balance] ⚠️ Tentative {attempt + 1}/{max_retries} : Structure balance inconnue")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delays[attempt])
+                        continue
+                    else:
+                        print(f"[Balance] ❌ Échec après {max_retries} tentatives")
+                        return _BALANCE_CACHE.get('value')  # Retourner cache si disponible
                 
+                # Succès : mettre à jour cache et DB
                 total = float(total)
-                
-                # Mise à jour cache et DB
                 _BALANCE_CACHE['value'] = total
                 _BALANCE_CACHE['timestamp'] = time.time()
                 
                 try:
                     database.set_setting('CURRENT_BALANCE_USDT', f"{total:.6f}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[Balance] ⚠️ Échec sauvegarde DB : {e}")
                 
                 return total
-            
-            except ccxt.RateLimitExceeded as e:
-                if attempt < max_retries - 1:
-                    delay = backoff_delays[attempt]
-                    print(f"[Balance] Rate limit, retry dans {delay}s...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"[Balance] Rate limit persistant après {max_retries} tentatives")
-                    # Retourner cache si disponible
-                    if _BALANCE_CACHE['value'] is not None:
-                        return _BALANCE_CACHE['value']
-                    return None
-            
-            except ccxt.NetworkError as e:
-                if attempt < max_retries - 1:
-                    delay = backoff_delays[attempt]
-                    print(f"[Balance] Erreur réseau, retry dans {delay}s...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"[Balance] Erreur réseau persistante")
-                    if _BALANCE_CACHE['value'] is not None:
-                        return _BALANCE_CACHE['value']
-                    return None
-            
+                
             except Exception as e:
+                error_msg = str(e).lower()
+                
+                # Rate limit : attendre plus longtemps
+                if 'rate' in error_msg or 'limit' in error_msg:
+                    wait_time = retry_delays[attempt] * 2
+                    print(f"[Balance] ⚠️ Rate limit détecté, attente {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                
+                # Autres erreurs
+                print(f"[Balance] ⚠️ Tentative {attempt + 1}/{max_retries} échouée : {e}")
+                
                 if attempt < max_retries - 1:
-                    delay = backoff_delays[attempt]
-                    print(f"[Balance] Erreur : {e}, retry dans {delay}s...")
-                    time.sleep(delay)
+                    time.sleep(retry_delays[attempt])
                     continue
                 else:
-                    print(f"[Balance] Échec après {max_retries} tentatives : {e}")
-                    if _BALANCE_CACHE['value'] is not None:
-                        print(f"[Balance] Utilisation cache : {_BALANCE_CACHE['value']} USDT")
-                        return _BALANCE_CACHE['value']
-                    return None
+                    print(f"[Balance] ❌ Échec définitif après {max_retries} tentatives")
+                    return _BALANCE_CACHE.get('value')  # Retourner cache si disponible
         
-        return None
-    
+        # Si on arrive ici, toutes les tentatives ont échoué
+        return _BALANCE_CACHE.get('value')
+        
     except Exception as e:
-        print(f"[Balance] Erreur fatale : {e}")
-        return None
+        print(f"[Balance] ❌ Erreur critique : {e}")
+        import traceback
+        traceback.print_exc()
+        return _BALANCE_CACHE.get('value')
 
 
-def clear_balance_cache():
-    """Invalide le cache du solde (à appeler après un trade)."""
+def clear_balance_cache() -> None:
+    """
+    Invalide le cache de balance (à appeler après ouverture/fermeture de trade).
+    Force le prochain appel à get_account_balance_usdt() à récupérer les données actualisées.
+    """
     global _BALANCE_CACHE
     _BALANCE_CACHE['timestamp'] = 0
+    print("[Balance] Cache invalidé - prochain appel sera un refresh")
+
+
 
 def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, quantity: float, entry_px: float) -> None:
     """
@@ -2331,6 +2307,7 @@ def _import_exchange_position_to_db(ex: ccxt.Exchange, symbol: str, side: str, q
             pass
     except Exception as e:
         notifier.tg_send_error(f"Import position {symbol} -> DB", e)
+        
 
 def _estimate_pnl_for_closed_trade(ex, row: Dict[str, Any]) -> float:
     """
@@ -3402,256 +3379,62 @@ def execute_signal_with_gates(
 
     # --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
     # Sans bougie de réaction valide avant l'entrée, on NE prend PAS le trade.
-    try:
-        if not _check_reaction_before_entry(df, signal, is_long):
-            _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="no_reaction_candle")
-            return False, "Rejeté: aucune bougie de réaction valide avant l'entrée."
-    except Exception:
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="reaction_check_error")
-        return False, "Rejeté: erreur lors du contrôle de la bougie de réaction."
+    passed_reaction, msg_react = _gate_reaction_obligatoire(df, is_long, regime)
+    if not passed_reaction:
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=msg_react)
+        return False, msg_react
 
-    last = df.iloc[-1]
-    last_atr = float(last.get('atr', 0.0))
-    try:
-        tp_pct = get_tp_offset_pct()
-    except Exception:
-        tp_pct = 0.003
-    try:
-        tp_atr_k = float(database.get_setting('TP_ATR_K', 0.50))
-    except Exception:
-        tp_atr_k = 0.50
-    try:
-        cut_wick_enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
-    except Exception:
-        cut_wick_enabled = False
-
-    contact_idx = _find_contact_index(df, base_exclude_last=True, max_lookback=5)
-    contact = (df.iloc[contact_idx] if contact_idx is not None else None)
-
-    if contact is not None:
-        sl_live = float(_sl_from_contact_candle(contact, ('buy' if is_long else 'sell'), float(contact.get('atr', 0.0))))
-    else:
-        sl_live = float(signal.get('sl', 0.0))
-
-    if regime == "Tendance":
-        target_band = float(last['bb80_up'] if is_long else last['bb80_lo'])
-        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
-        tp_live = target_band * (1.0 - eff_pct) if is_long else target_band * (1.0 + eff_pct)
-    else:
-        target_band = float(last['bb20_up'] if is_long else last['bb20_lo'])
-        eff_pct = max(tp_pct, (tp_atr_k * last_atr) / target_band if target_band > 0 else tp_pct)
-        tp_live = target_band * (1.0 - eff_pct) if is_long else target_band * (1.0 + eff_pct)
-
-    # ---- Gate spécifique CONTRE-TENDANCE : séquence BB80 + réintégration BB20/BB80 sans ressortie ----
-    if regime != "Tendance":
-        ok_ct_bb = _check_ct_reintegration_window(df, is_long, max_window=REACTION_WINDOW_BARS)
-        if not ok_ct_bb:
-            signal['entry'] = entry_px
-            signal['sl'] = float(sl_live)
-            signal['tp'] = float(tp_live)
-            try:
-                current_rr = float(signal.get('rr', 0.0) or 0.0)
-            except Exception:
-                current_rr = 0.0
-            signal['rr'] = current_rr
-            _update_signal_state(
-                symbol,
-                timeframe,
-                signal,
-                entry_px,
-                "SKIPPED",
-                reason="ct_bb_reintegration_failed",
-                tp=float(tp_live),
-                sl=float(sl_live),
-            )
-            return False, "Rejeté: séquence contre-tendance BB20+BB80 non conforme."
-
-    # ---- Gate sortie prolongée BB80 (tendance & contre-tendance) : éviter le 1er trade après excès prolongé ----
-    try:
-        streak_thr = int(database.get_setting('SKIP_AFTER_BB80_STREAK', 5))
-    except Exception:
-        streak_thr = 5
-    if streak_thr > 0:
-        try:
-            if _is_first_after_prolonged_bb80_exit(df, is_long, streak_thr):
-                signal['entry'] = entry_px
-                signal['sl'] = float(sl_live)
-                signal['tp'] = float(tp_live)
-                _update_signal_state(
-                    symbol,
-                    timeframe,
-                    signal,
-                    entry_px,
-                    "SKIPPED",
-                    reason="skip_first_after_prolonged_bb80",
-                    tp=float(tp_live),
-                    sl=float(sl_live),
-                )
-                return False, "Rejeté: premier trade après sortie prolongée des BB80."
-        except Exception:
-            # On ne casse jamais l'exécution sur ce filtre : si le check échoue, on continue normalement.
-            pass
-
-    # ---- RR et éventuel cut-wick ----
-    rr = 0.0
-    if is_long:
-        if (entry_px > sl_live) and (tp_live > entry_px):
-            rr = (tp_live - entry_px) / (entry_px - sl_live)
-    else:
-        if (sl_live > entry_px) and (tp_live < entry_px):
-            rr = (entry_px - tp_live) / (sl_live - entry_px)
-
-    rr_final = rr
-    if rr_final < MIN_RR and rr_final >= 2.8 and cut_wick_enabled and contact is not None:
-        rr_alt, _ = _maybe_improve_rr_with_cut_wick(contact, entry_px, sl_live, tp_live, ('buy' if is_long else 'sell'))
-        rr_final = max(rr_final, rr_alt)
-
-    if rr_final < MIN_RR or rr_final <= 0.0:
-        signal['entry'] = entry_px
-        signal['sl'] = float(sl_live)
-        signal['tp'] = float(tp_live)
-        signal['rr'] = float(rr_final)
-        _update_signal_state(
-            symbol, timeframe, signal, entry_px, "SKIPPED",
-            reason=f"rr_entry_gate({rr_final:.2f})", tp=float(tp_live), sl=float(sl_live)
-        )
-        return False, f"Rejeté: RR entrée {rr_final:.2f} < MIN_RR ({MIN_RR})."
-
-    signal['entry'] = entry_px
-    signal['sl'] = float(sl_live)
-    signal['tp'] = float(tp_live)
-    signal['rr'] = float(rr_final)
-
-    is_paper_mode = str(database.get_setting('PAPER_TRADING_MODE', 'true')).lower() == 'true'
-    max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv('MAX_OPEN_POSITIONS', 3)))
-
-    # Sync éventuelle avant exécution
-    try:
-        if str(database.get_setting('SYNC_BEFORE_EXECUTE', 'true')).lower() == 'true':
-            sync_positions_with_exchange(ex)
-    except Exception:
-        pass
-
-    # ---- Fermeture obligatoire sur signal inverse ----
-    try:
-        open_positions = database.get_open_positions()
-        for pos_open in open_positions:
-            try:
-                if pos_open.get('symbol') != symbol:
-                    continue
-                pos_side = str(pos_open.get('side', '')).lower()
-                if not pos_side or pos_side == side:
-                    continue
-                close_position_manually(ex, int(pos_open['id']))
-                
-                # ✅ MODIFICATION 1 : Invalider cache après fermeture position inverse
-                clear_balance_cache()
-                
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # Slots & position déjà ouverte (même sens)
-    if len(database.get_open_positions()) >= max_pos:
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=f"max_positions({max_pos})")
-        return False, f"Rejeté: Max positions ({max_pos}) atteint."
-    if database.is_position_open(symbol):
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="already_open_in_db")
-        return False, "Rejeté: Position déjà ouverte (DB)."
-
-    balance = get_usdt_balance(ex)
-    if balance is None or balance <= 10:
-        _update_signal_state(
-            symbol, timeframe, signal, entry_px,
-            "SKIPPED", reason=f"low_balance({balance or 0:.2f} USDT)"
-        )
-        return False, f"Rejeté: Solde insuffisant ({balance or 0:.2f} USDT) ou erreur API."
-
-    price_ref = entry_px
-    sl = float(signal['sl'])
-    tp = float(signal['tp'])
-
-    try:
-        gap_pct = float(database.get_setting('SL_MIN_GAP_PCT', 0.0003))
-    except Exception:
-        gap_pct = 0.0003
-    if is_long:
-        if sl >= price_ref:
-            sl = price_ref * (1.0 - gap_pct)
-        if tp <= price_ref:
-            tp = price_ref * (1.0 + gap_pct)
-    else:
-        if sl <= price_ref:
-            sl = price_ref * (1.0 + gap_pct)
-        if tp >= price_ref:
-            tp = price_ref * (1.0 - gap_pct)
-
-    market = ex.market(symbol) or {}
-    tick_size = _bitget_tick_size(market)
-
-    mark_now = _current_mark_price(ex, symbol)
-    sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
-
-    try:
-        side_for_tp = ('buy' if is_long else 'sell')
-        tp = _prepare_validated_tp(ex, symbol, side_for_tp, float(tp))
-    except Exception:
-        t = ex.fetch_ticker(symbol) or {}
-        last_px = float(t.get("last") or t.get("close") or price_ref)
-        if is_long and tp <= last_px:
-            tp = last_px * (1.0 + gap_pct)
-        if (not is_long) and tp >= last_px:
-            tp = last_px * (1.0 - gap_pct)
-
-    # --- Taille théorique selon le risque ---
-    quantity = calculate_position_size(balance, RISK_PER_TRADE_PERCENT, price_ref, sl)
-    if quantity <= 0:
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="qty_zero_after_sizing")
-        return False, f"Rejeté: Quantité calculée nulle ({quantity})."
-
-    ref_price = price_ref
-    if not ref_price:
-        try:
-            t = ex.fetch_ticker(symbol) or {}
-            ref_price = float(t.get("last") or t.get("close") or t.get("bid") or t.get("ask") or 0.0)
-        except Exception:
-            ref_price = price_ref
-
-    # --- Cap par marge/filtres marché ---
-    capped_qty, meta = _cap_qty_for_margin_and_filters(
-        ex, symbol, side, abs(float(quantity)), ref_price or price_ref
+    # --- RECALCUL SL/TP LIVE ---
+    sl, tp, err = _recalc_sl_tp_live(
+        df=df,
+        side=side,
+        regime=regime,
+        entry_price=entry_px,
+        symbol=symbol,
+        timeframe=timeframe
     )
-    if capped_qty <= 0.0 and meta.get("reason") == "INSUFFICIENT_AFTER_CAP":
-        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="insufficient_after_cap")
-        try:
-            need_notional = (abs(float(quantity)) * (ref_price or price_ref or 0.0))
-            max_notional = meta.get("max_notional")
-            txt = (
-                f"❌ <b>Ordre annulé</b> (solde insuffisant)\n"
-                f"• {symbol} {side.upper()} MARKET\n"
-                f"• Notional requise: <code>{need_notional:.2f} USDT</code>\n"
-                f"• Max possible (marge): <code>{(max_notional or 0.0):.2f} USDT</code>\n"
-                f"• Levier: <code>{meta.get('leverage')}</code>\n"
-                f"• Marge dispo: <code>{(meta.get('available_margin') or 0.0):.2f} USDT</code>\n"
-                f"• Filtres marché: min_qty=<code>{meta.get('min_qty')}</code>, "
-                f"min_notional=<code>{meta.get('min_notional')}</code>\n"
-            )
-            notifier.tg_send(txt)
-        except Exception:
-            pass
-        return False, "Ordre annulé: solde insuffisant."
+    if err:
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=err)
+        return False, err
 
-    notional_value = capped_qty * price_ref
-    if notional_value < MIN_NOTIONAL_VALUE:
+    # --- GATE RR MINIMUM ---
+    rr_calc = abs((tp - entry_px) / (entry_px - sl + 1e-8))
+    if rr_calc < MIN_RR_RATIO:
         _update_signal_state(
             symbol, timeframe, signal, entry_px, "SKIPPED",
-            reason=f"below_min_notional({notional_value:.2f}<{MIN_NOTIONAL_VALUE})"
+            reason=f"RR={rr_calc:.2f} < {MIN_RR_RATIO}"
         )
-        return False, (
-            f"Rejeté: Valeur du trade ({notional_value:.2f} USDT) "
-            f"< min requis ({MIN_NOTIONAL_VALUE} USDT)."
-        )
+        return False, f"Rejeté: RR={rr_calc:.2f} < {MIN_RR_RATIO}."
+
+    # --- CALCUL QTÉ ---
+    # Récupérer le solde
+    balance_usdt = get_account_balance_usdt(ex)
+    if balance_usdt is None or balance_usdt <= 0:
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="balance_unavailable")
+        return False, "Rejeté: solde USDT indisponible."
+    
+    # Calculer la taille de position
+    raw_qty = calculate_position_size(
+        balance=balance_usdt,
+        risk_percent=RISK_PER_TRADE_PERCENT,
+        entry_price=entry_px,
+        sl_price=sl
+    )
+    
+    # Appliquer les caps (marge disponible + filtres marché)
+    capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, raw_qty, entry_px)
+    
+    # Vérifier que la quantité est valide après caps
+    if meta.get('reason') == 'INSUFFICIENT_AFTER_CAP':
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="insufficient_margin")
+        return False, "Rejeté: marge insuffisante après application des filtres."
+    
+    if capped_qty is None or capped_qty <= 0:
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="qty_zero")
+        return False, "Rejeté: taille position = 0 ou invalide."
+
+    is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
+    price_ref = entry_px
 
     try:
         sl = float(ex.price_to_precision(symbol, sl))
@@ -3687,6 +3470,20 @@ def execute_signal_with_gates(
             except Exception:
                 pass
 
+            # --- FERMETURE POSITION INVERSE SI EXISTANTE ---
+            open_positions = database.get_open_positions()
+            for pos_open in open_positions:
+                if pos_open.get('symbol') == symbol and pos_open.get('side', '').lower() != side:
+                    try:
+                        close_position_manually(ex, int(pos_open['id']))
+                        
+                        # ✅ MODIFICATION 1 : Invalider cache après fermeture position inverse
+                        clear_balance_cache()
+                        
+                    except Exception as e_close:
+                        notifier.tg_send(f"⚠️ Fermeture position inverse échouée pour {symbol}: {e_close}")
+                        continue
+
             # --- Ordre marché d'entrée ---
             order = create_market_order_smart(
                 ex, symbol, side, quantity, ref_price=final_entry_price, params=common_params
@@ -3711,42 +3508,48 @@ def execute_signal_with_gates(
                 for p in positions:
                     same = (p.get('symbol') == symbol)
                     if (not same) and market_real:
-                        same = (p.get('raw', {}) or {}).get('symbol') == market_real.get('id')
+                        same = (p.get('raw', {}).get('symbol') == market_real.get('id'))
                     if same:
-                        size_val = float(p.get('size') or p.get('contracts') or p.get('positionAmt') or 0.0)
-                        if abs(size_val) > 0:
-                            real_qty = abs(size_val)
+                        contracts = float(p.get('size') or p.get('contracts') or p.get('positionAmt') or 0.0)
+                        contracts = abs(contracts)
+                        if contracts and contracts > 0:
+                            real_qty = contracts
                             break
-
+                
                 if real_qty is not None and real_qty > 0:
-                    try:
-                        quantity = float(ex.amount_to_precision(symbol, real_qty))
-                    except Exception:
-                        quantity = float(real_qty)
+                    quantity = real_qty
+                    quantity = float(ex.amount_to_precision(symbol, quantity))
             except Exception:
-                # en cas d'erreur, on garde la quantité théorique
                 pass
 
-            # --- SL/TP sur la QUANTITÉ RÉELLE ---
-            close_side = 'sell' if is_long else 'buy'
-            mark_now = _current_mark_price(ex, symbol)
-            sl = _validate_sl_for_side(side, float(sl), mark_now, tick_size)
+            # --- Ordres SL/TP ---
+            try:
+                sl_side = 'sell' if is_long else 'buy'
+                sl_params = {
+                    'stopLossPrice': str(sl),
+                    'tdMode': 'cross',
+                    'posMode': 'oneway',
+                }
+                ex.create_order(symbol, 'market', sl_side, quantity, params=sl_params)
+            except Exception as e_sl:
+                notifier.tg_send(f"⚠️ SL non placé pour {symbol}: {e_sl}")
 
-            ex.create_order(
-                symbol, 'market', close_side, quantity, price=None,
-                params={**common_params, 'stopLossPrice': float(sl), 'reduceOnly': True, 'triggerType': 'mark'}
-            )
-            ex.create_order(
-                symbol, 'market', close_side, quantity, price=None,
-                params={**common_params, 'takeProfitPrice': float(tp), 'reduceOnly': True, 'triggerType': 'mark'}
-            )
+            try:
+                tp_side = 'sell' if is_long else 'buy'
+                tp_params = {
+                    'takeProfitPrice': str(tp),
+                    'tdMode': 'cross',
+                    'posMode': 'oneway',
+                }
+                ex.create_order(symbol, 'market', tp_side, quantity, params=tp_params)
+            except Exception as e_tp:
+                notifier.tg_send(f"⚠️ TP non placé pour {symbol}: {e_tp}")
 
         except Exception as e:
             try:
                 close_side = 'sell' if is_long else 'buy'
                 create_market_order_smart(
-                    ex, symbol, close_side, quantity, ref_price=final_entry_price,
-                    params={'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                    ex, symbol, close_side, quantity, ref_price=final_entry_price, params=common_params
                 )
                 
                 # ✅ MODIFICATION 3 : Invalider cache après fermeture d'urgence
@@ -3770,7 +3573,7 @@ def execute_signal_with_gates(
         entry_price=final_entry_price,
         sl_price=float(sl),
         tp_price=float(tp),
-        quantity=float(quantity),  # taille réelle si on a réussi à la lire
+        quantity=float(quantity),
         risk_percent=RISK_PER_TRADE_PERCENT,
         management_strategy=management_strategy,
         entry_atr=float(signal.get('entry_atr', 0.0) or 0.0),
@@ -3796,6 +3599,9 @@ def execute_signal_with_gates(
         pass
 
     return True, "Position ouverte avec succès."
+
+
+
 
 def get_tp_offset_pct() -> float:
     """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
