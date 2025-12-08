@@ -153,34 +153,57 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
             Renvoie l'indice (0..len(df_plot)-1) de la bougie 'base_key'
             (contact / reaction / entry) si elle est dans les 20 dernières
             bougies. Sinon -> None.
+            
+            VERSION AMÉLIORÉE : Essaie TOUS les champs possibles
             """
-            # via index sur df complet
-            idx_keys = [f"{base_key}_index", f"{base_key}_idx", f"{base_key}_bar"]
-            for k in idx_keys:
+            # Liste exhaustive des clés possibles
+            all_keys = [
+                f"{base_key}_index",
+                f"{base_key}_idx",
+                f"{base_key}_bar",
+                f"{base_key}Index",
+                f"{base_key}Idx",
+                base_key  # Parfois le signal contient juste "contact": 123
+            ]
+            
+            # 1) Via index sur df complet
+            for k in all_keys:
                 if k in signal and signal[k] is not None:
                     try:
                         idx_full = int(signal[k])
                     except Exception:
                         continue
+                    
+                    # Vérifier que l'index est valide
                     if idx_full < 0 or idx_full >= len(df):
                         continue
+                    
+                    # Récupérer le timestamp de cette bougie
                     ts_full = df.index[idx_full]
+                    
+                    # Trouver la position dans df_plot (20 dernières bougies)
                     try:
+                        # df_plot.index.get_loc() cherche le timestamp exact
                         loc = df_plot.index.get_loc(ts_full)
+                        
+                        # get_loc() peut renvoyer un int, slice, ou array
                         if isinstance(loc, slice):
                             loc = loc.start
                         if isinstance(loc, (list, tuple)):
                             loc = loc[0]
+                        
                         return int(loc)
-                    except Exception:
+                    except (KeyError, IndexError):
+                        # Ce timestamp n'est pas dans df_plot (trop vieux)
                         continue
-
-            # via timestamp (optionnel)
+            
+            # 2) Via timestamp (optionnel mais utile)
             ts_keys = [f"{base_key}_ts", f"{base_key}_time", f"{base_key}_timestamp"]
             for k in ts_keys:
                 if k in signal and signal[k] is not None:
                     raw = signal[k]
                     try:
+                        # Convertir en timestamp pandas
                         if isinstance(raw, (int, float)):
                             if raw > 1e12:
                                 ts = pd.to_datetime(int(raw), unit='ms', utc=True)
@@ -190,15 +213,19 @@ def generate_trade_chart(symbol: str, df: pd.DataFrame, signal: Dict[str, Any]) 
                             ts = pd.to_datetime(raw, utc=True)
                     except Exception:
                         continue
+                    
+                    # Vérifier que le timestamp est dans la fenêtre
                     if ts < df_plot.index[0] or ts > df_plot.index[-1]:
                         continue
+                    
+                    # Trouver la position la plus proche
                     try:
                         deltas = (df_plot.index - ts)
                         pos = int(deltas.abs().argmin())
                         return pos
                     except Exception:
                         continue
-
+            
             return None
 
         contact_pos  = _resolve_bar_position('contact')
