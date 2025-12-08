@@ -14,7 +14,7 @@ import sys
 # ============================================================================
 
 # Chemin DB (changez selon votre nom exact)
-DB_PATH_OVERRIDE = None  # None = recherche auto, ou "/var/data/votre_db.db"
+DB_PATH_OVERRIDE = "/var/data/darwin_bot.db"
 
 DROPBOX_TOKEN = os.getenv('DROPBOX_TOKEN', '')
 DROPBOX_FOLDER = '/TradingBot_Backups'
