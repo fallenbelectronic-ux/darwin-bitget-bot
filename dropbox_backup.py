@@ -132,7 +132,7 @@ def export_csv_from_db(db_path, output_file):
         return False
 
 def export_summary_from_db(db_path, output_file):
-    """Export résumé (avec détection automatique des colonnes)."""
+    """Export résumé (avec détection automatique des colonnes ET timestamps)."""
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -192,9 +192,28 @@ def export_summary_from_db(db_path, output_file):
         
         winrate = (wins / total * 100) if total > 0 else 0.0
         
-        # 4. Stats 30 jours
-        cutoff_30d = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+        # 4. CORRECTION : Détecter le format des timestamps
+        cursor.execute("SELECT MIN(open_timestamp), MAX(open_timestamp) FROM trades WHERE open_timestamp IS NOT NULL")
+        ts_row = cursor.fetchone()
+        min_ts = ts_row[0] if ts_row else None
+        max_ts = ts_row[1] if ts_row else None
         
+        # Déterminer si timestamps en millisecondes ou secondes
+        # Si max_ts > 10^12 (1 trillion) → millisecondes
+        # Sinon → secondes
+        if max_ts and max_ts > 1e12:
+            # Timestamps en millisecondes
+            cutoff_30d = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+            timestamp_format = "millisecondes"
+        else:
+            # Timestamps en secondes
+            cutoff_30d = int((datetime.now() - timedelta(days=30)).timestamp())
+            timestamp_format = "secondes"
+        
+        print(f"   ℹ️ Format timestamp détecté : {timestamp_format}")
+        print(f"   ℹ️ Cutoff 30 jours : {cutoff_30d}")
+        
+        # 5. Stats 30 jours (avec cutoff corrigé)
         query_30d = f"""
             SELECT 
                 COUNT(*) as total_30d,
@@ -209,14 +228,62 @@ def export_summary_from_db(db_path, output_file):
         total_30d = row_30d[0] or 0
         profit_30d = row_30d[1] or 0.0
         
-        # 5. Positions ouvertes
+        # 6. Stats 7 jours (bonus)
+        if max_ts and max_ts > 1e12:
+            cutoff_7d = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+        else:
+            cutoff_7d = int((datetime.now() - timedelta(days=7)).timestamp())
+        
+        query_7d = f"""
+            SELECT 
+                COUNT(*) as total_7d,
+                SUM({profit_col}) as profit_7d
+            FROM trades
+            WHERE status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
+            AND open_timestamp > ?
+        """
+        
+        cursor.execute(query_7d, (cutoff_7d,))
+        row_7d = cursor.fetchone()
+        total_7d = row_7d[0] or 0
+        profit_7d = row_7d[1] or 0.0
+        
+        # 7. Positions ouvertes
         cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
         open_pos = cursor.fetchone()[0] or 0
         
+        # 8. Pyramiding stats (si colonnes existent)
+        pyramid_trades = 0
+        pyramid_avg_profit = 0.0
+        if 'pyramid_count' in columns:
+            cursor.execute(f"""
+                SELECT 
+                    COUNT(*) as with_pyramid,
+                    AVG({profit_col}) as avg_profit_pyramid
+                FROM trades
+                WHERE pyramid_count > 0
+                AND status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
+            """)
+            pyr_row = cursor.fetchone()
+            pyramid_trades = pyr_row[0] or 0
+            pyramid_avg_profit = pyr_row[1] or 0.0
+        
+        # 9. Partial exits stats (si colonnes existent)
+        partial_trades = 0
+        if 'partial_exits' in columns:
+            cursor.execute("""
+                SELECT COUNT(*) as with_partial
+                FROM trades
+                WHERE partial_exits IS NOT NULL
+                AND status IN ('CLOSED', 'CLOSED_MANUAL', 'CLOSED_BY_EXCHANGE')
+            """)
+            partial_trades = cursor.fetchone()[0] or 0
+        
         conn.close()
         
-        # 6. Générer rapport (CORRIGÉ - pas de f-string imbriqué)
+        # 10. Générer rapport (CORRIGÉ - format lisible)
         profit_per_trade_30d = (profit_30d / total_30d) if total_30d > 0 else 0.0
+        profit_per_trade_7d = (profit_7d / total_7d) if total_7d > 0 else 0.0
         
         report = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -246,6 +313,25 @@ Profit               : %.2f USDT
 Profit par trade     : %.2f USDT
 
 
+📈 PERFORMANCE 7 DERNIERS JOURS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Trades               : %d
+Profit               : %.2f USDT
+Profit par trade     : %.2f USDT
+
+
+🎯 FEATURES AVANCÉES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pyramiding
+  Trades avec pyramid : %d
+  Profit moyen        : %.2f USDT
+  
+Partial Exits
+  Trades avec partial : %d
+
+
 ═══════════════════════════════════════════════════════════════
 📦 Backup créé automatiquement
 🔗 Téléchargez depuis : https://www.dropbox.com/home%s
@@ -263,6 +349,12 @@ Profit par trade     : %.2f USDT
             total_30d,
             profit_30d,
             profit_per_trade_30d,
+            total_7d,
+            profit_7d,
+            profit_per_trade_7d,
+            pyramid_trades,
+            pyramid_avg_profit,
+            partial_trades,
             DROPBOX_FOLDER
         )
         
