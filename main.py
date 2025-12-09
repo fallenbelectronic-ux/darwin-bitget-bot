@@ -570,9 +570,6 @@ def process_callback_query(callback_query: Dict):
             }
             notifier.send_config_message(config)
 
-        elif data == 'menu_signals':
-            notifier.send_signals_menu()
-
         elif data == 'main_menu':
             notifier.send_main_menu(_paused)
 
