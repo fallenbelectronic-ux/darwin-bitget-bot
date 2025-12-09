@@ -3395,10 +3395,7 @@ def execute_signal_with_gates(
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=msg_react)
         return False, msg_react
 
-    # ========================================================================
-    # ✅ CORRECTION : Passer le signal à _recalc_sl_tp_live()
-    # ========================================================================
-    
+    # --- RECALCUL SL/TP LIVE ---
     sl, tp, err = _recalc_sl_tp_live(
         df=df,
         side=side,
@@ -3406,7 +3403,7 @@ def execute_signal_with_gates(
         entry_price=entry_px,
         symbol=symbol,
         timeframe=timeframe,
-        signal=signal  # ← AJOUT CRITIQUE
+        signal=signal
     )
     
     if err:
@@ -3585,10 +3582,87 @@ def execute_signal_with_gates(
 
     _update_signal_state(symbol, timeframe, signal, final_entry_price, "VALID", tp=float(tp), sl=float(sl))
 
+    # ========================================================================
+    # ✅ CORRECTION : GÉNÉRATION GRAPHIQUE AVEC LOGGING COMPLET
+    # ========================================================================
+    
+    chart_image = None
+    
     try:
-        chart_image = charting.generate_trade_chart(symbol, df, signal)
-    except Exception:
+        # Vérifier que le signal contient les index nécessaires
+        required_keys = ['contact_index', 'reaction_index', 'entry_index']
+        missing_keys = [k for k in required_keys if k not in signal]
+        
+        if missing_keys:
+            print(f"⚠️ Signal {symbol} incomplet pour graphique. Manquant: {missing_keys}")
+            print(f"   Clés disponibles: {list(signal.keys())}")
+            
+            try:
+                notifier.tg_send(
+                    f"⚠️ Graphique {symbol} non généré\n"
+                    f"Index manquants: {', '.join(missing_keys)}\n"
+                    f"Signal: {signal.get('regime', 'N/A')} {signal.get('pattern', 'N/A')}"
+                )
+            except Exception:
+                pass
+        
+        else:
+            # Vérifier que le DF contient assez de données
+            contact_idx = signal.get('contact_index')
+            reaction_idx = signal.get('reaction_index')
+            entry_idx = signal.get('entry_index')
+            
+            max_idx = max(contact_idx, reaction_idx, entry_idx)
+            
+            if df is None or len(df) <= max_idx:
+                print(f"⚠️ DF {symbol} trop court pour graphique")
+                print(f"   DF length: {len(df) if df is not None else 0}, max_idx needed: {max_idx}")
+                
+                try:
+                    notifier.tg_send(
+                        f"⚠️ Graphique {symbol} non généré\n"
+                        f"DF trop court: {len(df) if df is not None else 0} bougies\n"
+                        f"Requis: {max_idx + 1}"
+                    )
+                except Exception:
+                    pass
+            
+            else:
+                # Tout est OK → générer le graphique
+                print(f"📊 Génération graphique {symbol}...")
+                print(f"   contact_idx={contact_idx}, reaction_idx={reaction_idx}, entry_idx={entry_idx}")
+                print(f"   DF length={len(df)}, SL={sl:.4f}, TP={tp:.4f}")
+                
+                chart_image = charting.generate_trade_chart(symbol, df, signal)
+                
+                if chart_image:
+                    print(f"✅ Graphique {symbol} généré avec succès")
+                else:
+                    print(f"⚠️ Graphique {symbol} retourné None")
+    
+    except Exception as e:
+        print(f"❌ ERREUR génération graphique {symbol}: {e}")
+        print(f"   Type: {type(e).__name__}")
+        
+        import traceback
+        traceback.print_exc()
+        
+        try:
+            error_msg = str(e)[:200]  # Limiter la longueur
+            notifier.tg_send(
+                f"❌ **Erreur Graphique**\n\n"
+                f"🎯 {symbol}\n"
+                f"⚠️ {error_msg}\n\n"
+                f"Le trade a été ouvert mais sans graphique."
+            )
+        except Exception:
+            pass
+        
         chart_image = None
+
+    # ========================================================================
+    # FIN CORRECTION GRAPHIQUE
+    # ========================================================================
 
     mode_text = "PAPIER" if is_paper_mode else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
@@ -3598,13 +3672,14 @@ def execute_signal_with_gates(
             notifier.tg_send_with_photo(photo_buffer=chart_image, caption=trade_message)
         else:
             notifier.tg_send(trade_message)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"❌ Erreur envoi notification {symbol}: {e}")
+        try:
+            notifier.tg_send(trade_message)
+        except Exception:
+            pass
 
     return True, "Position ouverte avec succès."
-
-
-
 
 def get_tp_offset_pct() -> float:
     """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
