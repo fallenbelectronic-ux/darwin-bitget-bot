@@ -421,7 +421,8 @@ def _telegram_command_handlers() -> Dict[str, Any]:
     """
     return {
         "setuniverse": notifier.set_universe_command,   
-        "setmaxpos":  notifier.set_maxpos_command,      
+        "setmaxpos":  notifier.set_maxpos_command,
+        "setrisk":    notifier.set_risk_command,     
         "offset":     notifier.offset_command,          
         "help":       notifier.send_commands_help,      
     }
@@ -650,6 +651,18 @@ def process_message(message: Dict):
                     notifier.tg_send("❌ Le nombre doit être >= 0.")
             except ValueError:
                 notifier.tg_send("❌ Valeur invalide. Utilisez: /setmaxpos 3")
+
+        elif command == "/setrisk" and len(parts) > 1:
+            try:
+                risk = float(parts[1])
+                if 0 < risk <= 10:
+                    database.set_setting('RISK_PER_TRADE_PERCENT', str(risk))
+                    notifier.tg_send(f"✅ Risque par trade mis à <b>{risk}%</b>.")
+                    notifier.send_main_menu(_paused)
+                else:
+                    notifier.tg_send("❌ Le risque doit être entre 0 et 10%.")
+            except ValueError:
+                notifier.tg_send("❌ Valeur invalide. Utilisez: /setrisk 2")
 
     elif command == "/stats":
         ex = create_exchange()
