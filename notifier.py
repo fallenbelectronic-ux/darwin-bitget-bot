@@ -592,19 +592,9 @@ def get_main_menu_keyboard(is_paused: bool) -> Dict:
     pause_resume_btn = {"text": "💹 Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pause", "callback_data": "pause"}
     return {"inline_keyboard": [
         [pause_resume_btn, {"text": "🛰️ Ping", "callback_data": "ping"}],
-        [{"text": "🚀 Signaux", "callback_data": "menu_signals"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
+        [{"text": "🚀 Signaux (6h)", "callback_data": "signals_6h"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
         [{"text": "📊 Positions", "callback_data": "list_positions"}, {"text": "⚙️ Configuration", "callback_data": "menu_config"}]
     ]}
-
-def get_signals_menu_keyboard() -> Dict:
-    """Crée le clavier pour le menu des signaux."""
-    return {
-        "inline_keyboard": [
-            [{"text": "⏱️ Signal(s) en attente", "callback_data": "signals_pending"}],
-            [{"text": "🚀 Signaux valides (6 Dernières Heures)", "callback_data": "signals_6h"}],
-            [{"text": "↩️ Retour", "callback_data": "main_menu"}]
-        ]
-    }
 
 def get_positions_keyboard(positions: List[Dict[str, Any]]) -> Optional[Dict]:
     """Retourne le clavier pour la gestion des positions ouvertes + bouton retour menu principal."""
@@ -821,19 +811,7 @@ def try_handle_inline_callback(event: Any) -> bool:
             if cq_id: tg_answer_callback_query(cq_id)
             return True
 
-        # ----- MENUS SIGNAUX -----
-        if cmd == "menu_signals":
-            send_signals_menu()
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
-            return True
-
-        if cmd == "signals_pending":
-            tg_show_signals_pending()
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
-            return True
-
+        # ----- SIGNAUX (DIRECT) -----
         if cmd == "signals_6h":
             tg_show_signals_6h()
             cq_id = data.get("id")
@@ -873,7 +851,6 @@ def try_handle_inline_callback(event: Any) -> bool:
 
         # ----- RETOUR GRAPHIQUE ÉQUITY -----
         if cmd == "equity_back":
-            # On passe l'update complet pour que handle_equity_back_callback retrouve callback_query/message
             handle_equity_back_callback(event)
             return True
 
@@ -889,8 +866,6 @@ def try_handle_inline_callback(event: Any) -> bool:
     except Exception as e:
         tg_send_error("Callback routing", e)
         return False
-
-        
 
 def _format_signal_row(sig: dict) -> str:
     """Format compact d'un signal (sans la raison), horodaté Europe/Lisbon.
@@ -939,8 +914,8 @@ def tg_show_signals_6h(limit: int = 50):
     """
     Affiche 'Signaux valides des 6 dernières heures' :
     - uniquement les signaux VALID_TAKEN ou VALID_SKIPPED,
-      c’est-à-dire les setups qui respectent toutes les conditions
-      d’entrée (contact, réintégration, réaction, RR, etc.).
+      c'est-à-dire les setups qui respectent toutes les conditions
+      d'entrée (contact, réintégration, réaction, RR, etc.).
     - filtrage supplémentaire via les règles de RR / cut-wick.
 
     Tri décroissant par ts (les plus récents en premier).
@@ -1026,14 +1001,14 @@ def tg_show_signals_6h(limit: int = 50):
         reason = s.get("reason") or (payload.get("reason") if isinstance(payload, dict) else "")
         return f"  (raison: {html.escape(str(reason))})" if reason else ""
 
-    # Titre + une ligne vide entre chaque signal
+    # Titre + une ligne vide entre chaque signal pour bien les séparer
     lines = ["<b>⏱️ Signaux valides (6h)</b>"]
     for s in signals:
         row = _format_signal_row(s)
         note = ""
         try:
             rr_val = float(s.get("rr", 0) or 0.0)
-            # Si cut-wick ON et RR entre [cw_min_rr ; MIN_RR[, on l’affiche mais on tag l’écart vs MIN_RR
+            # Si cut-wick ON et RR entre [cw_min_rr ; MIN_RR[, on l'affiche mais on tag l'écart vs MIN_RR
             if cut_wick and rr_val < min_rr and rr_val >= cw_min_rr:
                 note = "  ⚠ RR<MIN_RR (cut-wick)"
         except Exception:
@@ -1214,36 +1189,6 @@ def send_config_menu():
             database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
     except Exception as e:
         print(f"Erreur sendMessage (config): {e}")
-
-def send_signals_menu():
-    text = "🚀 <b>Menu Signaux</b>"
-    keyboard = get_signals_menu_keyboard()
-    msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
-
-    if TG_TOKEN and TG_CHAT_ID and msg_id:
-        try:
-            payload_edit = {
-                "chat_id": TG_CHAT_ID,
-                "message_id": int(msg_id),
-                "text": text,
-                "parse_mode": "HTML",
-                "reply_markup": keyboard
-            }
-            r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload_edit, timeout=10)
-            data = r.json()
-            if data.get("ok"):
-                return
-        except Exception as e:
-            print(f"Erreur editMessageText (signaux): {e}")
-
-    try:
-        payload_send = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "reply_markup": keyboard}
-        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload_send, timeout=10)
-        data = r.json()
-        if data.get("ok"):
-            database.set_setting('MAIN_MENU_MESSAGE_ID', str(data["result"]["message_id"]))
-    except Exception as e:
-        print(f"Erreur sendMessage (signaux): {e}")
 
 def send_strategy_menu(current_strategy: str):
     text = (
@@ -1558,7 +1503,7 @@ def tg_show_positions():
             if ex and hasattr(trader, "sync_positions_with_exchange"):
                 trader.sync_positions_with_exchange(ex)
         except Exception as _sync_err:
-            # On ne bloque pas l’affichage si la sync échoue
+            # On ne bloque pas l'affichage si la sync échoue
             print(f"[notifier.tg_show_positions] Sync positions warning: {_sync_err}")
 
         positions = database.get_open_positions() or []
