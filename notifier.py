@@ -522,6 +522,34 @@ def tg_get_updates(offset: Optional[int] = None) -> List[Dict[str, Any]]:
         
     return []
 
+def set_risk_command(message: Dict[str, Any]):
+    """Commande texte: /setrisk <nombre> — met à jour RISK_PER_TRADE_PERCENT (immédiat)."""
+    try:
+        text = (message or {}).get("text", "") or ""
+        parts = text.strip().split()
+        if len(parts) < 2:
+            tg_send("❌ Utilisation: /setrisk <pourcentage>")
+            return
+        
+        risk = float(parts[1])
+        if risk <= 0 or risk > 10:
+            tg_send("❌ Le risque doit être entre 0 et 10%.")
+            return
+        
+        database.set_setting('RISK_PER_TRADE_PERCENT', str(risk))
+        tg_send(f"✅ Risque par trade mis à <b>{risk}%</b>.")
+        
+        # Rafraîchit le menu
+        try:
+            is_paused = str(database.get_setting('PAUSED', 'false')).lower() == 'true'
+        except Exception:
+            is_paused = False
+        send_main_menu(is_paused)
+    except ValueError:
+        tg_send("❌ Valeur invalide. Utilisez: /setrisk 2")
+    except Exception as e:
+        tg_send(f"❌ Erreur /setrisk: <code>{_escape(e)}</code>")
+
 def set_universe_command(message: Dict[str, Any]):
     """Commande texte: /setuniverse <nombre> — met à jour UNIVERSE_SIZE (impact IMMÉDIAT + rafraîchit le menu)."""
     try:
@@ -1065,7 +1093,7 @@ def send_main_menu(is_paused: bool):
     mode_text = "PAPIER" if is_paper else "RÉEL"
     etat_text = "PAUSE" if is_paused else "ACTIF"
 
-    # Chips d’état
+    # Chips d'état
     mode_chip = "🟦 Mode: <b>PAPIER</b>" if is_paper else "🟩 Mode: <b>RÉEL</b>"
     status_chip = "🟠 État: <b>PAUSE</b>" if is_paused else "🟢 État: <b>ACTIF</b>"
 
@@ -1078,7 +1106,13 @@ def send_main_menu(is_paused: bool):
         max_pos = int(database.get_setting('MAX_OPEN_POSITIONS', os.getenv("MAX_OPEN_POSITIONS", "3")))
     except Exception:
         max_pos = 3
-    risk = getattr(trader, "RISK_PER_TRADE_PERCENT", 1.0)
+    
+    # Risque - LECTURE DEPUIS DB
+    try:
+        risk = float(database.get_setting('RISK_PER_TRADE_PERCENT', os.getenv("RISK_PER_TRADE_PERCENT", "1.0")))
+    except Exception:
+        risk = 1.0
+    
     leverage = getattr(trader, "LEVERAGE", 1)
 
     # Univers scanné (fallback 500)
@@ -1124,8 +1158,10 @@ def send_main_menu(is_paused: bool):
         f"{cw_chip}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🛠️ Commandes</b>\n"
+        f"💰 <code>/setrisk &lt;%&gt;</code> — Risque par trade\n"
         f"🌐 <code>/setuniverse &lt;nombre&gt;</code> — Taille du scan\n"
-        f"🔢 <code>/setmaxpos &lt;nombre&gt;</code> — Nb max de trades"
+        f"🔢 <code>/setmaxpos &lt;nombre&gt;</code> — Nb max de trades\n"
+        
     )
 
     keyboard = get_main_menu_keyboard(is_paused)
