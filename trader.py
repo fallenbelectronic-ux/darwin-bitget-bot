@@ -1464,19 +1464,23 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
     Détecte un signal Darwin (Tendance ou CT) avec VALIDATION STRICTE OBLIGATOIRE.
     
+    CORRECTION CRITIQUE : SL basé sur HIGH/LOW de CONTACT + RÉACTION (pas BB20/BB80 dernière bougie)
+    
     RÈGLES DARWIN OBLIGATOIRES :
     
     TENDANCE :
     1. Contact BB20
     2. Pattern de réaction 30% OBLIGATOIRE (pinbar/wick/marubozu/gap)
     3. Réintégration BB20 OBLIGATOIRE
-    4. RR >= MIN_RR
+    4. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
+    5. RR >= MIN_RR
     
     CONTRE-TENDANCE :
     1. Double extrême BB20 + BB80 OBLIGATOIRE
     2. Pattern de réaction 30% OBLIGATOIRE
     3. Réintégration BB20 + BB80 OBLIGATOIRE (les DEUX)
-    4. RR >= MIN_RR
+    4. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
+    5. RR >= MIN_RR
     
     Args:
         symbol: Symbole à analyser
@@ -1518,6 +1522,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         bb80_up = float(current['bb80_up'])
         bb80_lo = float(current['bb80_lo'])
         bb80_mid = float(current['bb80_mid'])
+        atr = float(current.get('atr', 0.0))
     except (KeyError, ValueError, TypeError):
         return None
     
@@ -1545,7 +1550,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reaction_result = find_reaction_pattern(df, contact_idx, 'long')
             
             if not reaction_result['valid']:
-                # Pas de pattern 30% valide → rejet
                 return None
             
             reaction_idx = reaction_result['reaction_idx']
@@ -1555,19 +1559,33 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
             
             if not reintegration_result['valid']:
-                # Pas de réintégration BB20 → rejet
                 return None
             
             reintegration_idx = reintegration_result['reintegration_idx']
             
+            # ✅ CORRECTION : Récupérer les bougies de contact et réaction
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            # ✅ CORRECTION : Stocker HIGH/LOW de contact et réaction
+            contact_high = float(contact_bar['high'])
+            contact_low = float(contact_bar['low'])
+            reaction_high = float(reaction_bar['high'])
+            reaction_low = float(reaction_bar['low'])
+            
             # Setup VALIDE → Calculer SL/TP
             entry_price = close
             
-            try:
-                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
-            except:
-                sl_offset_pct = 0.003
-            sl_price = bb20_lo * (1 - sl_offset_pct)
+            # ✅ CORRECTION : SL = MIN(contact_low, reaction_low) pour LONG
+            sl_anchor = min(contact_low, reaction_low)
+            
+            # Appliquer offset (ajustable depuis Telegram)
+            sl_price = adjust_sl_for_offset(
+                raw_sl=sl_anchor,
+                side='buy',
+                atr=atr,
+                ref_price=sl_anchor
+            )
             
             try:
                 min_rr = float(database.get_setting('MIN_RR', '3.0'))
@@ -1606,7 +1624,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'rr': rr_final,
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
-                    'entry_index': entry_idx
+                    'entry_index': entry_idx,
+                    # ✅ AJOUT : Stocker les niveaux pour recalc live
+                    'contact_high': contact_high,
+                    'contact_low': contact_low,
+                    'reaction_high': reaction_high,
+                    'reaction_low': reaction_low,
                 }
     
     # ========================================================================
@@ -1643,14 +1666,29 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             
             reintegration_idx = reintegration_result['reintegration_idx']
             
+            # ✅ CORRECTION : Récupérer les bougies de contact et réaction
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            # ✅ CORRECTION : Stocker HIGH/LOW
+            contact_high = float(contact_bar['high'])
+            contact_low = float(contact_bar['low'])
+            reaction_high = float(reaction_bar['high'])
+            reaction_low = float(reaction_bar['low'])
+            
             # Setup VALIDE
             entry_price = close
             
-            try:
-                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
-            except:
-                sl_offset_pct = 0.003
-            sl_price = bb20_up * (1 + sl_offset_pct)
+            # ✅ CORRECTION : SL = MAX(contact_high, reaction_high) pour SHORT
+            sl_anchor = max(contact_high, reaction_high)
+            
+            # Appliquer offset (ajustable depuis Telegram)
+            sl_price = adjust_sl_for_offset(
+                raw_sl=sl_anchor,
+                side='sell',
+                atr=atr,
+                ref_price=sl_anchor
+            )
             
             try:
                 min_rr = float(database.get_setting('MIN_RR', '3.0'))
@@ -1687,7 +1725,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'rr': rr_final,
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
-                    'entry_index': entry_idx
+                    'entry_index': entry_idx,
+                    # ✅ AJOUT : Stocker les niveaux
+                    'contact_high': contact_high,
+                    'contact_low': contact_low,
+                    'reaction_high': reaction_high,
+                    'reaction_low': reaction_low,
                 }
     
     # ========================================================================
@@ -1745,14 +1788,27 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if not (reintegrated_bb20 and reintegrated_bb80):
                 return None
             
+            # ✅ CORRECTION : Récupérer bougies contact/réaction
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            contact_high = float(contact_bar['high'])
+            contact_low = float(contact_bar['low'])
+            reaction_high = float(reaction_bar['high'])
+            reaction_low = float(reaction_bar['low'])
+            
             # Setup CT VALIDE
             entry_price = close
             
-            try:
-                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
-            except:
-                sl_offset_pct = 0.003
-            sl_price = bb80_lo * (1 - sl_offset_pct)
+            # ✅ CORRECTION : SL = MIN(contact_low, reaction_low) pour LONG CT
+            sl_anchor = min(contact_low, reaction_low)
+            
+            sl_price = adjust_sl_for_offset(
+                raw_sl=sl_anchor,
+                side='buy',
+                atr=atr,
+                ref_price=sl_anchor
+            )
             
             # TP = MM80 pour CT
             try:
@@ -1789,7 +1845,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'rr': rr_final,
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
-                    'entry_index': entry_idx
+                    'entry_index': entry_idx,
+                    # ✅ AJOUT
+                    'contact_high': contact_high,
+                    'contact_low': contact_low,
+                    'reaction_high': reaction_high,
+                    'reaction_low': reaction_low,
                 }
     
     # ========================================================================
@@ -1845,14 +1906,27 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if not (reintegrated_bb20 and reintegrated_bb80):
                 return None
             
+            # ✅ CORRECTION : Récupérer bougies
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            contact_high = float(contact_bar['high'])
+            contact_low = float(contact_bar['low'])
+            reaction_high = float(reaction_bar['high'])
+            reaction_low = float(reaction_bar['low'])
+            
             # Setup CT VALIDE
             entry_price = close
             
-            try:
-                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.003'))
-            except:
-                sl_offset_pct = 0.003
-            sl_price = bb80_up * (1 + sl_offset_pct)
+            # ✅ CORRECTION : SL = MAX(contact_high, reaction_high) pour SHORT CT
+            sl_anchor = max(contact_high, reaction_high)
+            
+            sl_price = adjust_sl_for_offset(
+                raw_sl=sl_anchor,
+                side='sell',
+                atr=atr,
+                ref_price=sl_anchor
+            )
             
             # TP = MM80 pour CT
             try:
@@ -1889,7 +1963,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'rr': rr_final,
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
-                    'entry_index': entry_idx
+                    'entry_index': entry_idx,
+                    # ✅ AJOUT
+                    'contact_high': contact_high,
+                    'contact_low': contact_low,
+                    'reaction_high': reaction_high,
+                    'reaction_low': reaction_low,
                 }
     
     return None
@@ -3145,18 +3224,30 @@ def _recalc_sl_tp_live(
     regime: str,
     entry_price: float,
     symbol: str,
-    timeframe: str
+    timeframe: str,
+    signal: Optional[Dict[str, Any]] = None
 ) -> Tuple[float, float, Optional[str]]:
     """
     Recalcule SL/TP live au moment de l'exécution selon la stratégie Darwin.
     
+    CORRECTION CRITIQUE : SL basé sur HIGH/LOW de CONTACT + RÉACTION (pas BB20/BB80 dernière bougie)
+    
     TENDANCE :
-    - SL = BB20 + offset
+    - SL = MAX/MIN(contact, reaction) + offset ajustable
     - TP = BB80 opposée + offset
     
     CONTRE-TENDANCE :
-    - SL = BB80 + offset
+    - SL = MAX/MIN(contact, reaction) + offset ajustable
     - TP = BB20_mid + offset
+    
+    Args:
+        df: DataFrame marché
+        side: 'buy' ou 'sell'
+        regime: 'Tendance' ou 'Contre-tendance'
+        entry_price: Prix d'entrée
+        symbol: Symbole
+        timeframe: Timeframe
+        signal: Signal dict contenant contact_high/low, reaction_high/low
     
     Returns:
         (sl_price, tp_price, error_message)
@@ -3179,43 +3270,79 @@ def _recalc_sl_tp_live(
         except Exception as e:
             return 0.0, 0.0, f"bb_missing:{e}"
         
-        # === TENDANCE ===
+        # ========================================================================
+        # ✅ CORRECTION : Utiliser les niveaux de CONTACT et RÉACTION du signal
+        # ========================================================================
+        
+        sl_anchor = None
+        
+        if signal:
+            contact_high = signal.get('contact_high')
+            contact_low = signal.get('contact_low')
+            reaction_high = signal.get('reaction_high')
+            reaction_low = signal.get('reaction_low')
+            
+            if is_long:
+                # LONG : SL = MIN(contact_low, reaction_low)
+                if contact_low is not None and reaction_low is not None:
+                    sl_anchor = min(float(contact_low), float(reaction_low))
+                elif contact_low is not None:
+                    sl_anchor = float(contact_low)
+                elif reaction_low is not None:
+                    sl_anchor = float(reaction_low)
+            else:
+                # SHORT : SL = MAX(contact_high, reaction_high)
+                if contact_high is not None and reaction_high is not None:
+                    sl_anchor = max(float(contact_high), float(reaction_high))
+                elif contact_high is not None:
+                    sl_anchor = float(contact_high)
+                elif reaction_high is not None:
+                    sl_anchor = float(reaction_high)
+        
+        # ========================================================================
+        # FALLBACK : Si pas de signal ou niveaux manquants → BB20/BB80
+        # ========================================================================
+        
+        if sl_anchor is None:
+            # Fallback sur BB (comportement ancien pour trades manuels)
+            if regime == 'Tendance':
+                sl_anchor = bb20_lo if is_long else bb20_up
+            else:  # Contre-tendance
+                sl_anchor = bb80_lo if is_long else bb80_up
+        
+        # ========================================================================
+        # CALCUL SL AVEC OFFSET AJUSTABLE (depuis Telegram)
+        # ========================================================================
+        
+        sl = adjust_sl_for_offset(
+            raw_sl=float(sl_anchor),
+            side=('buy' if is_long else 'sell'),
+            atr=float(atr),
+            ref_price=float(sl_anchor)
+        )
+        
+        # ========================================================================
+        # CALCUL TP (DYNAMIQUE - Dernière bougie)
+        # ========================================================================
+        
         if regime == 'Tendance':
             if is_long:
-                # LONG Tendance : SL = BB20_lo, TP = BB80_up
-                sl_raw = bb20_lo
                 tp_raw = bb80_up
-                
-                sl = adjust_sl_for_offset(sl_raw, 'buy', atr, ref_price=sl_raw)
-                tp = adjust_tp_for_bb_offset(tp_raw, 'buy', atr, ref_price=tp_raw)
-            
             else:
-                # SHORT Tendance : SL = BB20_up, TP = BB80_lo
-                sl_raw = bb20_up
                 tp_raw = bb80_lo
-                
-                sl = adjust_sl_for_offset(sl_raw, 'sell', atr, ref_price=sl_raw)
-                tp = adjust_tp_for_bb_offset(tp_raw, 'sell', atr, ref_price=tp_raw)
+        else:  # Contre-tendance
+            tp_raw = bb20_mid
         
-        # === CONTRE-TENDANCE ===
-        else:
-            if is_long:
-                # LONG CT : SL = BB80_lo, TP = BB20_mid
-                sl_raw = bb80_lo
-                tp_raw = bb20_mid
-                
-                sl = adjust_sl_for_offset(sl_raw, 'buy', atr, ref_price=sl_raw)
-                tp = adjust_tp_for_bb_offset(tp_raw, 'buy', atr, ref_price=tp_raw)
-            
-            else:
-                # SHORT CT : SL = BB80_up, TP = BB20_mid
-                sl_raw = bb80_up
-                tp_raw = bb20_mid
-                
-                sl = adjust_sl_for_offset(sl_raw, 'sell', atr, ref_price=sl_raw)
-                tp = adjust_tp_for_bb_offset(tp_raw, 'sell', atr, ref_price=tp_raw)
+        tp = adjust_tp_for_bb_offset(
+            raw_tp=float(tp_raw),
+            side=('buy' if is_long else 'sell'),
+            atr=float(atr),
+            ref_price=float(tp_raw)
+        )
         
-        # === VALIDATIONS ===
+        # ========================================================================
+        # VALIDATIONS FINALES
+        # ========================================================================
         
         # 1. SL ne doit pas être du mauvais côté de l'entry
         if is_long and sl >= entry_price:
@@ -3243,7 +3370,6 @@ def _recalc_sl_tp_live(
     except Exception as e:
         return 0.0, 0.0, f"recalc_error:{e}"
 
-
 def execute_signal_with_gates(
     ex: ccxt.Exchange,
     symbol: str,
@@ -3262,23 +3388,27 @@ def execute_signal_with_gates(
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
         return False, "Rejeté: données insuffisantes pour valider l'entrée."
 
-# --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
-    # Sans bougie de réaction valide avant l'entrée, on NE prend PAS le trade.
+    # --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
     passed_reaction = _check_reaction_before_entry(df, signal, is_long)
     msg_react = "no_reaction_pattern" if not passed_reaction else "reaction_found"
     if not passed_reaction:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=msg_react)
         return False, msg_react
 
-    # --- RECALCUL SL/TP LIVE ---
+    # ========================================================================
+    # ✅ CORRECTION : Passer le signal à _recalc_sl_tp_live()
+    # ========================================================================
+    
     sl, tp, err = _recalc_sl_tp_live(
         df=df,
         side=side,
         regime=regime,
         entry_price=entry_px,
         symbol=symbol,
-        timeframe=timeframe
+        timeframe=timeframe,
+        signal=signal  # ← AJOUT CRITIQUE
     )
+    
     if err:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason=err)
         return False, err
@@ -3293,13 +3423,11 @@ def execute_signal_with_gates(
         return False, f"Rejeté: RR={rr_calc:.2f} < {MIN_RR}."
 
     # --- CALCUL QTÉ ---
-    # Récupérer le solde
     balance_usdt = get_account_balance_usdt(ex)
     if balance_usdt is None or balance_usdt <= 0:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="balance_unavailable")
         return False, "Rejeté: solde USDT indisponible."
     
-    # Calculer la taille de position
     raw_qty = calculate_position_size(
         balance=balance_usdt,
         risk_percent=RISK_PER_TRADE_PERCENT,
@@ -3307,10 +3435,8 @@ def execute_signal_with_gates(
         sl_price=sl
     )
     
-    # Appliquer les caps (marge disponible + filtres marché)
     capped_qty, meta = _cap_qty_for_margin_and_filters(ex, symbol, side, raw_qty, entry_px)
     
-    # Vérifier que la quantité est valide après caps
     if meta.get('reason') == 'INSUFFICIENT_AFTER_CAP':
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="insufficient_margin")
         return False, "Rejeté: marge insuffisante après application des filtres."
@@ -3342,7 +3468,6 @@ def execute_signal_with_gates(
 
     if not is_paper_mode:
         try:
-            # Contexte marge/levier
             try:
                 ex.set_leverage(LEVERAGE, symbol)
                 try:
@@ -3362,10 +3487,7 @@ def execute_signal_with_gates(
                 if pos_open.get('symbol') == symbol and pos_open.get('side', '').lower() != side:
                     try:
                         close_position_manually(ex, int(pos_open['id']))
-                        
-                        # ✅ MODIFICATION 1 : Invalider cache après fermeture position inverse
                         clear_balance_cache()
-                        
                     except Exception as e_close:
                         notifier.tg_send(f"⚠️ Fermeture position inverse échouée pour {symbol}: {e_close}")
                         continue
@@ -3377,11 +3499,9 @@ def execute_signal_with_gates(
             if order and order.get('price'):
                 final_entry_price = float(order['price'])
             
-            # ✅ MODIFICATION 2 : Invalider cache solde après ouverture position
             clear_balance_cache()
 
-            # --- RÉCUPÉRATION DE LA TAILLE RÉELLE SUR L'EXCHANGE ---
-            # (permet d'avoir SL/TP exactement sur la taille exécutée)
+            # --- RÉCUPÉRATION TAILLE RÉELLE ---
             try:
                 market_real = None
                 try:
@@ -3437,10 +3557,7 @@ def execute_signal_with_gates(
                 create_market_order_smart(
                     ex, symbol, close_side, quantity, ref_price=final_entry_price, params=common_params
                 )
-                
-                # ✅ MODIFICATION 3 : Invalider cache après fermeture d'urgence
                 clear_balance_cache()
-                
             except Exception:
                 pass
             notifier.tg_send_error(f"Exécution d'ordre sur {symbol}", e)
