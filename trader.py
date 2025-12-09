@@ -1468,6 +1468,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     Détecte un signal Darwin (Tendance ou CT) avec VALIDATION STRICTE OBLIGATOIRE.
     
     CORRECTION CRITIQUE : SL basé sur HIGH/LOW de CONTACT + RÉACTION (pas BB20/BB80 dernière bougie)
+    ✅ LOOKBACK FIXE À 3 BOUGIES MAX (non modifiable)
     
     RÈGLES DARWIN OBLIGATOIRES :
     
@@ -1537,9 +1538,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     is_below_mm80 = close < mm80
     
     if is_above_mm80:
-        # Chercher contact BB20_lo dans les 6 dernières bougies
+        # ✅ CORRECTION 1/4 : Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
-        for i in range(len(df) - 3, len(df) - 1):
+        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
                 continue
             bar = df.iloc[i]
@@ -1640,9 +1641,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # ========================================================================
     
     if is_below_mm80:
-        # Chercher contact BB20_up dans les 6 dernières bougies
+        # ✅ CORRECTION 2/4 : Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
-        for i in range(len(df) - 3, len(df) - 1):
+        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
                 continue
             bar = df.iloc[i]
@@ -1741,9 +1742,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # ========================================================================
     
     if is_below_mm80:
-        # Chercher double extrême bas (BB20 + BB80 touchées)
+        # ✅ CORRECTION 3/4 : Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
-        for i in range(len(df) - 3, len(df) - 1):
+        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
                 continue
             
@@ -1861,9 +1862,9 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # ========================================================================
     
     if is_above_mm80:
-        # Chercher double extrême haut (BB20 + BB80 touchées)
+        # ✅ CORRECTION 4/4 : Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
-        for i in range(len(df) - 3, len(df) - 1):
+        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
                 continue
             
