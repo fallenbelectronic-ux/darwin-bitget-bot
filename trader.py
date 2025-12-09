@@ -10,7 +10,10 @@ import charting
 import utils
 
 # --- Paramètres de Trading ---
-RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
+try:
+    RISK_PER_TRADE_PERCENT = float(database.get_setting('RISK_PER_TRADE_PERCENT', os.getenv("RISK_PER_TRADE_PERCENT", "1.0")))
+except Exception:
+    RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "2"))
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 MIN_RR = float(os.getenv("MIN_RR", "3.0"))
