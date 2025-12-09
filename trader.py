@@ -2469,19 +2469,112 @@ def _current_mark_price(exchange, symbol: str) -> float:
 
 def _validate_sl_for_side(side: str, sl_price: float, current_mark: float, tick_size: float) -> float:
     """
-    Bitget: 
-      - short  : SL > current_mark
-      - long   : SL < current_mark
-    On pousse d'au moins 2 ticks pour être safe vs micro-écarts.
+    Bitget STRICT : 
+      - SHORT (sell) : SL > current_mark (protection au-dessus)
+      - LONG (buy)   : SL < current_mark (protection en-dessous)
+    
+    Ajoute 5 ticks de marge de sécurité (au lieu de 2) pour éviter rejets.
     """
-    if tick_size <= 0: tick_size = 0.0001
-    if str(side).lower() in ("sell", "short"):
+    if tick_size <= 0: 
+        tick_size = 0.0001
+    
+    # Marge de sécurité augmentée : 5 ticks au lieu de 2
+    safety_margin = 5.0 * tick_size
+    
+    side_clean = str(side).lower().strip()
+    
+    if side_clean in ("sell", "short"):
+        # SHORT : SL doit être > current_mark
         if sl_price <= current_mark:
-            sl_price = current_mark + 2.0 * tick_size
+            sl_price = current_mark + safety_margin
+        # Double vérification après ajustement
+        elif sl_price <= current_mark + tick_size:
+            sl_price = current_mark + safety_margin
     else:
+        # LONG : SL doit être < current_mark
         if sl_price >= current_mark:
-            sl_price = current_mark - 2.0 * tick_size
+            sl_price = current_mark - safety_margin
+        # Double vérification après ajustement
+        elif sl_price >= current_mark - tick_size:
+            sl_price = current_mark - safety_margin
+    
     return sl_price
+
+def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float], tp: Optional[float], 
+                      params: dict, is_long: bool, tick_size: float) -> tuple:
+    """
+    Place SL et TP de manière robuste avec détection des erreurs Bitget.
+    
+    Returns:
+        (sl_success: bool, tp_success: bool)
+    """
+    sl_ok = False
+    tp_ok = False
+    
+    # Récupérer mark price pour validation
+    try:
+        mark = _current_mark_price(ex, symbol)
+    except Exception:
+        mark = 0.0
+    
+    # ========== PLACEMENT SL ==========
+    if sl and qty > 0:
+        try:
+            # Validation STRICTE avant envoi
+            if mark > 0:
+                sl_validated = _validate_sl_for_side(
+                    ('buy' if is_long else 'sell'),
+                    float(sl),
+                    mark,
+                    tick_size
+                )
+            else:
+                sl_validated = float(sl)
+            
+            # Vérification finale des règles Bitget
+            if is_long:
+                # LONG : SL < mark
+                if sl_validated >= mark:
+                    print(f"⚠️ {symbol} LONG : SL {sl_validated:.6f} >= mark {mark:.6f} → skip")
+                    return False, tp_ok
+            else:
+                # SHORT : SL > mark
+                if sl_validated <= mark:
+                    print(f"⚠️ {symbol} SHORT : SL {sl_validated:.6f} <= mark {mark:.6f} → skip")
+                    return False, tp_ok
+            
+            # Placement SL
+            sl_side = 'sell' if is_long else 'buy'
+            ex.create_order(
+                symbol, 'market', sl_side, qty, price=None,
+                params={**params, 'stopLossPrice': float(sl_validated), 'triggerType': 'mark'}
+            )
+            sl_ok = True
+        
+        except Exception as e:
+            err_msg = str(e)
+            # Détection erreur 40836 (SL invalide)
+            if '40836' in err_msg or 'stop loss price' in err_msg.lower():
+                print(f"⚠️ {symbol} : SL invalide (40836) → position skippée ce cycle")
+            else:
+                print(f"❌ {symbol} : Erreur SL → {e}")
+    
+    # ========== PLACEMENT TP ==========
+    if tp and qty > 0:
+        try:
+            tp_side = 'sell' if is_long else 'buy'
+            tp_validated = _prepare_validated_tp(ex, symbol, tp_side, float(tp))
+            
+            ex.create_order(
+                symbol, 'market', tp_side, qty, price=None,
+                params={**params, 'takeProfitPrice': float(tp_validated), 'triggerType': 'mark'}
+            )
+            tp_ok = True
+        
+        except Exception as e:
+            print(f"❌ {symbol} : Erreur TP → {e}")
+    
+    return sl_ok, tp_ok
 
 def _extract_tp_sl_from_orders(orders: list) -> Tuple[Optional[float], Optional[float]]:
     """Retourne (tp_price, sl_price) détectés dans les ordres ouverts."""
@@ -5013,22 +5106,16 @@ def manage_open_positions(ex: ccxt.Exchange):
                         pass
 
                     if qty > 0:
-                        mark_now_tp = _current_mark_price(ex, symbol)
-                        sl_price = _validate_sl_for_side(
-                            ('buy' if is_long else 'sell'),
-                            float(sl_price),
-                            mark_now_tp,
-                            tick_size
+                        # ✅ UTILISATION DU WRAPPER
+                        _place_sl_tp_safe(
+                            ex, symbol, close_side, qty,
+                            sl=float(sl_price),
+                            tp=float(target_tp),
+                            params=common_params,
+                            is_long=is_long,
+                            tick_size=tick_size
                         )
-
-                        ex.create_order(
-                            symbol, 'market', close_side, qty, price=None,
-                            params={**common_params, 'stopLossPrice': float(sl_price), 'triggerType': 'mark'}
-                        )
-                        ex.create_order(
-                            symbol, 'market', close_side, qty, price=None,
-                            params={**common_params, 'takeProfitPrice': float(target_tp), 'triggerType': 'mark'}
-                        )
+                        
                         try:
                             database.update_trade_tp(pos['id'], float(target_tp))
                         except Exception:
@@ -5233,45 +5320,52 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-                ex.create_order(
-                    symbol, 'market', close_side, qty, price=None,
-                    params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
+                # ✅ UTILISATION DU WRAPPER
+                sl_ok, _ = _place_sl_tp_safe(
+                    ex, symbol, close_side, qty,
+                    sl=float(want_sl),
+                    tp=None,
+                    params=common_params,
+                    is_long=is_long,
+                    tick_size=tick_size
                 )
-                try:
-                    database.update_trade_to_breakeven(pos['id'], float(qty), float(want_sl))
-                    sl_current = float(want_sl)
-                    be_armed = True
+                
+                if sl_ok:
+                    try:
+                        database.update_trade_to_breakeven(pos['id'], float(qty), float(want_sl))
+                        sl_current = float(want_sl)
+                        be_armed = True
 
-                    if prev_be_status != 'ACTIVE':
-                        try:
-                            remaining_qty = float(qty)
-                            entry_price_be = float(pos.get('entry_price') or 0.0)
-                            curr = mark_now_be
-                            if curr is None or entry_price_be <= 0 or remaining_qty <= 0:
-                                pnl_realised = 0.0
-                            else:
-                                if is_long:
-                                    pnl_realised = max(0.0, (curr - entry_price_be) * remaining_qty)
+                        if prev_be_status != 'ACTIVE':
+                            try:
+                                remaining_qty = float(qty)
+                                entry_price_be = float(pos.get('entry_price') or 0.0)
+                                curr = mark_now_be
+                                if curr is None or entry_price_be <= 0 or remaining_qty <= 0:
+                                    pnl_realised = 0.0
                                 else:
-                                    pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
-                            
-                            if is_manual_trade:
-                                notifier.tg_send(
-                                    f"🔵 **Trade Manuel → BE Activé**\n\n"
-                                    f"📊 {symbol} {pos['side'].upper()}\n"
-                                    f"💰 PnL sécurisé : {pnl_realised:.2f} USDT\n"
-                                    f"🛡️ SL déplacé au Break-Even"
-                                )
-                            else:
-                                notifier.send_breakeven_notification(
-                                    symbol=symbol,
-                                    pnl_realised=float(pnl_realised),
-                                    remaining_qty=float(remaining_qty)
-                                )
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                                    if is_long:
+                                        pnl_realised = max(0.0, (curr - entry_price_be) * remaining_qty)
+                                    else:
+                                        pnl_realised = max(0.0, (entry_price_be - curr) * remaining_qty)
+                                
+                                if is_manual_trade:
+                                    notifier.tg_send(
+                                        f"🔵 **Trade Manuel → BE Activé**\n\n"
+                                        f"📊 {symbol} {pos['side'].upper()}\n"
+                                        f"💰 PnL sécurisé : {pnl_realised:.2f} USDT\n"
+                                        f"🛡️ SL déplacé au Break-Even"
+                                    )
+                                else:
+                                    notifier.send_breakeven_notification(
+                                        symbol=symbol,
+                                        pnl_realised=float(pnl_realised),
+                                        remaining_qty=float(remaining_qty)
+                                    )
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
         # ========================================================================
         # NIVEAU 3B : TRAILING PAR PALIERS
@@ -5314,17 +5408,24 @@ def manage_open_positions(ex: ccxt.Exchange):
                             except Exception:
                                 pass
                             
-                            ex.create_order(
-                                symbol, 'market', close_side, qty, price=None,
-                                params={**common_params, 'stopLossPrice': float(target_sl), 'triggerType': 'mark'}
+                            # ✅ UTILISATION DU WRAPPER
+                            sl_ok, _ = _place_sl_tp_safe(
+                                ex, symbol, close_side, qty,
+                                sl=float(target_sl),
+                                tp=None,
+                                params=common_params,
+                                is_long=is_long,
+                                tick_size=tick_size
                             )
-                            try:
-                                database.update_trade_sl(pos['id'], float(target_sl))
-                                sl_current = float(target_sl)
-                                pos['sl_price'] = float(target_sl)
-                            except Exception:
-                                pass
-                            break
+                            
+                            if sl_ok:
+                                try:
+                                    database.update_trade_sl(pos['id'], float(target_sl))
+                                    sl_current = float(target_sl)
+                                    pos['sl_price'] = float(target_sl)
+                                except Exception:
+                                    pass
+                                break
         
         # ========================================================================
         # NIVEAU 3C : TRAILING FINAL SERRÉ (>90% du TP)
@@ -5367,16 +5468,23 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
                 
-                ex.create_order(
-                    symbol, 'market', close_side, qty, price=None,
-                    params={**common_params, 'stopLossPrice': float(want_sl), 'triggerType': 'mark'}
+                # ✅ UTILISATION DU WRAPPER
+                sl_ok, _ = _place_sl_tp_safe(
+                    ex, symbol, close_side, qty,
+                    sl=float(want_sl),
+                    tp=None,
+                    params=common_params,
+                    is_long=is_long,
+                    tick_size=tick_size
                 )
-                try:
-                    database.update_trade_sl(pos['id'], float(want_sl))
-                    pos['sl_price'] = float(want_sl)
-                    pos['breakeven_status'] = 'ACTIVE'
-                except Exception:
-                    pass
+                
+                if sl_ok:
+                    try:
+                        database.update_trade_sl(pos['id'], float(want_sl))
+                        pos['sl_price'] = float(want_sl)
+                        pos['breakeven_status'] = 'ACTIVE'
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Erreur trailing final {symbol}: {e}")
 
