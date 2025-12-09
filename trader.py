@@ -1539,7 +1539,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_above_mm80:
         # Chercher contact BB20_lo dans les 6 dernières bougies
         contact_idx = None
-        for i in range(len(df) - 6, len(df) - 1):
+        for i in range(len(df) - 3, len(df) - 1):
             if i < 0:
                 continue
             bar = df.iloc[i]
@@ -1642,7 +1642,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_below_mm80:
         # Chercher contact BB20_up dans les 6 dernières bougies
         contact_idx = None
-        for i in range(len(df) - 6, len(df) - 1):
+        for i in range(len(df) - 3, len(df) - 1):
             if i < 0:
                 continue
             bar = df.iloc[i]
@@ -1743,7 +1743,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_below_mm80:
         # Chercher double extrême bas (BB20 + BB80 touchées)
         contact_idx = None
-        for i in range(len(df) - 6, len(df) - 1):
+        for i in range(len(df) - 3, len(df) - 1):
             if i < 0:
                 continue
             
@@ -1863,7 +1863,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if is_above_mm80:
         # Chercher double extrême haut (BB20 + BB80 touchées)
         contact_idx = None
-        for i in range(len(df) - 6, len(df) - 1):
+        for i in range(len(df) - 3, len(df) - 1):
             if i < 0:
                 continue
             
