@@ -1469,6 +1469,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     CORRECTION CRITIQUE : SL basé sur HIGH/LOW de CONTACT + RÉACTION (pas BB20/BB80 dernière bougie)
     ✅ LOOKBACK FIXE À 3 BOUGIES MAX (non modifiable)
+    ✅ GATE EXCÈS PROLONGÉ BB80 : Ignore premier signal après 5+ bougies hors BB80
+    ✅ GATE CT SÉQUENCE STRICTE : Contact → Réintégration → Pas de ressortie
     
     RÈGLES DARWIN OBLIGATOIRES :
     
@@ -1538,6 +1540,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     is_below_mm80 = close < mm80
     
     if is_above_mm80:
+        # ✅ GATE 1/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
+        if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
+            return None
+        
         # ✅ CORRECTION 1/4 : Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
@@ -1641,6 +1647,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # ========================================================================
     
     if is_below_mm80:
+        # ✅ GATE 2/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
+        if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
+            return None
+        
         # ✅ CORRECTION 2/4 : Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
@@ -1730,7 +1740,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx,
-                    # ✅ AJOUT : Stocker les niveaux
                     'contact_high': contact_high,
                     'contact_low': contact_low,
                     'reaction_high': reaction_high,
@@ -1742,7 +1751,15 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # ========================================================================
     
     if is_below_mm80:
-        # ✅ CORRECTION 3/4 : Lookback FIXE à 3 bougies max (non modifiable)
+        # Excès prolongé BB80 (ignore premier signal après réintégration)
+        if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
+            return None
+        
+        # Validation séquence stricte (Contact → Réintégration → Pas de ressortie)
+        if not _check_ct_reintegration_window(df, is_long=True, max_window=3):
+            return None
+        
+        # Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
@@ -1792,7 +1809,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if not (reintegrated_bb20 and reintegrated_bb80):
                 return None
             
-            # ✅ CORRECTION : Récupérer bougies contact/réaction
+            # Récupérer bougies contact/réaction
             contact_bar = df.iloc[contact_idx]
             reaction_bar = df.iloc[reaction_idx]
             
@@ -1862,7 +1879,15 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # ========================================================================
     
     if is_above_mm80:
-        # ✅ CORRECTION 4/4 : Lookback FIXE à 3 bougies max (non modifiable)
+        # ✅ GATE 4/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
+        if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
+            return None
+        
+        # ✅ GATE CT : Validation séquence stricte (Contact → Réintégration → Pas de ressortie)
+        if not _check_ct_reintegration_window(df, is_long=False, max_window=3):
+            return None
+        
+        # Lookback FIXE à 3 bougies max (non modifiable)
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
@@ -1910,7 +1935,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if not (reintegrated_bb20 and reintegrated_bb80):
                 return None
             
-            # ✅ CORRECTION : Récupérer bougies
+            # Récupérer bougies
             contact_bar = df.iloc[contact_idx]
             reaction_bar = df.iloc[reaction_idx]
             
@@ -1968,7 +1993,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx,
-                    # ✅ AJOUT
                     'contact_high': contact_high,
                     'contact_low': contact_low,
                     'reaction_high': reaction_high,
@@ -1976,7 +2000,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 }
     
     return None
-    
+
+
 def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
     """
     Charge le DF préparé, appelle detect_signal(), enregistre le signal et notifie.
@@ -2800,7 +2825,43 @@ def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[List[str]] = None
         return out
     except Exception:
         return []
-            
+
+def _cancel_all_orders_safe(ex: ccxt.Exchange, symbol: str) -> None:
+    """
+    Annule TOUS les ordres ouverts sur un symbole de manière robuste.
+    
+    Utilisé pour nettoyer les ordres restants (TP/SL/BE) après:
+    - Fermeture manuelle position
+    - Détection position fermée par exchange
+    - Sync positions
+    
+    Ne lève JAMAIS d'exception (fail-safe).
+    
+    Args:
+        ex: Exchange
+        symbol: Symbole à nettoyer
+    """
+    try:
+        # Récupérer tous les ordres ouverts
+        orders = ex.fetch_open_orders(symbol)
+        
+        if not orders:
+            return
+        
+        # Annuler chaque ordre individuellement
+        for order in orders:
+            try:
+                order_id = order.get('id')
+                if order_id:
+                    ex.cancel_order(order_id, symbol)
+            except Exception:
+                # Skip silencieusement si ordre déjà annulé/exécuté
+                continue
+    
+    except Exception:
+        # Fail-safe : ne jamais casser l'exécution
+        pass
+
 def _fetch_balance_safe(exchange):
     try:
         exchange.load_markets()
@@ -3485,6 +3546,11 @@ def execute_signal_with_gates(
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
         return False, "Rejeté: données insuffisantes pour valider l'entrée."
 
+    # --- ✅ GATE CORRELATION/SECTEUR (AJOUTÉ) ---
+    if not check_correlation_risk(ex, symbol, side):
+        _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="correlation_risk")
+        return False, "Rejeté: risque correlation/secteur trop élevé."
+
     # --- GATE RÉACTION OBLIGATOIRE (TENDANCE + CT) ---
     passed_reaction = _check_reaction_before_entry(df, signal, is_long)
     msg_react = "no_reaction_pattern" if not passed_reaction else "reaction_found"
@@ -3624,26 +3690,19 @@ def execute_signal_with_gates(
 
             # --- Ordres SL/TP ---
             try:
-                sl_side = 'sell' if is_long else 'buy'
-                sl_params = {
-                    'stopLossPrice': str(sl),
-                    'tdMode': 'cross',
-                    'posMode': 'oneway',
-                }
-                ex.create_order(symbol, 'market', sl_side, quantity, params=sl_params)
-            except Exception as e_sl:
-                notifier.tg_send(f"⚠️ SL non placé pour {symbol}: {e_sl}")
+                market = ex.market(symbol) or {}
+                tick_size = _bitget_tick_size(market)
+            except Exception:
+                tick_size = 0.0001
 
-            try:
-                tp_side = 'sell' if is_long else 'buy'
-                tp_params = {
-                    'takeProfitPrice': str(tp),
-                    'tdMode': 'cross',
-                    'posMode': 'oneway',
-                }
-                ex.create_order(symbol, 'market', tp_side, quantity, params=tp_params)
-            except Exception as e_tp:
-                notifier.tg_send(f"⚠️ TP non placé pour {symbol}: {e_tp}")
+            sl_ok, tp_ok = _place_sl_tp_safe(
+                ex, symbol, side, quantity,
+                sl=float(sl),
+                tp=float(tp),
+                params=common_params,
+                is_long=is_long,
+                tick_size=tick_size
+            )
 
         except Exception as e:
             try:
@@ -3680,19 +3739,17 @@ def execute_signal_with_gates(
     _update_signal_state(symbol, timeframe, signal, final_entry_price, "VALID", tp=float(tp), sl=float(sl))
 
     # ========================================================================
-    # ✅ CORRECTION : GÉNÉRATION GRAPHIQUE AVEC LOGGING COMPLET
+    # GÉNÉRATION GRAPHIQUE
     # ========================================================================
     
     chart_image = None
     
     try:
-        # Vérifier que le signal contient les index nécessaires
         required_keys = ['contact_index', 'reaction_index', 'entry_index']
         missing_keys = [k for k in required_keys if k not in signal]
         
         if missing_keys:
             print(f"⚠️ Signal {symbol} incomplet pour graphique. Manquant: {missing_keys}")
-            print(f"   Clés disponibles: {list(signal.keys())}")
             
             try:
                 notifier.tg_send(
@@ -3704,7 +3761,6 @@ def execute_signal_with_gates(
                 pass
         
         else:
-            # Vérifier que le DF contient assez de données
             contact_idx = signal.get('contact_index')
             reaction_idx = signal.get('reaction_index')
             entry_idx = signal.get('entry_index')
@@ -3713,7 +3769,6 @@ def execute_signal_with_gates(
             
             if df is None or len(df) <= max_idx:
                 print(f"⚠️ DF {symbol} trop court pour graphique")
-                print(f"   DF length: {len(df) if df is not None else 0}, max_idx needed: {max_idx}")
                 
                 try:
                     notifier.tg_send(
@@ -3725,10 +3780,7 @@ def execute_signal_with_gates(
                     pass
             
             else:
-                # Tout est OK → générer le graphique
                 print(f"📊 Génération graphique {symbol}...")
-                print(f"   contact_idx={contact_idx}, reaction_idx={reaction_idx}, entry_idx={entry_idx}")
-                print(f"   DF length={len(df)}, SL={sl:.4f}, TP={tp:.4f}")
                 
                 chart_image = charting.generate_trade_chart(symbol, df, signal)
                 
@@ -3739,13 +3791,12 @@ def execute_signal_with_gates(
     
     except Exception as e:
         print(f"❌ ERREUR génération graphique {symbol}: {e}")
-        print(f"   Type: {type(e).__name__}")
         
         import traceback
         traceback.print_exc()
         
         try:
-            error_msg = str(e)[:200]  # Limiter la longueur
+            error_msg = str(e)[:200]
             notifier.tg_send(
                 f"❌ **Erreur Graphique**\n\n"
                 f"🎯 {symbol}\n"
@@ -3756,10 +3807,6 @@ def execute_signal_with_gates(
             pass
         
         chart_image = None
-
-    # ========================================================================
-    # FIN CORRECTION GRAPHIQUE
-    # ========================================================================
 
     mode_text = "PAPIER" if is_paper_mode else "RÉEL"
     trade_message = notifier.format_trade_message(symbol, signal, quantity, mode_text, RISK_PER_TRADE_PERCENT)
@@ -3777,6 +3824,7 @@ def execute_signal_with_gates(
             pass
 
     return True, "Position ouverte avec succès."
+
 
 def get_tp_offset_pct() -> float:
     """Retourne le pourcentage d'offset (ex: 0.003 = 0.3%) pour TP/SL depuis la DB,
@@ -5434,21 +5482,20 @@ def manage_open_positions(ex: ccxt.Exchange):
         
         if progress >= 0.90:
             try:
-                try:
-                    final_atr_k = float(database.get_setting('TRAIL_FINAL_ATR_K', 0.5))
-                except Exception:
-                    final_atr_k = 0.5
+                # ✅ UTILISER LE HELPER EXISTANT (au lieu de calcul inline)
+                want_sl = _compute_trailing_sl(
+                    mark_price=mark_now,
+                    side=('buy' if is_long else 'sell'),
+                    atr=last_atr
+                )
                 
-                if is_long:
-                    want_sl = mark_now - (final_atr_k * last_atr)
-                else:
-                    want_sl = mark_now + (final_atr_k * last_atr)
-                
+                # Vérifier amélioration SL
                 if is_long and want_sl <= sl_current:
                     continue
                 if (not is_long) and want_sl >= sl_current:
                     continue
                 
+                # Vérifier mouvement minimum
                 try:
                     min_move_pct = float(database.get_setting('TRAIL_MIN_MOVE_PCT', 0.001))
                 except Exception:
@@ -5458,6 +5505,7 @@ def manage_open_positions(ex: ccxt.Exchange):
                 if abs(want_sl - sl_current) < min_move_abs:
                     continue
                 
+                # Valider pour Bitget
                 want_sl = _validate_sl_for_side(
                     ('buy' if is_long else 'sell'),
                     float(want_sl),
