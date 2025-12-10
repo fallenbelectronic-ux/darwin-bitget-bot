@@ -2066,6 +2066,8 @@ def get_account_balance_usdt(ex=None) -> Optional[float]:
     """
     Retourne le solde total en USDT (et le met en cache dans settings.CURRENT_BALANCE_USDT).
     Supporte Bybit/Bitget via ccxt.fetchBalance().
+    
+    ✅ CORRECTION : Erreurs silencieuses (logs console uniquement)
     """
     try:
         if ex is None and hasattr(globals(), "create_exchange"):
@@ -2144,7 +2146,8 @@ def get_account_balance_usdt(ex=None) -> Optional[float]:
         return total
 
     except Exception as e:
-        print(f"Erreur get_account_balance_usdt: {e}")
+        # ✅ CORRECTION : Log console uniquement (pas de notification Telegram)
+        print(f"⚠️ [get_account_balance_usdt] Erreur : {e}")
         return None
 
 def clear_balance_cache():
@@ -2531,6 +2534,9 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
     """
     Place SL et TP de manière robuste avec détection des erreurs Bitget.
     
+    ✅ CORRECTION : Continue à placer le TP même si le SL échoue
+    ✅ Notifie si TP non placé (changement d'avis utilisateur)
+    
     Returns:
         (sl_success: bool, tp_success: bool)
     """
@@ -2543,7 +2549,10 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
     except Exception:
         mark = 0.0
     
+    # ========================================================================
     # ========== PLACEMENT SL ==========
+    # ========================================================================
+    
     if sl and qty > 0:
         try:
             # Validation STRICTE avant envoi
@@ -2558,47 +2567,120 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
                 sl_validated = float(sl)
             
             # Vérification finale des règles Bitget
+            sl_invalid = False
+            
             if is_long:
                 # LONG : SL < mark
                 if sl_validated >= mark:
-                    print(f"⚠️ {symbol} LONG : SL {sl_validated:.6f} >= mark {mark:.6f} → skip")
-                    return False, tp_ok
+                    print(f"⚠️ {symbol} LONG : SL {sl_validated:.6f} >= mark {mark:.6f} → skip SL")
+                    sl_invalid = True
             else:
                 # SHORT : SL > mark
                 if sl_validated <= mark:
-                    print(f"⚠️ {symbol} SHORT : SL {sl_validated:.6f} <= mark {mark:.6f} → skip")
-                    return False, tp_ok
+                    print(f"⚠️ {symbol} SHORT : SL {sl_validated:.6f} <= mark {mark:.6f} → skip SL")
+                    sl_invalid = True
             
-            # Placement SL
-            sl_side = 'sell' if is_long else 'buy'
-            ex.create_order(
-                symbol, 'market', sl_side, qty, price=None,
-                params={**params, 'stopLossPrice': float(sl_validated), 'triggerType': 'mark'}
-            )
-            sl_ok = True
+            # ✅ CORRECTION : Ne pas placer le SL si invalide, mais CONTINUER vers le TP
+            if not sl_invalid:
+                # Placement SL
+                sl_side = 'sell' if is_long else 'buy'
+                
+                try:
+                    ex.create_order(
+                        symbol, 'market', sl_side, qty, price=None,
+                        params={**params, 'stopLossPrice': float(sl_validated), 'triggerType': 'mark'}
+                    )
+                    sl_ok = True
+                    print(f"✅ {symbol} : SL placé à {sl_validated:.6f}")
+                
+                except Exception as e_sl:
+                    err_msg = str(e_sl)
+                    # Détection erreur 40836 (SL invalide)
+                    if '40836' in err_msg or 'stop loss price' in err_msg.lower():
+                        print(f"⚠️ {symbol} : SL invalide (40836) → SL skippé, mais TP va être tenté")
+                    else:
+                        print(f"❌ {symbol} : Erreur SL → {e_sl}")
+            
+            else:
+                print(f"⚠️ {symbol} : SL invalide (règles Bitget) → SL skippé, mais TP va être tenté")
         
         except Exception as e:
-            err_msg = str(e)
-            # Détection erreur 40836 (SL invalide)
-            if '40836' in err_msg or 'stop loss price' in err_msg.lower():
-                print(f"⚠️ {symbol} : SL invalide (40836) → position skippée ce cycle")
-            else:
-                print(f"❌ {symbol} : Erreur SL → {e}")
+            print(f"❌ {symbol} : Erreur validation SL → {e}")
+            # ✅ IMPORTANT : Ne pas return ici, continuer vers le TP
     
+    # ========================================================================
     # ========== PLACEMENT TP ==========
+    # ========================================================================
+    
     if tp and qty > 0:
         try:
             tp_side = 'sell' if is_long else 'buy'
-            tp_validated = _prepare_validated_tp(ex, symbol, tp_side, float(tp))
             
-            ex.create_order(
-                symbol, 'market', tp_side, qty, price=None,
-                params={**params, 'takeProfitPrice': float(tp_validated), 'triggerType': 'mark'}
-            )
-            tp_ok = True
+            # Validation TP
+            try:
+                tp_validated = _prepare_validated_tp(ex, symbol, tp_side, float(tp))
+            except Exception as e_val:
+                print(f"⚠️ {symbol} : Erreur validation TP → {e_val}")
+                tp_validated = float(tp)
+            
+            # Placement TP
+            try:
+                ex.create_order(
+                    symbol, 'market', tp_side, qty, price=None,
+                    params={**params, 'takeProfitPrice': float(tp_validated), 'triggerType': 'mark'}
+                )
+                tp_ok = True
+                print(f"✅ {symbol} : TP placé à {tp_validated:.6f}")
+            
+            except Exception as e_tp:
+                err_msg = str(e_tp)
+                
+                # Log détaillé pour debug
+                print(f"❌ {symbol} : Erreur placement TP")
+                print(f"   Prix TP : {tp_validated:.6f}")
+                print(f"   Prix mark : {mark:.6f}")
+                print(f"   Quantité : {qty:.6f}")
+                print(f"   Erreur : {err_msg}")
+                
+                # ✅ Notifier si erreur critique (remis suite changement d'avis)
+                if '40836' in err_msg or 'take profit price' in err_msg.lower():
+                    try:
+                        notifier.tg_send(
+                            f"⚠️ **TP NON PLACÉ**\n\n"
+                            f"{symbol} {side.upper()}\n"
+                            f"Prix TP : {tp_validated:.6f}\n"
+                            f"Prix mark : {mark:.6f}\n"
+                            f"Erreur : TP invalide (40836)\n\n"
+                            f"❗ Placer le TP manuellement"
+                        )
+                    except Exception:
+                        pass
         
         except Exception as e:
             print(f"❌ {symbol} : Erreur TP → {e}")
+    
+    # ========================================================================
+    # ========== RÉSUMÉ ==========
+    # ========================================================================
+    
+    if sl and qty > 0 and not sl_ok:
+        print(f"⚠️ {symbol} : SL NON placé")
+    
+    if tp and qty > 0 and not tp_ok:
+        print(f"⚠️ {symbol} : TP NON placé")
+        
+        # ✅ NOTIFICATION TELEGRAM si TP échoue (remis suite changement d'avis)
+        try:
+            notifier.tg_send(
+                f"⚠️ **ALERTE TP**\n\n"
+                f"🎯 {symbol}\n"
+                f"TP non placé sur l'exchange\n\n"
+                f"{'✅' if sl_ok else '❌'} SL : {sl:.6f if sl else 'N/A'}\n"
+                f"❌ TP : {tp:.6f if tp else 'N/A'}\n\n"
+                f"❗ Vérifier et placer manuellement"
+            )
+        except Exception:
+            pass
     
     return sl_ok, tp_ok
 
@@ -2863,6 +2945,11 @@ def _cancel_all_orders_safe(ex: ccxt.Exchange, symbol: str) -> None:
         pass
 
 def _fetch_balance_safe(exchange):
+    """
+    Récupère le solde de manière robuste.
+    
+    ✅ CORRECTION : Erreurs silencieuses (pas de spam Telegram)
+    """
     try:
         exchange.load_markets()
     except Exception:
@@ -2897,23 +2984,31 @@ def _fetch_balance_safe(exchange):
                     last_err = e
                     continue
 
-            try:
-                notifier.tg_send(f"❌ Erreur: Récupération du solde\nbitget {str(last_err)}")
-            except Exception:
-                pass
+            # ✅ CORRECTION : Erreur SILENCIEUSE (pas de notification Telegram)
+            # Ancienne ligne commentée :
+            # try:
+            #     notifier.tg_send(f"❌ Erreur: Récupération du solde\nbitget {str(last_err)}")
+            # except Exception:
+            #     pass
+            
+            # Log console uniquement
+            print(f"⚠️ [_fetch_balance_safe] Erreur Bitget : {last_err}")
             return {}
 
         bal = exchange.fetch_balance()
         return bal if bal else {}
+    
     except Exception as e:
-        try:
-            notifier.tg_send(f"❌ Erreur: Récupération du solde\n{getattr(exchange,'id','')} {str(e)}")
-        except Exception:
-            pass
+        # ✅ CORRECTION : Erreur SILENCIEUSE (pas de notification Telegram)
+        # Ancienne ligne commentée :
+        # try:
+        #     notifier.tg_send(f"❌ Erreur: Récupération du solde\n{getattr(exchange,'id','')} {str(e)}")
+        # except Exception:
+        #     pass
+        
+        # Log console uniquement
+        print(f"⚠️ [_fetch_balance_safe] Erreur {getattr(exchange,'id','')} : {e}")
         return {}
-
-
-
 
 def get_portfolio_equity_usdt(exchange) -> float:
     """
@@ -4316,7 +4411,7 @@ def execute_pyramid_add(ex, pyramid_info: Dict[str, Any]) -> bool:
     2. Recalculer prix d'entrée moyen
     3. Ajuster SL (ne jamais reculer)
     4. Mettre à jour DB
-    5. Notifier
+    5. Notifier (SANS donner l'impression d'un nouveau trade)
     
     Args:
         ex: Exchange
@@ -4434,21 +4529,41 @@ def execute_pyramid_add(ex, pyramid_info: Dict[str, Any]) -> bool:
             try:
                 new_sl = float(ex.price_to_precision(symbol, new_sl))
                 new_tp = float(ex.price_to_precision(symbol, new_tp))
-                total_qty = float(ex.amount_to_precision(symbol, total_qty))
+                total_qty_prec = float(ex.amount_to_precision(symbol, total_qty))
             except Exception:
-                pass
+                total_qty_prec = total_qty
             
-            ex.create_order(
-                symbol, 'market', close_side, total_qty, price=None,
-                params={**common_params, 'stopLossPrice': float(new_sl), 'reduceOnly': True, 'triggerType': 'mark'}
+            # ✅ ANNULER ANCIENS ORDRES TP/SL AVANT D'EN PLACER DE NOUVEAUX
+            try:
+                _cancel_all_orders_safe(ex, symbol)
+                print(f"[pyramiding] Anciens ordres annulés pour {symbol}")
+            except Exception as e:
+                print(f"[pyramiding] Erreur annulation ordres: {e}")
+            
+            # ✅ PLACER NOUVEAUX TP/SL AVEC LOGS
+            sl_ok, tp_ok = _place_sl_tp_safe(
+                ex, symbol, close_side, total_qty_prec,
+                sl=float(new_sl),
+                tp=float(new_tp),
+                params={**common_params, 'reduceOnly': True},
+                is_long=is_long,
+                tick_size=tick_size
             )
-            ex.create_order(
-                symbol, 'market', close_side, total_qty, price=None,
-                params={**common_params, 'takeProfitPrice': float(new_tp), 'reduceOnly': True, 'triggerType': 'mark'}
-            )
+            
+            if not sl_ok:
+                print(f"[pyramiding] ⚠️ SL non placé sur {symbol}")
+            else:
+                print(f"[pyramiding] ✅ SL placé sur {symbol}: {new_sl}")
+            
+            if not tp_ok:
+                print(f"[pyramiding] ⚠️ TP non placé sur {symbol}")
+            else:
+                print(f"[pyramiding] ✅ TP placé sur {symbol}: {new_tp}")
         
         except Exception as e:
-            print(f"Erreur placement SL/TP pyramiding: {e}")
+            print(f"[pyramiding] Erreur placement SL/TP: {e}")
+            import traceback
+            traceback.print_exc()
         
         # ====== 7. METTRE À JOUR DB ======
         
@@ -4477,28 +4592,45 @@ def execute_pyramid_add(ex, pyramid_info: Dict[str, Any]) -> bool:
             except Exception:
                 pass
         
-        # ====== 8. NOTIFICATION ======
+        # ====== 8. ✅ NOTIFICATION AMÉLIORÉE (Pas comme un nouveau trade) ======
         
         try:
+            # Calculer distances TP/BE
+            if is_long:
+                distance_to_tp = ((new_tp - current_price) / current_price) * 100
+                distance_to_be = ((new_sl - current_price) / current_price) * 100
+            else:
+                distance_to_tp = ((current_price - new_tp) / current_price) * 100
+                distance_to_be = ((current_price - new_sl) / current_price) * 100
+            
             notifier.tg_send(
-                f"📈 **PYRAMIDING AJOUTÉ**\n\n"
-                f"🎯 {symbol} {side.upper()}\n"
-                f"➕ Ajout #{pyramid_count}\n"
-                f"📊 Breakout : {pyramid_info['breakout_level']}\n"
-                f"💰 Profit actuel : +{pyramid_info['profit_pct']:.2f}%\n\n"
-                f"📦 Quantité :\n"
-                f"  • Avant : {old_qty:.6f}\n"
-                f"  • Ajout : +{add_qty:.6f}\n"
-                f"  • Total : {total_qty:.6f}\n\n"
-                f"💵 Prix d'entrée :\n"
-                f"  • Initial : {old_entry:.4f}\n"
-                f"  • Ajout : {filled_price:.4f}\n"
-                f"  • Moyen : {new_avg_entry:.4f}\n\n"
-                f"🛡️ Nouveau SL : {new_sl:.4f}\n"
-                f"🎯 TP : {new_tp:.4f}"
+                f"📈 **PYRAMIDING #{pyramid_count}**\n\n"
+                f"{'🟢' if is_long else '🔴'} {symbol} {side.upper()}\n"
+                f"💚 Profit actuel : +{pyramid_info['profit_pct']:.2f}%\n"
+                f"📊 Breakout : {pyramid_info['breakout_level']}\n\n"
+                f"➕ **Ajout position**\n"
+                f"  • Quantité ajoutée : {add_qty:.6f}\n"
+                f"  • Prix d'ajout : {filled_price:.4f}\n"
+                f"  • Prix moyen : {old_entry:.4f} → {new_avg_entry:.4f}\n\n"
+                f"📦 **Position totale**\n"
+                f"  • Quantité : {old_qty:.6f} → {total_qty:.6f}\n\n"
+                f"🎯 **Nouveaux objectifs**\n"
+                f"  • TP : {new_tp:.4f} ({distance_to_tp:+.2f}%)\n"
+                f"  • BE : {new_sl:.4f} ({distance_to_be:+.2f}%)\n\n"
+                f"🔢 Trade #{position_id}"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # Fallback notification simple
+            try:
+                notifier.tg_send(
+                    f"📈 PYRAMIDING #{pyramid_count}\n"
+                    f"{symbol} : +{add_qty:.6f} @ {filled_price:.4f}\n"
+                    f"Total : {total_qty:.6f}\n"
+                    f"TP : {new_tp:.4f} | BE : {new_sl:.4f}"
+                )
+            except Exception:
+                pass
+            print(f"Erreur notification pyramiding: {e}")
         
         return True
     
@@ -4508,6 +4640,8 @@ def execute_pyramid_add(ex, pyramid_info: Dict[str, Any]) -> bool:
         except Exception:
             pass
         print(f"Erreur execute_pyramid_add: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def should_take_partial_profit(pos: dict, current_price: float) -> Optional[Dict[str, Any]]:
@@ -4944,24 +5078,111 @@ def manage_open_positions(ex: ccxt.Exchange):
     for pos in open_positions:
         symbol = pos['symbol']
 
-        # Vérifier position toujours ouverte
+        # ========================================================================
+        # ✅ CORRECTION : DÉTECTION FERMETURE + NOTIFICATION TP/SL
+        # ========================================================================
+        
         try:
             real_qty = float(live_map.get(symbol, 0.0))
             if real_qty <= 0:
+                # ✅ AMÉLIORATION : Détecter si fermé par TP ou SL
                 try:
-                    _cancel_all_orders_safe(ex, symbol)
-                except Exception:
-                    pass
-                try:
-                    database.close_trade(pos['id'], status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                    entry = float(pos['entry_price'])
+                    tp = float(pos.get('tp_price', 0))
+                    sl = float(pos.get('sl_price', 0))
+                    
+                    # Prix de fermeture (approximatif via ticker)
+                    try:
+                        t = ex.fetch_ticker(symbol) or {}
+                        close_price = float(t.get('last') or t.get('close') or entry)
+                    except Exception:
+                        close_price = entry
+                    
+                    # Calculer PnL
+                    is_long = (pos['side'] == 'buy')
+                    qty = float(pos['quantity'])
+                    
+                    if is_long:
+                        pnl = (close_price - entry) * qty
+                    else:
+                        pnl = (entry - close_price) * qty
+                    
+                    # Déterminer TP ou SL
+                    if is_long:
+                        hit_tp = (close_price >= tp * 0.999) if tp > 0 else False
+                        hit_sl = (close_price <= sl * 1.001) if sl > 0 else False
+                    else:
+                        hit_tp = (close_price <= tp * 1.001) if tp > 0 else False
+                        hit_sl = (close_price >= sl * 0.999) if sl > 0 else False
+                    
+                    # ✅ NOTIFICATION DIFFÉRENCIÉE
+                    if hit_tp:
+                        status = 'CLOSED_TP'
+                        emoji = '🎯'
+                        result = 'Take Profit atteint'
+                        color = '💚'
+                    elif hit_sl:
+                        status = 'CLOSED_SL'
+                        emoji = '🛡️'
+                        result = 'Stop Loss touché'
+                        color = '🔴' if pnl < 0 else '🟡'
+                    else:
+                        status = 'CLOSED_BY_EXCHANGE'
+                        emoji = '✅'
+                        result = 'Fermé par exchange'
+                        color = '🔵'
+                    
+                    # Annuler ordres restants
+                    try:
+                        _cancel_all_orders_safe(ex, symbol)
+                    except Exception:
+                        pass
+                    
+                    # Fermer en DB
+                    database.close_trade(pos['id'], status=status, pnl=float(pnl))
                     clear_balance_cache()
-                    notifier.tg_send(
-                        f"✅ Fermeture auto (exchange) détectée sur {symbol} — "
-                        f"Trade #{pos['id']} clôturé en DB et ordres annulés."
+                    
+                    # Notification riche
+                    pnl_pct = (pnl / (entry * qty)) * 100 if (entry * qty) > 0 else 0
+                    
+                    msg = (
+                        f"{emoji} **{result}**\n\n"
+                        f"📊 {symbol} {pos['side'].upper()}\n"
+                        f"{'🟢' if is_long else '🔴'} {'LONG' if is_long else 'SHORT'}\n\n"
+                        f"💵 Prix d'entrée : {entry:.4f}\n"
+                        f"💵 Prix de sortie : {close_price:.4f}\n"
+                        f"📦 Quantité : {qty:.6f}\n\n"
+                        f"{color} **PnL : {pnl:+.2f} USDT ({pnl_pct:+.2f}%)**\n\n"
+                        f"🔢 Trade #{pos['id']}"
                     )
-                except Exception:
-                    pass
+                    
+                    # Ajouter infos régime si disponible
+                    regime = pos.get('regime')
+                    if regime and regime != 'Importé':
+                        msg += f"\n📈 Stratégie : {regime}"
+                    
+                    notifier.tg_send(msg)
+                
+                except Exception as e:
+                    # Fallback notification simple
+                    try:
+                        _cancel_all_orders_safe(ex, symbol)
+                    except Exception:
+                        pass
+                    
+                    try:
+                        database.close_trade(pos['id'], status='CLOSED_BY_EXCHANGE', pnl=0.0)
+                        clear_balance_cache()
+                        
+                        notifier.tg_send(
+                            f"✅ Position {symbol} fermée\n"
+                            f"Trade #{pos['id']} clôturé"
+                        )
+                    except Exception:
+                        pass
+                
                 continue
+        
         except Exception:
             pass
 
@@ -5155,7 +5376,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                         pass
 
                     if qty > 0:
-                        # ✅ UTILISATION DU WRAPPER
                         _place_sl_tp_safe(
                             ex, symbol, close_side, qty,
                             sl=float(sl_price),
@@ -5268,6 +5488,16 @@ def manage_open_positions(ex: ccxt.Exchange):
         # NIVEAU 3A : BE DYNAMIQUE (Contact BB20_mid)
         # ========================================================================
         
+        # ✅ VÉRIFIER SI DÉJÀ NOTIFIÉ
+        try:
+            meta = pos.get('meta', {})
+            if isinstance(meta, str):
+                import json
+                meta = json.loads(meta)
+            be_already_notified = meta.get('be_notified', False)
+        except Exception:
+            be_already_notified = False
+        
         be_trigger = False
         try:
             try:
@@ -5369,7 +5599,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
 
-                # ✅ UTILISATION DU WRAPPER
                 sl_ok, _ = _place_sl_tp_safe(
                     ex, symbol, close_side, qty,
                     sl=float(want_sl),
@@ -5385,7 +5614,8 @@ def manage_open_positions(ex: ccxt.Exchange):
                         sl_current = float(want_sl)
                         be_armed = True
 
-                        if prev_be_status != 'ACTIVE':
+                        # ✅ CORRECTION : Notifier SEULEMENT si pas déjà notifié
+                        if prev_be_status != 'ACTIVE' and not be_already_notified:
                             try:
                                 remaining_qty = float(qty)
                                 entry_price_be = float(pos.get('entry_price') or 0.0)
@@ -5411,6 +5641,12 @@ def manage_open_positions(ex: ccxt.Exchange):
                                         pnl_realised=float(pnl_realised),
                                         remaining_qty=float(remaining_qty)
                                     )
+                                
+                                # ✅ AJOUT : Marquer comme notifié dans la DB
+                                try:
+                                    database.update_trade_meta(pos['id'], {'be_notified': True})
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
                     except Exception:
@@ -5457,7 +5693,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                             except Exception:
                                 pass
                             
-                            # ✅ UTILISATION DU WRAPPER
                             sl_ok, _ = _place_sl_tp_safe(
                                 ex, symbol, close_side, qty,
                                 sl=float(target_sl),
@@ -5482,7 +5717,6 @@ def manage_open_positions(ex: ccxt.Exchange):
         
         if progress >= 0.90:
             try:
-                # ✅ UTILISER LE HELPER EXISTANT (au lieu de calcul inline)
                 want_sl = _compute_trailing_sl(
                     mark_price=mark_now,
                     side=('buy' if is_long else 'sell'),
@@ -5517,7 +5751,6 @@ def manage_open_positions(ex: ccxt.Exchange):
                 except Exception:
                     pass
                 
-                # ✅ UTILISATION DU WRAPPER
                 sl_ok, _ = _place_sl_tp_safe(
                     ex, symbol, close_side, qty,
                     sl=float(want_sl),
