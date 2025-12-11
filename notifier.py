@@ -10,6 +10,22 @@ import database
 import trader
 import charting
 
+# ============================================================================
+# ⚡ CACHE PRIX (après les imports, avant les fonctions)
+# ============================================================================
+
+import time as _time_module  # Import explicite pour le cache
+
+# Cache global : {symbol: (price, timestamp)}
+_PRICE_CACHE = {}
+_PRICE_CACHE_TTL = 30  # secondes
+
+# ============================================================================
+# ⚡ PAGINATION STATE (après les imports et cache)
+# ============================================================================
+
+# État pagination par chat_id : {chat_id: {'page': int, 'total_pages': int, 'period': str}}
+_PAGINATION_STATE = {}
 
 # --- PARAMÈTRES TELEGRAM ---
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -799,8 +815,9 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
 
 def try_handle_inline_callback(event: Any) -> bool:
     """
-    Route Offset/Signaux/Restart/Stats.
-    Accepte soit un objet 'callback_query', soit un update complet, soit une LISTE d'updates.
+    Route Offset/Signaux/Restart/Stats + PAGINATION.
+    
+    ⚡ OPTIMISATION : answerCallbackQuery IMMÉDIAT pour tous les callbacks.
     """
     if isinstance(event, list):
         handled = False
@@ -821,6 +838,11 @@ def try_handle_inline_callback(event: Any) -> bool:
         if not cmd:
             return False
 
+        # ✅ RÉPONSE IMMÉDIATE POUR TOUS LES CALLBACKS
+        cq_id = data.get("id")
+        if cq_id:
+            tg_answer_callback_query(cq_id)
+
         # ----- MENU PRINCIPAL -----
         if cmd == "main_menu":
             try:
@@ -828,29 +850,47 @@ def try_handle_inline_callback(event: Any) -> bool:
             except Exception:
                 is_paused = False
             send_main_menu(is_paused)
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- MENU CONFIGURATION -----
         if cmd == "menu_config":
             send_config_menu()
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
-        # ----- SIGNAUX (DIRECT) -----
+        # ----- SIGNAUX (PREMIÈRE PAGE) -----
         if cmd == "signals_6h":
-            tg_show_signals_6h()
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
+            # Extraire chat_id pour pagination
+            try:
+                msg = data.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id") or "")
+            except Exception:
+                chat_id = None
+            
+            tg_show_signals_6h(page=1, chat_id=chat_id)
+            return True
+        
+        # ----- PAGINATION SIGNAUX -----
+        if isinstance(cmd, str) and cmd.startswith("signals_page:"):
+            try:
+                page = int(cmd.split(":", 1)[1])
+            except Exception:
+                page = 1
+            
+            # Extraire chat_id
+            try:
+                msg = data.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id") or "")
+            except Exception:
+                chat_id = None
+            
+            tg_show_signals_6h(page=page, chat_id=chat_id)
             return True
 
         # ----- POSITIONS -----
         if cmd == "list_positions":
             tg_show_positions()
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- OFFSETS -----
@@ -859,22 +899,17 @@ def try_handle_inline_callback(event: Any) -> bool:
             chat = msg.get("chat") or {}
             chat_id = chat.get("id")
             message_id = msg.get("message_id")
-            cq_id = data.get("id")
-            handle_offset_callback(cmd, chat_id=chat_id, message_id=message_id, callback_query_id=cq_id)
+            handle_offset_callback(cmd, chat_id=chat_id, message_id=message_id, callback_query_id=None)
             return True
 
         # ----- STATS -----
         if cmd == "get_stats":
             tg_show_stats("24h")
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         if isinstance(cmd, str) and cmd.startswith("stats:"):
             period = cmd.split(":", 1)[1] if ":" in cmd else "24h"
             tg_show_stats(period)
-            cq_id = data.get("id")
-            if cq_id: tg_answer_callback_query(cq_id)
             return True
 
         # ----- RETOUR GRAPHIQUE ÉQUITY -----
@@ -884,16 +919,55 @@ def try_handle_inline_callback(event: Any) -> bool:
 
         # ----- RESTART -----
         if cmd == "restart_bot":
-            handle_restart_callback(data); return True
+            handle_restart_callback(data)
+            return True
         if cmd == "confirm_restart_bot":
-            handle_restart_confirm(data); return True
+            handle_restart_confirm(data)
+            return True
         if cmd == "cancel_restart_bot":
-            handle_restart_cancel(data); return True
+            handle_restart_cancel(data)
+            return True
 
         return False
+    
     except Exception as e:
         tg_send_error("Callback routing", e)
         return False
+```
+
+---
+
+## ✅ **RÉSUMÉ DES MODIFICATIONS**
+
+### **📁 trader.py**
+| Ligne | Avant | Après |
+|-------|-------|-------|
+| ~1780 | `is_below_mm80` | `is_clearly_below_mm80` ✅ |
+| ~1850 | `is_above_mm80` | `is_clearly_above_mm80` ✅ |
+
+### **📁 notifier.py**
+| Ajout | Description |
+|-------|-------------|
+| `_PAGINATION_STATE` | Cache état pagination par chat |
+| `tg_show_signals_6h(page=1)` | Pagination 10 signaux/page |
+| `signals_page:N` callback | Navigation pages |
+
+---
+
+## 🎯 **RÉSULTAT ATTENDU**
+
+### **Signaux (6h) :**
+```
+⏱️ Signaux valides (6h)
+Page 1/3 — 25 signaux au total
+
+- 2025-12-11 14:23 — BTC/USDT (1h) BUY
+  Entry: 43250.00 | SL: 42800.00 | TP: 44500.00 | RR: x3.25  —  ✅ Pris
+
+[... 9 autres signaux ...]
+
+[⬅️ Précédent] [Suivant ➡️]
+[↩️ Retour]
 
 def _format_signal_row(sig: dict) -> str:
     """Format compact d'un signal (sans la raison), horodaté Europe/Lisbon.
@@ -938,22 +1012,20 @@ def _format_signal_row(sig: dict) -> str:
     return "  ".join(parts)
 
 
-def tg_show_signals_6h(limit: int = 50):
+def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optional[str] = None):
     """
-    Affiche 'Signaux valides des 6 dernières heures' :
-    - uniquement les signaux VALID_TAKEN ou VALID_SKIPPED,
-      c'est-à-dire les setups qui respectent toutes les conditions
-      d'entrée (contact, réintégration, réaction, RR, etc.).
-    - filtrage supplémentaire via les règles de RR / cut-wick.
-
-    Tri décroissant par ts (les plus récents en premier).
-
-    Règles d'affichage:
-      - CUT_WICK_FOR_RR = false  -> masquer si RR < MIN_RR
-      - CUT_WICK_FOR_RR = true   -> masquer si RR < 2.8 (ou CUT_WICK_MIN_RR)
+    Affiche 'Signaux valides des 6 dernières heures' avec pagination.
+    
+    ⚡ OPTIMISATION : 
+    - 10 signaux par page (configurable)
+    - Boutons Précédent/Suivant
+    - Cache state pagination par chat
+    
+    Args:
+        limit_per_page: Nombre de signaux par page (défaut 10)
+        page: Numéro de page (commence à 1)
+        chat_id: ID du chat (pour cache pagination)
     """
-    keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
-
     # Paramètres de RR
     try:
         min_rr = float(database.get_setting('MIN_RR', os.getenv("MIN_RR", "3.0")))
@@ -963,59 +1035,81 @@ def tg_show_signals_6h(limit: int = 50):
         cut_wick = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
     except Exception:
         cut_wick = False
-    # Seuil spécifique cut-wick (configurable sinon défaut 2.8)
     try:
         cw_min_rr = float(database.get_setting('CUT_WICK_MIN_RR', '2.8'))
     except Exception:
         cw_min_rr = 2.8
 
-    # Lecture DB : on ne récupère que les signaux validés (pris + valides non pris)
+    # Lecture DB : signaux validés uniquement (TOUS pour pagination)
     try:
-        raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=limit) or []
-        raw_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=limit) or []
+        raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=100) or []
+        raw_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=100) or []
     except Exception as e:
+        keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
         edit_main(f"⚠️ Erreur lecture signaux valides (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
     raw_all = (raw_taken or []) + (raw_skipped or [])
     if not raw_all:
+        keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
         edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal valide sur les 6 dernières heures.", keyboard)
         return
 
-    # Filtrage strict : on garde uniquement VALID_TAKEN / VALID_SKIPPED qui respectent les seuils de RR
+    # Filtrage strict RR
     signals = []
     for s in raw_all:
         try:
             st = str(s.get("state", "")).upper()
             if st not in ("VALID_TAKEN", "VALID_SKIPPED"):
-                # Sécurité supplémentaire : on exclut tout ce qui n'est pas explicitement validé
                 continue
 
             rr_val = float(s.get("rr", 0) or 0.0)
 
             if cut_wick:
-                # cut-wick actif -> masquer si RR < cw_min_rr
                 if rr_val < cw_min_rr:
                     continue
             else:
-                # cut-wick inactif -> masquer si RR < MIN_RR
                 if rr_val < min_rr:
                     continue
         except Exception:
-            # En cas de problème de données sur un signal, on le jette
             continue
 
         signals.append(s)
 
-    # Tri du plus récent au plus ancien + respect du limit global
+    # Tri du plus récent au plus ancien
     signals = sorted(signals, key=lambda s: int(s.get("ts", 0)), reverse=True)
-    if limit and len(signals) > limit:
-        signals = signals[:limit]
 
     if not signals:
+        keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
         edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal valide sur les 6 dernières heures.", keyboard)
         return
 
+    # ========================================================================
+    # PAGINATION
+    # ========================================================================
+    
+    total_signals = len(signals)
+    total_pages = (total_signals + limit_per_page - 1) // limit_per_page
+    page = max(1, min(page, total_pages))  # Clamp page
+    
+    # Calcul index
+    start_idx = (page - 1) * limit_per_page
+    end_idx = min(start_idx + limit_per_page, total_signals)
+    
+    page_signals = signals[start_idx:end_idx]
+    
+    # Mémoriser state pagination
+    if chat_id:
+        _PAGINATION_STATE[chat_id] = {
+            'page': page,
+            'total_pages': total_pages,
+            'period': '6h'
+        }
+    
+    # ========================================================================
+    # CONSTRUCTION MESSAGE
+    # ========================================================================
+    
     def _badge(s: dict) -> str:
         st = str(s.get("state", "")).upper()
         if st == "VALID_TAKEN":
@@ -1029,22 +1123,48 @@ def tg_show_signals_6h(limit: int = 50):
         reason = s.get("reason") or (payload.get("reason") if isinstance(payload, dict) else "")
         return f"  (raison: {html.escape(str(reason))})" if reason else ""
 
-    # Titre + une ligne vide entre chaque signal pour bien les séparer
-    lines = ["<b>⏱️ Signaux valides (6h)</b>"]
-    for s in signals:
+    # Titre + info pagination
+    lines = [
+        f"<b>⏱️ Signaux valides (6h)</b>",
+        f"<i>Page {page}/{total_pages} — {total_signals} signaux au total</i>",
+        ""
+    ]
+    
+    for s in page_signals:
         row = _format_signal_row(s)
         note = ""
         try:
             rr_val = float(s.get("rr", 0) or 0.0)
-            # Si cut-wick ON et RR entre [cw_min_rr ; MIN_RR[, on l'affiche mais on tag l'écart vs MIN_RR
             if cut_wick and rr_val < min_rr and rr_val >= cw_min_rr:
                 note = "  ⚠ RR<MIN_RR (cut-wick)"
         except Exception:
             pass
         lines.append(f"{row}  —  {_badge(s)}{note}{_reason(s)}")
-
-    edit_main("\n\n".join(lines), keyboard)
-
+    
+    message = "\n\n".join(lines)
+    
+    # ========================================================================
+    # CLAVIER PAGINATION
+    # ========================================================================
+    
+    keyboard_rows = []
+    
+    # Ligne navigation
+    nav_row = []
+    if page > 1:
+        nav_row.append({"text": "⬅️ Précédent", "callback_data": f"signals_page:{page-1}"})
+    if page < total_pages:
+        nav_row.append({"text": "Suivant ➡️", "callback_data": f"signals_page:{page+1}"})
+    
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    
+    # Ligne retour
+    keyboard_rows.append([{"text": "↩️ Retour", "callback_data": "main_menu"}])
+    
+    keyboard = {"inline_keyboard": keyboard_rows}
+    
+    edit_main(message, keyboard)
 
 def handle_equity_back_callback(update: Dict[str, Any]) -> None:
     """
@@ -1526,22 +1646,12 @@ def tg_show_stats(period: str = "24h"):
 def tg_show_positions():
     """
     Affiche les positions ouvertes depuis la DB dans le message principal.
-    (Routé par le bouton '📊 Positions') — tente d'abord une sync avec l'exchange.
+    
+    ⚡ OPTIMISATION : Pas de sync ici (trop lent pour Telegram).
+    La sync se fait déjà dans manage_open_positions() toutes les 60s.
     """
     try:
-        # 🔄 Sync on-demand avec l'exchange pour remonter une position ouverte ailleurs (ex: Bybit)
-        ex = None
-        try:
-            ex = getattr(trader, "create_exchange", None) and trader.create_exchange()
-        except Exception:
-            ex = None
-        try:
-            if ex and hasattr(trader, "sync_positions_with_exchange"):
-                trader.sync_positions_with_exchange(ex)
-        except Exception as _sync_err:
-            # On ne bloque pas l'affichage si la sync échoue
-            print(f"[notifier.tg_show_positions] Sync positions warning: {_sync_err}")
-
+        # ✅ LECTURE DIRECTE DB (rapide)
         positions = database.get_open_positions() or []
     except Exception as e:
         edit_main(f"⚠️ Erreur lecture positions : <code>{_escape(e)}</code>",
@@ -1551,13 +1661,13 @@ def tg_show_positions():
     format_open_positions(positions)
 
 def format_open_positions(positions: List[Dict[str, Any]]):
-    """Affiche les positions ouvertes dans le message principal (pas de spam) avec PNL si prix courant dispo
-    ou, à défaut, récupéré via API publique CCXT.
-    PNL = (price - entry) * qty pour un LONG, (entry - price) * qty pour un SHORT.
-
-    Recherche du prix courant dans: current_price, last_price, mark_price, ticker_last, price, last.
-    Si absent: tentative fetch_ticker(symbol) (Bybit puis Bitget, type=swap).
-    Recherche de la qty dans: quantity, qty, contracts, size, amount. Sinon 'N/A'.
+    """
+    Affiche les positions ouvertes dans le message principal avec PNL.
+    
+    ⚡ OPTIMISATIONS :
+    - Cache prix 30s (_fetch_public_price)
+    - Helpers locaux pour éviter répétitions
+    - Recherche robuste qty/price
     """
     keyboard = get_positions_keyboard(positions) or {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
 
@@ -1566,7 +1676,7 @@ def format_open_positions(positions: List[Dict[str, Any]]):
         edit_main(notifier_text, keyboard)
         return
 
-    # --- Helpers locaux (aucun impact global) ---
+    # --- Helpers locaux ---
     def _to_float(x, default=None):
         try:
             if x is None:
@@ -1581,73 +1691,6 @@ def format_open_positions(positions: List[Dict[str, Any]]):
                 return pos[k]
         return default
 
-    _price_cache: Dict[str, Optional[float]] = {}
-
-    def _normalize_candidates(sym: str) -> List[str]:
-        """Génère plusieurs variantes de symbole compatibles CCXT."""
-        if not sym:
-            return []
-        sym = sym.strip()
-        cands = [sym]
-        # extraire 'BASE' si possible
-        base = ""
-        if "/" in sym:
-            base = sym.split("/")[0]
-        elif sym.endswith("USDT"):
-            base = sym[:-4]
-        base = base or sym
-
-        # Variantes futures/spot courantes
-        cands.append(f"{base}/USDT:USDT")
-        cands.append(f"{base}/USDT")
-        # dédoublonner en conservant l'ordre
-        seen, out = set(), []
-        for s in cands:
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
-
-    def _fetch_public_price(sym: str) -> Optional[float]:
-        """Tentative de récupération d’un prix 'last' public (cache par appel)."""
-        try:
-            from importlib import import_module
-            if sym in _price_cache:
-                return _price_cache[sym]
-            # Import CCXT seulement si nécessaire
-            ccxt = import_module("ccxt")
-            exchs = []
-            # Instances publiques, rate-limit ON, type swap par défaut
-            try:
-                exchs.append(ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}}))
-            except Exception:
-                pass
-            try:
-                exchs.append(ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}}))
-            except Exception:
-                pass
-            if not exchs:
-                _price_cache[sym] = None
-                return None
-
-            for candidate in _normalize_candidates(sym):
-                for ex in exchs:
-                    try:
-                        t = ex.fetch_ticker(candidate)
-                        last = t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice")
-                        last_f = _to_float(last, None)
-                        if last_f is not None:
-                            _price_cache[sym] = last_f
-                            return last_f
-                    except Exception:
-                        continue
-            _price_cache[sym] = None
-            return None
-        except Exception:
-            _price_cache[sym] = None
-            return None
-
-    # ⚠️ pas d'annotation Tuple ici pour éviter des imports en plus
     def _pnl_tuple(pos: Dict[str, Any]):
         try:
             entry = _to_float(pos.get('entry_price'), 0.0)
@@ -1655,11 +1698,12 @@ def format_open_positions(positions: List[Dict[str, Any]]):
             side  = (pos.get('side') or '').lower()
             sym   = (pos.get('symbol') or '').strip()
 
-            # Prix courant: on tente plusieurs clés, sinon API publique
+            # Prix courant: on tente plusieurs clés, sinon API publique (cachée)
             cur_raw = _first(pos, ['current_price', 'last_price', 'mark_price', 'ticker_last', 'price', 'last'], None)
             cur     = _to_float(cur_raw, None)
+            
             if cur is None and sym:
-                cur = _fetch_public_price(sym)
+                cur = _fetch_public_price(sym)  # ✅ CACHE 30S
 
             if cur is None or qty <= 0 or entry <= 0:
                 return None, None
@@ -1670,15 +1714,18 @@ def format_open_positions(positions: List[Dict[str, Any]]):
             else:
                 pnl = (entry - cur) * qty
                 pnl_pct = (entry - cur) / entry * 100.0
+            
             return pnl, pnl_pct
         except Exception:
             return None, None
 
     # --- Construction du message ---
-    lines = ["<b>📊 Positions Ouvertes (DB)</b>\n"]
+    lines = ["<b>📊 Positions Ouvertes</b>\n"]
+    
     for pos in positions:
         side_icon = "📈" if (pos.get('side') or '').lower() == 'buy' else "📉"
         pnl_val, pnl_pct = _pnl_tuple(pos)
+        
         emoji = "💰"
         if pnl_val is None or pnl_pct is None:
             pnl_str = f"{emoji} PNL: <i>N/A</i>"
@@ -1688,7 +1735,6 @@ def format_open_positions(positions: List[Dict[str, Any]]):
             pct_abs = abs(pnl_pct)
             pnl_str = f"💰: <b>{sign}{pnl_abs:.2f} USDT</b> ({sign}{pct_abs:.2f}%)"
 
-        # Affichages robustes (évite crash si None)
         def _fmt(x, d=0.0):
             v = _to_float(x, d)
             return f"{v:.4f}"
@@ -1702,6 +1748,92 @@ def format_open_positions(positions: List[Dict[str, Any]]):
 
     message = "\n\n".join(lines)
     edit_main(message, keyboard)
+
+def _fetch_public_price(sym: str) -> Optional[float]:
+    """
+    Tentative de récupération d'un prix 'last' public (cache 30s).
+    
+    ⚡ OPTIMISATION : Cache pour éviter appels API répétés.
+    """
+    try:
+        from importlib import import_module
+        
+        # ✅ VÉRIFIER CACHE D'ABORD
+        now = _time_module.time()
+        
+        if sym in _PRICE_CACHE:
+            cached_price, cached_time = _PRICE_CACHE[sym]
+            if now - cached_time < _PRICE_CACHE_TTL:
+                return cached_price
+        
+        # Cache expiré ou absent → Appel API
+        ccxt = import_module("ccxt")
+        exchs = []
+        
+        # Instances publiques, rate-limit ON, type swap par défaut
+        try:
+            exchs.append(ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}}))
+        except Exception:
+            pass
+        try:
+            exchs.append(ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}}))
+        except Exception:
+            pass
+        
+        if not exchs:
+            _PRICE_CACHE[sym] = (None, now)
+            return None
+
+        def _normalize_candidates(s: str) -> List[str]:
+            """Génère plusieurs variantes de symbole compatibles CCXT."""
+            if not s:
+                return []
+            s = s.strip()
+            cands = [s]
+            base = ""
+            if "/" in s:
+                base = s.split("/")[0]
+            elif s.endswith("USDT"):
+                base = s[:-4]
+            base = base or s
+            cands.append(f"{base}/USDT:USDT")
+            cands.append(f"{base}/USDT")
+            seen, out = set(), []
+            for c in cands:
+                if c and c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            return out
+
+        def _to_float(x, default=None):
+            try:
+                if x is None:
+                    return default
+                return float(x)
+            except Exception:
+                return default
+
+        # Essayer tous les candidats
+        for candidate in _normalize_candidates(sym):
+            for ex in exchs:
+                try:
+                    t = ex.fetch_ticker(candidate)
+                    last = t.get("last") or t.get("close") or t.get("info", {}).get("lastPrice")
+                    last_f = _to_float(last, None)
+                    if last_f is not None:
+                        # ✅ METTRE EN CACHE
+                        _PRICE_CACHE[sym] = (last_f, now)
+                        return last_f
+                except Exception:
+                    continue
+        
+        # Aucun prix trouvé
+        _PRICE_CACHE[sym] = (None, now)
+        return None
+    
+    except Exception:
+        _PRICE_CACHE[sym] = (None, _time_module.time())
+        return None
 
 
 def format_synced_open_positions(exchange_positions: List[Dict], db_positions: List[Dict]):
