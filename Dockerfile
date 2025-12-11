@@ -6,10 +6,10 @@ FROM python:3.11-slim
 # ========================================
 # ÉTAPE 1 : Dépendances système pour TA-Lib
 # ========================================
-# Installation en tant que ROOT (obligatoire)
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ========================================
