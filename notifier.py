@@ -612,6 +612,30 @@ def set_maxpos_command(message: Dict[str, Any]):
         tg_send(f"❌ Erreur /setmaxpos: <code>{_escape(e)}</code>")
 
 
+def tg_reset_stats(update, context):
+    """Réinitialise les statistiques (SOFT RESET)."""
+    import database
+    
+    # Exécuter le reset SOFT
+    try:
+        result = database.reset_statistics_soft()
+        
+        # Formatter le résultat
+        msg = f"<b>{result['message']}</b>\n\n"
+        msg += f"📊 <b>Résumé :</b>\n"
+        msg += f"• Trades ignorés : <code>{result['trades_ignored']}</code>\n"
+        msg += f"• Trades ouverts gardés : <code>{result['trades_kept_open']}</code>\n"
+        msg += f"• Exécutions ignorées : <code>{result['executions_ignored']}</code>\n"
+        msg += f"• Exécutions ouvertes gardées : <code>{result['executions_kept_open']}</code>\n"
+        msg += f"\n🕐 Reset effectué à : <code>{result['reset_date']}</code>\n"
+        msg += f"\n💡 <i>Les statistiques compteront uniquement les trades à partir de maintenant.</i>"
+        
+        update.message.reply_text(msg, parse_mode="HTML")
+        
+    except Exception as e:
+        update.message.reply_text(f"❌ Erreur lors du reset : {str(e)}")
+
+
 # ==============================================================================
 # GESTION DES CLAVIERS INTERACTIFS
 # ==============================================================================
@@ -695,6 +719,7 @@ def _restart_confirm_keyboard() -> Dict:
             ]
         ]
     }
+
 
 
 def handle_restart_callback(callback_query: Dict[str, Any]) -> None:
@@ -926,6 +951,11 @@ def try_handle_inline_callback(event: Any) -> bool:
             return True
         if cmd == "cancel_restart_bot":
             handle_restart_cancel(data)
+            return True
+
+        # ----- RESET STATS -----
+        if cmd == "reset_stats":
+            tg_reset_stats(callback_query=data)
             return True
 
         return False
