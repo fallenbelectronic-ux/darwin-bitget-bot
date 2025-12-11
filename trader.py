@@ -1401,6 +1401,98 @@ def validate_double_extreme_ct(df: pd.DataFrame, contact_idx: int) -> bool:
     
     return bb20_touched and bb80_touched
 
+def _is_first_after_prolonged_bb80_exit(df: pd.DataFrame, is_long: bool, min_streak: int = 5, lookback: int = 50) -> bool:
+    """
+    Détecte si on est juste après une sortie PROLONGÉE de la BB80 (GATE 3).
+    
+    RÈGLE DARWIN :
+    - Si on a eu 5+ bougies CONSÉCUTIVES hors BB80 récemment
+    - On REJETTE le premier signal qui apparaît après
+    - Raison : Excès de volatilité, faux signaux fréquents
+    
+    Args:
+        df: DataFrame marché
+        is_long: True pour LONG, False pour SHORT
+        min_streak: Nombre minimum de bougies consécutives hors BB80 (défaut 5)
+        lookback: Fenêtre de recherche en nombre de bougies (défaut 50)
+    
+    Returns:
+        True si on doit REJETER le signal (premier après excès)
+        False si signal acceptable
+    
+    Exemples:
+        LONG : Si 5+ bougies avec close < bb80_lo → REJETER prochain signal LONG
+        SHORT : Si 5+ bougies avec close > bb80_up → REJETER prochain signal SHORT
+    """
+    try:
+        if df is None or len(df) < min_streak + 2:
+            return False
+        
+        # Limiter la fenêtre d'analyse
+        start_idx = max(0, len(df) - lookback)
+        window = df.iloc[start_idx:]
+        
+        if len(window) < min_streak + 2:
+            return False
+        
+        # ====== DÉTECTION EXCÈS BB80 ======
+        
+        streak_count = 0
+        max_streak = 0
+        last_streak_end = -999  # Index de fin du dernier streak détecté
+        
+        for i, row in window.iterrows():
+            try:
+                close = float(row['close'])
+                bb80_up = float(row['bb80_up'])
+                bb80_lo = float(row['bb80_lo'])
+            except Exception:
+                continue
+            
+            # Vérifier si hors BB80
+            is_outside = False
+            
+            if is_long:
+                # LONG : chercher excès vers le BAS (close < bb80_lo)
+                is_outside = (close < bb80_lo)
+            else:
+                # SHORT : chercher excès vers le HAUT (close > bb80_up)
+                is_outside = (close > bb80_up)
+            
+            if is_outside:
+                streak_count += 1
+                max_streak = max(max_streak, streak_count)
+            else:
+                # Fin du streak
+                if streak_count >= min_streak:
+                    # Enregistrer position de fin du streak
+                    last_streak_end = window.index.get_loc(i) - 1
+                
+                streak_count = 0
+        
+        # Vérifier si dernier streak était prolongé
+        if streak_count >= min_streak:
+            # On est ENCORE dans l'excès → rejeter
+            return True
+        
+        # ====== VÉRIFIER SI ON EST JUSTE APRÈS L'EXCÈS ======
+        
+        if max_streak >= min_streak:
+            # Un excès a été détecté
+            # Vérifier si on est dans les 1-3 bougies APRÈS la fin de l'excès
+            
+            current_pos = len(window) - 1
+            distance_from_end = current_pos - last_streak_end
+            
+            # Si on est dans les 1-3 bougies après l'excès → REJETER
+            if 1 <= distance_from_end <= 3:
+                return True
+        
+        return False
+    
+    except Exception as e:
+        print(f"Erreur _is_first_after_prolonged_bb80_exit: {e}")
+        return False  # En cas d'erreur, ne pas rejeter le signal    
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
