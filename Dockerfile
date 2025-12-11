@@ -35,10 +35,10 @@ ENV PYTHONUNBUFFERED=1
 # Copier requirements.txt (pour référence seulement)
 COPY requirements.txt .
 
-# Installer TOUTES les dépendances dans le bon ordre
+# Installer TOUTES les dépendances dans le bon ordre avec versions compatibles
 RUN pip install --no-cache-dir --root-user-action ignore --upgrade pip && \
     pip install --no-cache-dir --root-user-action ignore "numpy>=1.26.0,<2.0" && \
-    pip install --no-cache-dir --root-user-action ignore "pandas==2.2.0" && \
+    pip install --no-cache-dir --root-user-action ignore "pandas>=2.1.0,<2.2.0" && \
     CFLAGS="-I/usr/include/ta-lib" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore "TA-Lib==0.4.28" && \
     pip install --no-cache-dir --root-user-action ignore \
         "ccxt==4.2.25" \
