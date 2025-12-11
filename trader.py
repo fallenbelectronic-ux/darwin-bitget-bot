@@ -4973,11 +4973,11 @@ def manage_open_positions(ex):
     Gestion positions ouvertes : sync, fermeture, TP dynamique, BE, trailing, pyramiding, partial exits.
     Inclut protection anti-recul BE + notification PnL sécurisé RÉEL.
     
-    ✅ CORRECTIONS :
+    ✅ CORRECTIONS FINALES :
     - Variable pnl_secured définie avant utilisation
     - Gestion erreur talib (ImportError)
-    - Tous les imports vérifiés
-    - Toutes les fonctions database existantes utilisées
+    - Pyramiding : create_market_order_smart (CORRECTION CRITIQUE)
+    - Partial exits : create_market_order_smart (CORRECTION CRITIQUE)
     """
     
     def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
@@ -5180,7 +5180,6 @@ def manage_open_positions(ex):
                 if tp_price > 0:
                     data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=100)
                     if len(data_bars) >= 80:
-                        # ✅ CORRECTION : Gestion erreur import talib
                         try:
                             import pandas as pd
                             import numpy as np
@@ -5317,12 +5316,14 @@ def manage_open_positions(ex):
                                 
                                 order_side = 'buy' if is_long else 'sell'
                                 
+                                # ✅ CORRECTION CRITIQUE : create_market_order_smart
                                 try:
-                                    order = ex.create_order(
-                                        symbol=symbol,
-                                        type='market',
-                                        side=order_side,
-                                        amount=add_qty
+                                    common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                    
+                                    order = create_market_order_smart(
+                                        ex, symbol, order_side, add_qty,
+                                        ref_price=current_price,
+                                        params=common_params
                                     )
                                     
                                     new_qty = qty + add_qty
@@ -5423,13 +5424,14 @@ def manage_open_positions(ex):
                                 
                                 close_side = 'sell' if is_long else 'buy'
                                 
+                                # ✅ CORRECTION CRITIQUE : create_market_order_smart
                                 try:
-                                    order = ex.create_order(
-                                        symbol=symbol,
-                                        type='market',
-                                        side=close_side,
-                                        amount=exit_qty,
-                                        params={'reduceOnly': True}
+                                    common_params_exit = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                                    
+                                    order = create_market_order_smart(
+                                        ex, symbol, close_side, exit_qty,
+                                        ref_price=current_price,
+                                        params=common_params_exit
                                     )
                                     
                                     remaining_qty = qty - exit_qty
@@ -5501,7 +5503,6 @@ def manage_open_positions(ex):
                         data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                         
                         if len(data_bars) >= 25:
-                            # ✅ CORRECTION : Gestion erreur import talib
                             try:
                                 import pandas as pd
                                 import numpy as np
@@ -5815,6 +5816,9 @@ def manage_open_positions(ex):
         except Exception as e:
             print(f"❌ Erreur manage_open_positions trade {pos.get('id')}: {e}")
             continue
+
+
+
 
 
 
