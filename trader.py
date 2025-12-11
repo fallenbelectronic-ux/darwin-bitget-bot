@@ -972,67 +972,6 @@ def _sl_from_contact_candle(contact: pd.Series, side: str, atr_contact: Optional
         except Exception:
             return 0.0
 
-def _is_first_after_prolonged_bb80_exit(
-    df: pd.DataFrame,
-    is_long: bool,
-    min_streak: int = 5,
-    lookback: int = 50
-) -> bool:
-    """
-    Détecte si la DERNIÈRE bougie est la PREMIÈRE clôture revenue à l'intérieur du canal BB80
-    après une séquence de `min_streak` clôtures consécutives en dehors.
-    
-    - is_long = True  : on regarde les excès SOUS bb80_lo (sortie basse prolongée) – protège les longs.
-    - is_long = False : on regarde les excès AU-DESSUS de bb80_up – protège les shorts.
-    
-    Utilisé comme gate pour ignorer le premier trade après excès prolongé (tendance et CT).
-    """
-    if df is None or len(df) < min_streak + 1:
-        return False
-
-    try:
-        tail = df.iloc[-min(len(df), lookback):].copy()
-    except Exception:
-        return False
-
-    if len(tail) < min_streak + 1:
-        return False
-
-    outside_streak = 0
-    first_inside_after_prolonged_idx = None
-
-    for idx, row in enumerate(tail.itertuples()):
-        try:
-            close = float(row.close)
-            bb80_lo = float(row.bb80_lo)
-            bb80_up = float(row.bb80_up)
-        except Exception:
-            outside = False
-            inside = False
-        else:
-            if is_long:
-                # Excès prolongé SOUS la BB80 basse pour les futurs longs
-                outside = (close <= bb80_lo)
-            else:
-                # Excès prolongé AU-DESSUS de la BB80 haute pour les futurs shorts
-                outside = (close >= bb80_up)
-            inside = (bb80_lo <= close <= bb80_up)
-
-        if outside:
-            outside_streak += 1
-        else:
-            if outside_streak >= min_streak and first_inside_after_prolonged_idx is None and inside:
-                # Première bougie qui réintègre le couloir BB80 après un excès prolongé
-                first_inside_after_prolonged_idx = idx
-            outside_streak = 0
-
-    if first_inside_after_prolonged_idx is None:
-        return False
-
-    # On veut que la DERNIÈRE bougie de la fenêtre soit justement cette première réintégration
-    return first_inside_after_prolonged_idx == (len(tail) - 1)
-
-
 def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
     """
     Retourne l'index de la dernière bougie de CONTACT (avant la réaction si base_exclude_last=True),
@@ -1495,24 +1434,24 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     mm20 = float(current.get('mm20', close_price))
     mm80 = float(current.get('mm80', close_price))
     
-    bb20_upper = float(current.get('bb20_upper', close_price))
-    bb20_lower = float(current.get('bb20_lower', close_price))
-    bb80_upper = float(current.get('bb80_upper', close_price))
-    bb80_lower = float(current.get('bb80_lower', close_price))
+    bb20_up = float(current.get('bb20_up', close_price))
+    bb20_lo = float(current.get('bb20_lo', close_price))
+    bb80_up = float(current.get('bb80_up', close_price))  # ✅ UNIFORMISÉ
+    bb80_lo = float(current.get('bb80_lo', close_price))  # ✅ UNIFORMISÉ
 
     # ============================================================================
     # DÉTECTION POSITION PAR RAPPORT AUX BANDES
     # ============================================================================
     
     # BB20
-    is_above_bb20 = close_price > bb20_upper
-    is_below_bb20 = close_price < bb20_lower
-    is_inside_bb20 = bb20_lower <= close_price <= bb20_upper
+    is_above_bb20 = close_price > bb20_up
+    is_below_bb20 = close_price < bb20_lo
+    is_inside_bb20 = bb20_lo <= close_price <= bb20_up
 
     # BB80
-    is_above_bb80 = close_price > bb80_upper
-    is_below_bb80 = close_price < bb80_lower
-    is_inside_bb80 = bb80_lower <= close_price <= bb80_upper
+    is_above_bb80 = close_price > bb80_up
+    is_below_bb80 = close_price < bb80_lo
+    is_inside_bb80 = bb80_lo <= close_price <= bb80_up
 
     # Position "claire" (marge 0.05%)
     threshold = 0.0005
@@ -1589,8 +1528,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if len(recent) < max_window + 2:
                 return False
             
-            bb80_u = recent['bb80_upper'].values
-            bb80_l = recent['bb80_lower'].values
+            bb80_u = recent['bb80_up'].values
+            bb80_l = recent['bb80_lo'].values
             closes = recent['close'].values
             
             # Chercher le contact BB80
@@ -1641,66 +1580,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         except Exception:
             return False
 
-    def _is_first_after_prolonged_bb80_exit(df_local: pd.DataFrame, is_long: bool, min_streak: int = 5, lookback: int = 50) -> bool:
-        """
-        Détecte si on est sur le premier signal après un excès BB80 prolongé (GATE 3).
-        
-        Si oui, on REJETTE ce signal (souvent faux signal de fin d'excès).
-        
-        Args:
-            df_local: DataFrame avec colonnes bb80_upper, bb80_lower, close
-            is_long: True pour LONG, False pour SHORT
-            min_streak: Nombre minimum de bougies consécutives hors BB80
-            lookback: Fenêtre de recherche
-        
-        Returns:
-            True si c'est le premier signal après excès prolongé (à rejeter)
-            False sinon
-        """
-        if df_local is None or df_local.empty or len(df_local) < min_streak + 2:
-            return False
-        
-        try:
-            recent = df_local.iloc[-lookback:].copy() if len(df_local) >= lookback else df_local.copy()
-            if len(recent) < min_streak + 2:
-                return False
-            
-            bb80_u = recent['bb80_upper'].values
-            bb80_l = recent['bb80_lower'].values
-            closes = recent['close'].values
-            
-            # Chercher séquence prolongée hors BB80
-            streak = 0
-            found_prolonged = False
-            end_streak_idx = None
-            
-            for i in range(len(recent) - 1):
-                if is_long:
-                    outside = closes[i] < bb80_l[i]
-                else:
-                    outside = closes[i] > bb80_u[i]
-                
-                if outside:
-                    streak += 1
-                    if streak >= min_streak:
-                        found_prolonged = True
-                else:
-                    if found_prolonged and streak >= min_streak:
-                        end_streak_idx = i
-                        break
-                    streak = 0
-            
-            if not found_prolonged or end_streak_idx is None:
-                return False
-            
-            # Vérifier si on est dans les 1-2 bougies après la fin de l'excès
-            current_idx = len(recent) - 1
-            distance_from_end = current_idx - end_streak_idx
-            
-            return 0 <= distance_from_end <= 2
-            
-        except Exception:
-            return False
+    # ✅ DOUBLON SUPPRIMÉ - On utilise la fonction globale définie ligne ~1200
 
     # ============================================================================
     # DÉTECTION TREND-FOLLOWING LONG (prix au-dessus MM80, sortie BB20 haut)
@@ -1725,8 +1605,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         
         # Calcul niveaux
         entry = close_price
-        sl = bb20_lower
-        tp = bb80_upper
+        sl = bb20_lo
+        tp = bb80_up
         
         # Vérification RR basique
         distance_to_sl = abs(entry - sl)
@@ -1771,8 +1651,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         
         # Calcul niveaux
         entry = close_price
-        sl = bb20_upper
-        tp = bb80_lower
+        sl = bb20_up
+        tp = bb80_lo
         
         # Vérification RR basique
         distance_to_sl = abs(sl - entry)
@@ -1796,7 +1676,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     # ============================================================================
     # DÉTECTION CONTRE-TENDANCE LONG (prix sous MM80, rebond vers le haut)
-    # ✅ CORRECTION : is_clearly_below_mm80 (pas is_below_mm80)
     # ============================================================================
     
     if is_clearly_below_mm80 or (is_in_dead_zone and trend_bias == 'down'):
@@ -1804,11 +1683,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if not is_below_bb80:
             return None
         
-        # ✅ GATE 2 : Validation séquence stricte (Contact → Réintégration → Pas de ressortie)
+        # ✅ GATE 2 : Validation séquence stricte
         if not _check_ct_reintegration_window(df, is_long=True, max_window=3):
             return None
         
-        # ✅ GATE 3 : Excès prolongé BB80 (ignore premier signal après réintégration)
+        # ✅ GATE 3 : Excès prolongé BB80
         if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
             return None
         
@@ -1818,7 +1697,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         
         # Calcul niveaux
         entry = close_price
-        sl = bb80_lower
+        sl = bb80_lo
         tp = mm20
         
         # Vérification RR basique
@@ -1843,7 +1722,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     # ============================================================================
     # DÉTECTION CONTRE-TENDANCE SHORT (prix au-dessus MM80, rebond vers le bas)
-    # ✅ CORRECTION : is_clearly_above_mm80 (pas is_above_mm80)
     # ============================================================================
     
     if is_clearly_above_mm80 or (is_in_dead_zone and trend_bias == 'up'):
@@ -1865,7 +1743,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         
         # Calcul niveaux
         entry = close_price
-        sl = bb80_upper
+        sl = bb80_up
         tp = mm20
         
         # Vérification RR basique
