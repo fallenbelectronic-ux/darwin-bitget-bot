@@ -35,15 +35,16 @@ ENV PYTHONUNBUFFERED=1
 # Copier requirements.txt
 COPY requirements.txt .
 
-# Installer pip et numpy D'ABORD
+# CRITIQUE : Forcer numpy 1.x AVANT tout
 RUN pip install --no-cache-dir --root-user-action ignore --upgrade pip && \
-    pip install --no-cache-dir --root-user-action ignore numpy==1.26.3
+    pip install --no-cache-dir --root-user-action ignore "numpy>=1.26.0,<2.0"
 
-# Installer TA-Lib avec le BON chemin des headers
+# Installer TA-Lib ENSUITE avec numpy 1.x déjà présent
 RUN CFLAGS="-I/usr/include/ta-lib" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore TA-Lib==0.4.28
 
-# Installer le reste des dépendances
-RUN pip install --no-cache-dir --root-user-action ignore -r requirements.txt
+# Installer le reste SANS mettre à jour numpy
+RUN pip install --no-cache-dir --root-user-action ignore --no-deps -r requirements.txt && \
+    pip install --no-cache-dir --root-user-action ignore -r requirements.txt
 
 # ========================================
 # ÉTAPE 4 : Sécurité (utilisateur non-root)
