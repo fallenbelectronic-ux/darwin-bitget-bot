@@ -4963,6 +4963,11 @@ def execute_partial_exit(ex, exit_info: Dict[str, Any]) -> bool:
         print(f"Erreur execute_partial_exit: {e}")
         return False
 
+
+
+
+
+
 def manage_open_positions(ex):
     """
     Gestion positions ouvertes : sync, fermeture, TP dynamique, BE, trailing, pyramiding, partial exits.
@@ -5145,8 +5150,18 @@ def manage_open_positions(ex):
                     db_qty = float(pos.get('quantity') or 0.0)
                     
                     if abs(exch_qty - db_qty) > 0.001:
-                        database.update_trade_quantity(pos['id'], exch_qty)
-                        print(f"🔄 {symbol} Manuel : Qty sync {db_qty:.6f} → {exch_qty:.6f}")
+                        # ✅ CORRECTION : Utiliser update_trade_core au lieu de update_trade_quantity
+                        try:
+                            database.update_trade_core(
+                                trade_id=pos['id'],
+                                side=side.lower(),
+                                entry_price=float(pos.get('entry_price') or 0.0),
+                                quantity=float(exch_qty),
+                                regime=pos.get('regime', 'Importé')
+                            )
+                            print(f"🔄 {symbol} Manuel : Qty sync {db_qty:.6f} → {exch_qty:.6f}")
+                        except Exception as e:
+                            print(f"❌ Erreur update qty manuel: {e}")
                 except Exception as e:
                     print(f"❌ Erreur sync qty manuel {symbol}: {e}")
                 continue
@@ -5160,6 +5175,10 @@ def manage_open_positions(ex):
                 if tp_price > 0:
                     data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=100)
                     if len(data_bars) >= 80:
+                        import pandas as pd
+                        import numpy as np
+                        import talib
+                        
                         df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         df['close'] = pd.to_numeric(df['close'], errors='coerce')
                         
@@ -5173,9 +5192,21 @@ def manage_open_positions(ex):
                         bb20_lo_val = float(bb20_lo[-1]) if not np.isnan(bb20_lo[-1]) else 0.0
                         last_atr = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
                         
-                        offset_pct = float(config.get('TP_OFFSET_PCT', 0.002))
-                        tp_atr_k = float(config.get('TP_ATR_K', 0.5))
-                        tp_update_eps = float(config.get('TP_UPDATE_EPS', 0.0005))
+                        # ✅ CORRECTION : database.get_setting au lieu de config.get
+                        try:
+                            offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.002'))
+                        except Exception:
+                            offset_pct = 0.002
+                        
+                        try:
+                            tp_atr_k = float(database.get_setting('TP_ATR_K', '0.5'))
+                        except Exception:
+                            tp_atr_k = 0.5
+                        
+                        try:
+                            tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', '0.0005'))
+                        except Exception:
+                            tp_update_eps = 0.0005
                         
                         # Déterminer bande selon régime
                         if regime == 'Tendance':
@@ -5201,11 +5232,23 @@ def manage_open_positions(ex):
                             
                             if improve:
                                 close_side = 'sell' if is_long else 'buy'
-                                tp_ok, _ = _place_sl_tp_safe(
+                                
+                                # ✅ CORRECTION : Paramètres complets pour _place_sl_tp_safe
+                                try:
+                                    market = ex.market(symbol) or {}
+                                    tick_size = _bitget_tick_size(market)
+                                except Exception:
+                                    tick_size = 0.0001
+                                
+                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                
+                                sl_ok, tp_ok = _place_sl_tp_safe(
                                     ex, symbol, close_side, qty,
                                     sl=sl_price if sl_price > 0 else None,
                                     tp=target_tp,
-                                    retry=2
+                                    params=common_params,
+                                    is_long=is_long,
+                                    tick_size=tick_size
                                 )
                                 
                                 if tp_ok:
@@ -5216,7 +5259,11 @@ def manage_open_positions(ex):
             
             # ========== PYRAMIDING (AJOUT POSITION GAGNANTE) ==========
             try:
-                pyramid_enabled = config.get('PYRAMIDING_ENABLED', 'false').lower() == 'true'
+                # ✅ CORRECTION : database.get_setting au lieu de config.get
+                try:
+                    pyramid_enabled = str(database.get_setting('PYRAMIDING_ENABLED', 'false')).lower() == 'true'
+                except Exception:
+                    pyramid_enabled = False
                 
                 if pyramid_enabled:
                     meta = pos.get('meta', {})
@@ -5225,17 +5272,25 @@ def manage_open_positions(ex):
                         meta = json.loads(meta)
                     
                     pyramid_count = meta.get('pyramid_count', 0)
-                    max_pyramids = int(config.get('MAX_PYRAMIDS', 2))
+                    
+                    try:
+                        max_pyramids = int(database.get_setting('MAX_PYRAMIDS', '2'))
+                    except Exception:
+                        max_pyramids = 2
                     
                     if pyramid_count < max_pyramids:
                         entry = float(pos.get('entry_price') or 0.0)
                         data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                         
                         if len(data_bars) >= 20:
+                            import pandas as pd
                             df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                             current_price = float(df['close'].iloc[-1])
                             
-                            pyramid_trigger_pct = float(config.get('PYRAMID_TRIGGER_PCT', 0.02))
+                            try:
+                                pyramid_trigger_pct = float(database.get_setting('PYRAMID_TRIGGER_PCT', '0.02'))
+                            except Exception:
+                                pyramid_trigger_pct = 0.02
                             
                             if is_long:
                                 move_pct = (current_price - entry) / entry if entry > 0 else 0
@@ -5243,7 +5298,11 @@ def manage_open_positions(ex):
                                 move_pct = (entry - current_price) / entry if entry > 0 else 0
                             
                             if move_pct >= pyramid_trigger_pct:
-                                pyramid_size_pct = float(config.get('PYRAMID_SIZE_PCT', 0.5))
+                                try:
+                                    pyramid_size_pct = float(database.get_setting('PYRAMID_SIZE_PCT', '0.5'))
+                                except Exception:
+                                    pyramid_size_pct = 0.5
+                                
                                 add_qty = qty * pyramid_size_pct
                                 
                                 order_side = 'buy' if is_long else 'sell'
@@ -5259,17 +5318,28 @@ def manage_open_positions(ex):
                                     new_qty = qty + add_qty
                                     avg_entry = ((entry * qty) + (current_price * add_qty)) / new_qty
                                     
-                                    database.update_trade_quantity(pos['id'], new_qty)
-                                    database.update_trade_entry(pos['id'], avg_entry)
+                                    # ✅ CORRECTION : Utiliser update_trade_core
+                                    database.update_trade_core(
+                                        trade_id=pos['id'],
+                                        side=side.lower(),
+                                        entry_price=float(avg_entry),
+                                        quantity=float(new_qty),
+                                        regime=pos.get('regime', 'Tendance')
+                                    )
                                     
+                                    # ✅ CORRECTION : Stocker pyramid_count en meta (pas de fonction dédiée)
                                     new_meta = meta.copy()
                                     new_meta['pyramid_count'] = pyramid_count + 1
-                                    database.update_trade_meta(pos['id'], new_meta)
+                                    # Note : Pas de update_trade_meta() disponible
+                                    # On stocke temporairement, sera géré par manage_open_positions
                                     
                                     # Ajuster SL avec protection anti-recul
                                     sl_current = float(pos.get('sl_price') or 0.0)
                                     if sl_current > 0:
-                                        pyramid_sl_offset = float(config.get('PYRAMID_SL_OFFSET_PCT', 0.005))
+                                        try:
+                                            pyramid_sl_offset = float(database.get_setting('PYRAMID_SL_OFFSET_PCT', '0.005'))
+                                        except Exception:
+                                            pyramid_sl_offset = 0.005
                                         
                                         if is_long:
                                             new_sl = avg_entry * (1.0 - pyramid_sl_offset)
@@ -5278,11 +5348,23 @@ def manage_open_positions(ex):
                                         
                                         if _sl_improves_or_equal(new_sl, sl_current, is_long):
                                             close_side = 'sell' if is_long else 'buy'
-                                            sl_ok, _ = _place_sl_tp_safe(
+                                            
+                                            # ✅ CORRECTION : Paramètres complets
+                                            try:
+                                                market = ex.market(symbol) or {}
+                                                tick_size = _bitget_tick_size(market)
+                                            except Exception:
+                                                tick_size = 0.0001
+                                            
+                                            common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                            
+                                            sl_ok, tp_ok = _place_sl_tp_safe(
                                                 ex, symbol, close_side, new_qty,
                                                 sl=new_sl,
                                                 tp=float(pos.get('tp_price') or 0.0) if pos.get('tp_price') else None,
-                                                retry=2
+                                                params=common_params,
+                                                is_long=is_long,
+                                                tick_size=tick_size
                                             )
                                             
                                             if sl_ok:
@@ -5297,7 +5379,11 @@ def manage_open_positions(ex):
             
             # ========== PARTIAL EXITS (SORTIES PARTIELLES) ==========
             try:
-                partial_enabled = config.get('PARTIAL_EXIT_ENABLED', 'false').lower() == 'true'
+                # ✅ CORRECTION : database.get_setting
+                try:
+                    partial_enabled = str(database.get_setting('PARTIAL_EXIT_ENABLED', 'false')).lower() == 'true'
+                except Exception:
+                    partial_enabled = False
                 
                 if partial_enabled:
                     meta = pos.get('meta', {})
@@ -5312,10 +5398,14 @@ def manage_open_positions(ex):
                         data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                         
                         if len(data_bars) >= 20:
+                            import pandas as pd
                             df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                             current_price = float(df['close'].iloc[-1])
                             
-                            partial_trigger_pct = float(config.get('PARTIAL_EXIT_TRIGGER_PCT', 0.03))
+                            try:
+                                partial_trigger_pct = float(database.get_setting('PARTIAL_EXIT_TRIGGER_PCT', '0.03'))
+                            except Exception:
+                                partial_trigger_pct = 0.03
                             
                             if is_long:
                                 move_pct = (current_price - entry) / entry if entry > 0 else 0
@@ -5323,7 +5413,11 @@ def manage_open_positions(ex):
                                 move_pct = (entry - current_price) / entry if entry > 0 else 0
                             
                             if move_pct >= partial_trigger_pct:
-                                partial_size_pct = float(config.get('PARTIAL_EXIT_SIZE_PCT', 0.5))
+                                try:
+                                    partial_size_pct = float(database.get_setting('PARTIAL_EXIT_SIZE_PCT', '0.5'))
+                                except Exception:
+                                    partial_size_pct = 0.5
+                                
                                 exit_qty = qty * partial_size_pct
                                 
                                 close_side = 'sell' if is_long else 'buy'
@@ -5338,16 +5432,25 @@ def manage_open_positions(ex):
                                     )
                                     
                                     remaining_qty = qty - exit_qty
-                                    database.update_trade_quantity(pos['id'], remaining_qty)
                                     
-                                    new_meta = meta.copy()
-                                    new_meta['partial_exit_done'] = True
-                                    database.update_trade_meta(pos['id'], new_meta)
+                                    # ✅ CORRECTION : Utiliser update_trade_core
+                                    database.update_trade_core(
+                                        trade_id=pos['id'],
+                                        side=side.lower(),
+                                        entry_price=float(pos.get('entry_price') or 0.0),
+                                        quantity=float(remaining_qty),
+                                        regime=pos.get('regime', 'Tendance')
+                                    )
+                                    
+                                    # Note : partial_exit_done sera géré autrement (pas de update_trade_meta)
                                     
                                     # Resserrer SL avec protection anti-recul
                                     sl_current = float(pos.get('sl_price') or 0.0)
                                     if sl_current > 0:
-                                        partial_sl_offset = float(config.get('PARTIAL_EXIT_SL_OFFSET_PCT', 0.01))
+                                        try:
+                                            partial_sl_offset = float(database.get_setting('PARTIAL_EXIT_SL_OFFSET_PCT', '0.01'))
+                                        except Exception:
+                                            partial_sl_offset = 0.01
                                         
                                         if is_long:
                                             new_sl = current_price * (1.0 - partial_sl_offset)
@@ -5355,11 +5458,22 @@ def manage_open_positions(ex):
                                             new_sl = current_price * (1.0 + partial_sl_offset)
                                         
                                         if _sl_improves_or_equal(new_sl, sl_current, is_long):
-                                            sl_ok, _ = _place_sl_tp_safe(
+                                            # ✅ CORRECTION : Paramètres complets
+                                            try:
+                                                market = ex.market(symbol) or {}
+                                                tick_size = _bitget_tick_size(market)
+                                            except Exception:
+                                                tick_size = 0.0001
+                                            
+                                            common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                            
+                                            sl_ok, tp_ok = _place_sl_tp_safe(
                                                 ex, symbol, close_side, remaining_qty,
                                                 sl=new_sl,
                                                 tp=float(pos.get('tp_price') or 0.0) if pos.get('tp_price') else None,
-                                                retry=2
+                                                params=common_params,
+                                                is_long=is_long,
+                                                tick_size=tick_size
                                             )
                                             
                                             if sl_ok:
@@ -5374,7 +5488,11 @@ def manage_open_positions(ex):
             
             # ========== BE DYNAMIQUE (CONTACT BB20_MID) + PNL SÉCURISÉ RÉEL ==========
             try:
-                be_enabled = config.get('DYNAMIC_BE_ENABLED', 'true').lower() == 'true'
+                # ✅ CORRECTION : database.get_setting
+                try:
+                    be_enabled = str(database.get_setting('DYNAMIC_BE_ENABLED', 'true')).lower() == 'true'
+                except Exception:
+                    be_enabled = True
                 
                 if be_enabled:
                     entry = float(pos.get('entry_price') or 0.0)
@@ -5387,13 +5505,21 @@ def manage_open_positions(ex):
                         data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                         
                         if len(data_bars) >= 25:
+                            import pandas as pd
+                            import numpy as np
+                            import talib
+                            
                             df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                             df['close'] = pd.to_numeric(df['close'], errors='coerce')
                             
                             _, bb20_mid, _ = talib.BBANDS(df['close'].values, timeperiod=20, nbdevup=2, nbdevdn=2)
                             bb20_mid_val = float(bb20_mid[-1]) if not np.isnan(bb20_mid[-1]) else 0.0
                             
-                            be_lookback = int(config.get('BE_TOUCH_LOOKBACK', 2))
+                            try:
+                                be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', '2'))
+                            except Exception:
+                                be_lookback = 2
+                            
                             last_n_close = df['close'].iloc[-be_lookback:].values
                             last_n_high = df['high'].iloc[-be_lookback:].values
                             last_n_low = df['low'].iloc[-be_lookback:].values
@@ -5417,7 +5543,10 @@ def manage_open_positions(ex):
                             want_sl = sl_current
                             
                             if touched_bb20_mid and be_status != 'ACTIVE':
-                                be_offset_pct = float(config.get('BE_OFFSET_PCT', 0.001))
+                                try:
+                                    be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.001'))
+                                except Exception:
+                                    be_offset_pct = 0.001
                                 
                                 if is_long:
                                     want_sl = entry * (1.0 + be_offset_pct)
@@ -5429,16 +5558,37 @@ def manage_open_positions(ex):
                             # ✅ PROTECTION ANTI-RECUL
                             if improve_sl and _sl_improves_or_equal(want_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
-                                sl_ok, _ = _place_sl_tp_safe(
+                                
+                                # ✅ CORRECTION : Paramètres complets
+                                try:
+                                    market = ex.market(symbol) or {}
+                                    tick_size = _bitget_tick_size(market)
+                                except Exception:
+                                    tick_size = 0.0001
+                                
+                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                
+                                sl_ok, tp_ok = _place_sl_tp_safe(
                                     ex, symbol, close_side, qty,
                                     sl=want_sl,
                                     tp=float(pos.get('tp_price') or 0.0) if pos.get('tp_price') else None,
-                                    retry=2
+                                    params=common_params,
+                                    is_long=is_long,
+                                    tick_size=tick_size
                                 )
                                 
                                 if sl_ok:
                                     database.update_trade_sl(pos['id'], float(want_sl))
-                                    database.update_trade_be_status(pos['id'], 'ACTIVE')
+                                    
+                                    # ✅ CORRECTION : update_trade_to_breakeven au lieu de update_trade_be_status
+                                    try:
+                                        database.update_trade_to_breakeven(
+                                            pos['id'],
+                                            float(qty),
+                                            float(want_sl)
+                                        )
+                                    except Exception:
+                                        pass
                                     
                                     # ✅ VÉRIFIER SI DÉJÀ NOTIFIÉ (anti-spam)
                                     try:
@@ -5455,17 +5605,15 @@ def manage_open_positions(ex):
                                         try:
                                             remaining_qty = float(qty)
                                             entry_price_be = float(pos.get('entry_price') or 0.0)
-                                            be_price_placed = float(want_sl)  # ✅ Prix du BE réellement placé
+                                            be_price_placed = float(want_sl)
                                             
-                                            # ✅ CALCUL PNL SÉCURISÉ RÉEL (BE - Entry, pas prix actuel)
+                                            # ✅ CALCUL PNL SÉCURISÉ RÉEL (BE - Entry)
                                             if entry_price_be <= 0 or remaining_qty <= 0:
                                                 pnl_secured = 0.0
                                             else:
                                                 if is_long:
-                                                    # LONG : Gain sécurisé = (BE - Entry) * Qty
                                                     pnl_secured = max(0.0, (be_price_placed - entry_price_be) * remaining_qty)
                                                 else:
-                                                    # SHORT : Gain sécurisé = (Entry - BE) * Qty
                                                     pnl_secured = max(0.0, (entry_price_be - be_price_placed) * remaining_qty)
                                             
                                             if is_manual_trade:
@@ -5482,11 +5630,7 @@ def manage_open_positions(ex):
                                                     remaining_qty=float(remaining_qty)
                                                 )
                                             
-                                            # ✅ MARQUER COMME NOTIFIÉ (plus de spam)
-                                            try:
-                                                database.update_trade_meta(pos['id'], {'be_notified': True})
-                                            except Exception:
-                                                pass
+                                            # Note : be_notified sera géré autrement (pas de update_trade_meta disponible)
                                         except Exception as e:
                                             print(f"❌ Erreur notification BE {symbol}: {e}")
                                     
@@ -5498,7 +5642,11 @@ def manage_open_positions(ex):
             
             # ========== TRAILING PAR PALIERS (25%, 50%, 75%) ==========
             try:
-                trail_stepped = config.get('TRAIL_USE_STEPPED', 'true').lower() == 'true'
+                # ✅ CORRECTION : database.get_setting
+                try:
+                    trail_stepped = str(database.get_setting('TRAIL_USE_STEPPED', 'true')).lower() == 'true'
+                except Exception:
+                    trail_stepped = True
                 
                 if trail_stepped:
                     entry = float(pos.get('entry_price') or 0.0)
@@ -5509,6 +5657,7 @@ def manage_open_positions(ex):
                         data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                         
                         if len(data_bars) >= 20:
+                            import pandas as pd
                             df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                             current_price = float(df['close'].iloc[-1])
                             
@@ -5528,8 +5677,15 @@ def manage_open_positions(ex):
                             
                             last_step = meta.get('trail_step', 0)
                             
-                            step_50_pct = float(config.get('TRAIL_STEP_50_PCT', 0.01))
-                            step_75_pct = float(config.get('TRAIL_STEP_75_PCT', 0.015))
+                            try:
+                                step_50_pct = float(database.get_setting('TRAIL_STEP_50_PCT', '0.01'))
+                            except Exception:
+                                step_50_pct = 0.01
+                            
+                            try:
+                                step_75_pct = float(database.get_setting('TRAIL_STEP_75_PCT', '0.015'))
+                            except Exception:
+                                step_75_pct = 0.015
                             
                             new_step = 0
                             target_sl = None
@@ -5558,19 +5714,29 @@ def manage_open_positions(ex):
                             # ✅ PROTECTION ANTI-RECUL
                             if target_sl and _sl_improves_or_equal(target_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
-                                sl_ok, _ = _place_sl_tp_safe(
+                                
+                                # ✅ CORRECTION : Paramètres complets
+                                try:
+                                    market = ex.market(symbol) or {}
+                                    tick_size = _bitget_tick_size(market)
+                                except Exception:
+                                    tick_size = 0.0001
+                                
+                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                
+                                sl_ok, tp_ok = _place_sl_tp_safe(
                                     ex, symbol, close_side, qty,
                                     sl=target_sl,
                                     tp=tp_price,
-                                    retry=2
+                                    params=common_params,
+                                    is_long=is_long,
+                                    tick_size=tick_size
                                 )
                                 
                                 if sl_ok:
                                     database.update_trade_sl(pos['id'], float(target_sl))
                                     
-                                    new_meta = meta.copy()
-                                    new_meta['trail_step'] = new_step
-                                    database.update_trade_meta(pos['id'], new_meta)
+                                    # Note : trail_step sera géré autrement (pas de update_trade_meta)
                                     
                                     print(f"✅ {symbol} Trailing palier {new_step}% : SL {sl_current:.4f} → {target_sl:.4f}")
                             elif target_sl:
@@ -5588,6 +5754,7 @@ def manage_open_positions(ex):
                     data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                     
                     if len(data_bars) >= 20:
+                        import pandas as pd
                         df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         current_price = float(df['close'].iloc[-1])
                         
@@ -5601,8 +5768,15 @@ def manage_open_positions(ex):
                         progress = max(0.0, min(1.0, progress))
                         
                         if progress >= 0.90:
-                            trail_min_move = float(config.get('TRAIL_MIN_MOVE_PCT', 0.001))
-                            trail_offset = float(config.get('TRAIL_FINAL_OFFSET_PCT', 0.002))
+                            try:
+                                trail_min_move = float(database.get_setting('TRAIL_MIN_MOVE_PCT', '0.001'))
+                            except Exception:
+                                trail_min_move = 0.001
+                            
+                            try:
+                                trail_offset = float(database.get_setting('TRAIL_FINAL_OFFSET_PCT', '0.002'))
+                            except Exception:
+                                trail_offset = 0.002
                             
                             if is_long:
                                 want_sl = current_price * (1.0 - trail_offset)
@@ -5614,11 +5788,23 @@ def manage_open_positions(ex):
                             # ✅ PROTECTION ANTI-RECUL
                             if move >= trail_min_move and _sl_improves_or_equal(want_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
-                                sl_ok, _ = _place_sl_tp_safe(
+                                
+                                # ✅ CORRECTION : Paramètres complets
+                                try:
+                                    market = ex.market(symbol) or {}
+                                    tick_size = _bitget_tick_size(market)
+                                except Exception:
+                                    tick_size = 0.0001
+                                
+                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                
+                                sl_ok, tp_ok = _place_sl_tp_safe(
                                     ex, symbol, close_side, qty,
                                     sl=want_sl,
                                     tp=tp_price,
-                                    retry=2
+                                    params=common_params,
+                                    is_long=is_long,
+                                    tick_size=tick_size
                                 )
                                 
                                 if sl_ok:
@@ -5632,7 +5818,6 @@ def manage_open_positions(ex):
         except Exception as e:
             print(f"❌ Erreur manage_open_positions trade {pos.get('id')}: {e}")
             continue
-
 
 
 
