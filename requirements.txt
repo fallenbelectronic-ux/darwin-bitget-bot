@@ -9,3 +9,4 @@ pytz
 tabulate
 scipy
 dropbox==11.36.2
+TA-Lib==0.4.28
