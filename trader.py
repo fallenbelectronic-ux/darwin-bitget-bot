@@ -5006,7 +5006,7 @@ def manage_open_positions(ex):
             continue
     
     # ========== FILTRAGE DOUBLONS (1 TRADE ACTIF PAR SYMBOLE) ==========
-    db_trades = database.get_active_trades()
+    db_trades = database.get_open_positions()
     active_per_symbol = {}
     for pos in db_trades:
         sym = pos.get('symbol', '')
