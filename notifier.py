@@ -933,41 +933,6 @@ def try_handle_inline_callback(event: Any) -> bool:
     except Exception as e:
         tg_send_error("Callback routing", e)
         return False
-```
-
----
-
-## ✅ **RÉSUMÉ DES MODIFICATIONS**
-
-### **📁 trader.py**
-| Ligne | Avant | Après |
-|-------|-------|-------|
-| ~1780 | `is_below_mm80` | `is_clearly_below_mm80` ✅ |
-| ~1850 | `is_above_mm80` | `is_clearly_above_mm80` ✅ |
-
-### **📁 notifier.py**
-| Ajout | Description |
-|-------|-------------|
-| `_PAGINATION_STATE` | Cache état pagination par chat |
-| `tg_show_signals_6h(page=1)` | Pagination 10 signaux/page |
-| `signals_page:N` callback | Navigation pages |
-
----
-
-## 🎯 **RÉSULTAT ATTENDU**
-
-### **Signaux (6h) :**
-```
-⏱️ Signaux valides (6h)
-Page 1/3 — 25 signaux au total
-
-- 2025-12-11 14:23 — BTC/USDT (1h) BUY
-  Entry: 43250.00 | SL: 42800.00 | TP: 44500.00 | RR: x3.25  —  ✅ Pris
-
-[... 9 autres signaux ...]
-
-[⬅️ Précédent] [Suivant ➡️]
-[↩️ Retour]
 
 def _format_signal_row(sig: dict) -> str:
     """Format compact d'un signal (sans la raison), horodaté Europe/Lisbon.
