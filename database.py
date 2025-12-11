@@ -617,13 +617,31 @@ def fetch_open_executions(limit: int = 100) -> List[Dict[str, Any]]:
     return items[:max(1, int(limit))]
 
 def fetch_recent_executions(hours: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
-    """Retourne les exécutions récentes (fermé ou ouvert), filtre sur fenêtre glissante en heures."""
+    """
+    Retourne les exécutions récentes (fermé ou ouvert), filtre sur fenêtre glissante en heures.
+    ⚠️ NOUVEAU : Filtre également par le timestamp de reset stats si défini.
+    """
     import time
     executions = _load_json_setting('EXECUTIONS_LOG', [])
     items = list(executions)
+    
+    # Timestamp de reset
+    reset_ts_sec = get_stats_reset_timestamp()
+    
+    # Calculer le timestamp minimum
+    min_ts = 0
     if hours is not None:
         min_ts = _now_ms() - int(hours) * 3600 * 1000
+    
+    # Convertir reset_ts en ms
+    reset_ts_ms = reset_ts_sec * 1000 if reset_ts_sec > 0 else 0
+    
+    # Utiliser le timestamp le plus récent
+    min_ts = max(min_ts, reset_ts_ms)
+    
+    if min_ts > 0:
         items = [x for x in items if int(x.get('opened_at', 0)) >= min_ts]
+    
     items.sort(key=lambda x: int(x.get('opened_at', 0)), reverse=True)
     return items[:max(1, int(limit))]
 
@@ -939,5 +957,70 @@ def save_signal(**payload):
     state = str(sig.pop('state', 'PENDING'))
     return upsert_signal(sig, state=state)
 
+def reset_statistics_soft() -> dict:
+    """
+    Réinitialisation SOFT des statistiques.
+    
+    - Enregistre un timestamp de reset
+    - Garde TOUTES les données historiques (trades, executions, orders)
+    - Les stats futures ne compteront que les trades/exécutions APRÈS ce timestamp
+    
+    Retourne un dict avec le résumé de l'opération.
+    """
+    import time
+    
+    reset_ts = int(time.time())
+    
+    # Enregistrer le timestamp de reset
+    set_setting("STATS_RESET_TIMESTAMP", str(reset_ts))
+    
+    # Vider le cache de stats pour forcer le recalcul
+    set_setting("STATS_CACHE", "{}")
+    
+    # Compter ce qui sera ignoré
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            
+            # Compter trades fermés qui seront ignorés
+            closed_trades = cur.execute("""
+                SELECT COUNT(*) FROM trades 
+                WHERE status != 'OPEN' 
+                AND COALESCE(close_timestamp, open_timestamp, 0) < ?
+            """, (reset_ts,)).fetchone()[0]
+            
+            # Compter positions ouvertes (seront gardées)
+            open_trades = cur.execute("""
+                SELECT COUNT(*) FROM trades WHERE status = 'OPEN'
+            """, ()).fetchone()[0]
+    except Exception:
+        closed_trades = 0
+        open_trades = 0
+    
+    # Compter executions qui seront ignorées
+    execs = _load_json_setting('EXECUTIONS_LOG', [])
+    closed_execs = len([e for e in execs if str(e.get('status', '')).lower() == 'closed'])
+    open_execs = len([e for e in execs if str(e.get('status', '')).lower() == 'open'])
+    
+    return {
+        "type": "SOFT_RESET",
+        "reset_timestamp": reset_ts,
+        "reset_date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_ts)),
+        "trades_ignored": closed_trades,
+        "trades_kept_open": open_trades,
+        "executions_ignored": closed_execs,
+        "executions_kept_open": open_execs,
+        "message": "✅ Reset SOFT effectué. Les statistiques compteront uniquement les trades/exécutions à partir de maintenant."
+    }
 
+
+def get_stats_reset_timestamp() -> int:
+    """
+    Retourne le timestamp de reset des stats, ou 0 si aucun reset n'a été fait.
+    """
+    try:
+        ts_str = get_setting("STATS_RESET_TIMESTAMP", "0")
+        return int(ts_str)
+    except Exception:
+        return 0
 
