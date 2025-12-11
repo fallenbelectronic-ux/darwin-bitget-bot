@@ -1014,13 +1014,62 @@ def reset_statistics_soft() -> dict:
     }
 
 
-def get_stats_reset_timestamp() -> int:
+# ============================================================================
+# GESTION RESET STATISTIQUES
+# ============================================================================
+
+def get_stats_reset_timestamp() -> float:
     """
-    Retourne le timestamp de reset des stats, ou 0 si aucun reset n'a été fait.
+    Retourne le timestamp du dernier reset stats.
+    
+    Returns:
+        float: Timestamp UNIX (secondes) du reset, ou 0 si jamais effectué
     """
     try:
-        ts_str = get_setting("STATS_RESET_TIMESTAMP", "0")
-        return int(ts_str)
+        raw = get_setting('STATS_RESET_TIMESTAMP', '0')
+        return float(raw) if raw else 0.0
     except Exception:
-        return 0
+        return 0.0
 
+
+def set_stats_reset_timestamp(timestamp: float) -> None:
+    """
+    Enregistre le timestamp du reset stats.
+    
+    Args:
+        timestamp: Timestamp UNIX (secondes) du reset
+    """
+    try:
+        set_setting('STATS_RESET_TIMESTAMP', str(float(timestamp)))
+    except Exception as e:
+        print(f"Erreur set_stats_reset_timestamp: {e}")
+
+
+def perform_stats_reset_soft() -> dict:
+    """
+    Effectue un SOFT RESET des statistiques.
+    
+    - Ne supprime AUCUNE donnée de la DB
+    - Enregistre simplement le timestamp actuel
+    - Les fonctions de stats filtreront automatiquement les trades avant ce timestamp
+    
+    Returns:
+        dict: {"success": bool, "timestamp": float, "message": str}
+    """
+    import time
+    
+    try:
+        current_time = time.time()
+        set_stats_reset_timestamp(current_time)
+        
+        return {
+            "success": True,
+            "timestamp": current_time,
+            "message": f"Reset SOFT effectué. Timestamp: {current_time}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "timestamp": 0.0,
+            "message": f"Erreur reset: {e}"
+        }
