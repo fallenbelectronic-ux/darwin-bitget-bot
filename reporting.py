@@ -812,6 +812,7 @@ def _get_closed_trades_for_period(hours: Optional[int]) -> List[Dict[str, Any]]:
     Tente de récupérer la liste des trades FERMÉS depuis la DB pour une période donnée.
     - Essaie plusieurs APIs possibles de database.* pour rester compatible avec les versions précédentes.
     - Filtre autant que possible par statut 'closed' (TP/SL/etc.) et par timestamp si dispo.
+    - ⚠️ NOUVEAU : Filtre également par le timestamp de reset stats si défini.
     """
     import time
     import database  # type: ignore
@@ -864,9 +865,21 @@ def _get_closed_trades_for_period(hours: Optional[int]) -> List[Dict[str, Any]]:
 
     trades = filtered or trades  # si aucun statut exploitable, on garde la liste brute
 
-    # Filtre temporel si possible
+    # ⚠️ NOUVEAU : Filtre par timestamp de reset stats
+    try:
+        reset_ts = database.get_stats_reset_timestamp()
+    except Exception:
+        reset_ts = 0
+
+    # Filtre temporel (période demandée + reset timestamp)
+    cutoff = 0
     if hours is not None and hours > 0:
         cutoff = time.time() - hours * 3600.0
+    
+    # Utiliser le timestamp le plus récent entre la période et le reset
+    cutoff = max(cutoff, reset_ts)
+
+    if cutoff > 0:
         windowed: List[Dict[str, Any]] = []
         for t in trades:
             try:
@@ -875,7 +888,7 @@ def _get_closed_trades_for_period(hours: Optional[int]) -> List[Dict[str, Any]]:
                 ts = 0.0
             if ts > 10_000_000_000:
                 ts /= 1000.0
-            if ts == 0.0 or ts >= cutoff:
+            if ts >= cutoff:
                 windowed.append(t)
         trades = windowed
 
