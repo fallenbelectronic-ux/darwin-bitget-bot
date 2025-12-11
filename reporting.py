@@ -411,14 +411,64 @@ def build_equity_history(trades: List[Dict[str, Any]]) -> List[tuple]:
     def _build_history_from_exec(executions: List[Dict[str, Any]]) -> List[tuple]:
         """Construit history = [(ts, equity)] à partir de EXECUTIONS_LOG."""
         def _is_closed(e: Dict[str, Any]) -> bool:
-            status = str(e.get("status", "")).lower()
-            if status in ("closed", "filled", "done", "finished", "tp", "sl", "closed_by_sl", "closed_by_tp"):
-                return True
+            """
+            Détermine si une exécution est fermée.
+            
+            ⚠️ EXCLUSIONS :
+            - Statuts ouverts : open, pending, new, live, active, running, partially_filled, partial
+            - Statuts notifications BE : be, breakeven, at_breakeven, moved_to_be, be_notification
+            
+            ✅ Clôtures valides : closed, tp, sl, closed_by_tp, closed_by_sl, etc.
+            """
+            # 1) closed_at prioritaire
             closed_at = e.get("closed_at")
             try:
-                return closed_at not in (None, "", 0, "0")
+                if closed_at not in (None, "", 0, "0"):
+                    return True
             except Exception:
+                pass
+
+            # 2) status
+            try:
+                raw_status = e.get("status", "")
+                status = str(raw_status or "").strip().lower()
+            except Exception:
+                status = ""
+
+            if not status:
                 return False
+
+            # ❌ Statuts ouverts
+            open_statuses = {
+                "open",
+                "opening",
+                "pending",
+                "new",
+                "live",
+                "active",
+                "running",
+                "partially_filled",
+                "partial",
+                "in_progress",
+            }
+
+            if status in open_statuses:
+                return False
+
+            # ❌ Statuts notifications BE (PAS des clôtures !)
+            notification_statuses = {
+                "be",
+                "breakeven",
+                "at_breakeven",
+                "moved_to_be",
+                "be_notification",
+            }
+
+            if status in notification_statuses:
+                return False
+
+            # ✅ Tout autre status = fermé
+            return True
 
         def _pnl_from_exec(e: Dict[str, Any]) -> float:
             pnl_abs = None
@@ -536,7 +586,8 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
 
     - On considère comme "fermées" :
         • si closed_at est renseigné (non vide / non 0)
-        • OU si status est présent et n'est PAS un statut "ouvert" (open/pending/...).
+        • OU si status est présent et n'est PAS un statut "ouvert" (open/pending/...)
+        • ET n'est PAS un statut "notification BE" (be/breakeven/...)
 
     - PnL USDT :
         • utilise en priorité e['pnl_abs'] si présent,
@@ -559,6 +610,8 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
             • status vide -> non fermé
             • status 'open' / 'pending' / 'new' / 'live' / 'active' / 'running' / 'partially_filled' / 'partial'
               -> NON fermé
+            • status 'be' / 'breakeven' / 'at_breakeven' / 'moved_to_be' / 'be_notification'
+              -> NON fermé (ce sont des NOTIFICATIONS, pas des clôtures)
             • tout autre status non vide -> considéré comme fermé
         """
         # 1) closed_at prioritaire
@@ -598,9 +651,23 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
         if status in open_statuses:
             return False
 
+        # ⚠️ CORRECTION CRITIQUE : Statuts "notifications BE" à exclure
+        # Ces statuts indiquent qu'une alerte BE a été envoyée, 
+        # MAIS la position n'est PAS encore fermée !
+        notification_statuses = {
+            "be",
+            "breakeven",
+            "at_breakeven",
+            "moved_to_be",
+            "be_notification",
+        }
+
+        if status in notification_statuses:
+            return False
+
         # Tout autre status non vide est considéré comme fermé:
         # ex: 'closed', 'tp', 'sl', 'closed_by_tp', 'closed_by_sl',
-        #     'closed_by_exchange', 'be', 'breakeven', etc.
+        #     'closed_by_exchange', 'finished', 'done', 'filled', etc.
         return True
 
     def _to_float(x, default: float = 0.0) -> float:
@@ -720,7 +787,7 @@ def calculate_performance_stats_from_executions(executions: List[Dict[str, Any]]
     else:
         sharpe_ratio = 0.0
 
-    # Max drawdown sur la courbe d’equity cumulée
+    # Max drawdown sur la courbe d'equity cumulée
     equity_curve = np.cumsum(pnls_arr).astype(float)
     running_max = np.maximum.accumulate(equity_curve)
     drawdown = equity_curve - running_max  # <= 0
@@ -814,6 +881,33 @@ def _get_closed_trades_for_period(hours: Optional[int]) -> List[Dict[str, Any]]:
 
     return trades
 
+def _load_balance_optional() -> Optional[float]:
+    """
+    Charge le solde USDT en DB ou via l'exchange en dernier recours.
+    Retourne None si indisponible.
+    """
+    try:
+        import database
+        raw = database.get_setting("CURRENT_BALANCE_USDT", None)
+        if raw is not None:
+            try:
+                return float(raw)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Tentative live via l'exchange
+    try:
+        import trader
+        from main import create_exchange
+        ex = create_exchange()
+        if ex is not None:
+            return float(trader.get_usdt_balance(ex))
+    except Exception:
+        pass
+
+    return None
 
 def _render_stats_period(period: str) -> str:
     """
