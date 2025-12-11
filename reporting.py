@@ -934,8 +934,11 @@ def _render_stats_period(period: str) -> str:
     - Choisit automatiquement l'ensemble le plus informatif :
         • si un des deux a un PnL total non nul → on privilégie celui-ci,
         • sinon on choisit celui avec le plus de trades.
+    
+    ✅ CORRECTION : Filtre EXECUTIONS_LOG par reset_timestamp
     """
     import database
+    import time
 
     period = (period or "24h").lower()
 
@@ -952,14 +955,43 @@ def _render_stats_period(period: str) -> str:
         hours = 24
         title = "Bilan Quotidien (24h)"
 
-    # ---------- 1) Stats EXECUTIONS_LOG ----------
+    # ✅ CORRECTION 1 : Récupérer reset_timestamp UNE SEULE FOIS
     try:
-        execs = database.fetch_recent_executions(hours=hours, limit=10000)
+        reset_ts = database.get_stats_reset_timestamp()
     except Exception:
-        execs = []
+        reset_ts = 0
+
+    # ✅ CORRECTION 2 : Calculer cutoff avec reset_timestamp
+    cutoff = 0
+    if hours is not None and hours > 0:
+        cutoff = time.time() - hours * 3600.0
+    
+    # Utiliser le timestamp le plus récent entre la période et le reset
+    cutoff = max(cutoff, reset_ts)
+
+    # ---------- 1) Stats EXECUTIONS_LOG (✅ AVEC FILTRE RESET) ----------
+    try:
+        execs_raw = database.fetch_recent_executions(hours=hours, limit=10000)
+    except Exception:
+        execs_raw = []
+
+    # ✅ CORRECTION 3 : Filtrer EXECUTIONS_LOG par cutoff (inclut reset_timestamp)
+    execs_filtered = []
+    if execs_raw and cutoff > 0:
+        for e in execs_raw:
+            try:
+                ts = float(e.get("closed_at") or e.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            if ts >= cutoff:
+                execs_filtered.append(e)
+    else:
+        execs_filtered = execs_raw
 
     try:
-        stats_exec = calculate_performance_stats_from_executions(execs)
+        stats_exec = calculate_performance_stats_from_executions(execs_filtered)
     except Exception:
         stats_exec = {
             "total_trades": 0,
@@ -973,7 +1005,7 @@ def _render_stats_period(period: str) -> str:
             "max_drawdown_percent": 0.0,
         }
 
-    # ---------- 2) Stats TRADES FERMÉS ----------
+    # ---------- 2) Stats TRADES FERMÉS (déjà filtrés) ----------
     try:
         trades = _get_closed_trades_for_period(hours)
     except Exception:
