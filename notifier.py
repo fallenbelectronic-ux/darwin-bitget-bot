@@ -612,9 +612,22 @@ def set_maxpos_command(message: Dict[str, Any]):
         tg_send(f"❌ Erreur /setmaxpos: <code>{_escape(e)}</code>")
 
 
-def tg_reset_stats(update, context):
-    """Réinitialise les statistiques (SOFT RESET)."""
+def tg_reset_stats(callback_query: Optional[Dict[str, Any]] = None):
+    """
+    Réinitialise les statistiques (SOFT RESET).
+    Peut être appelé via callback inline ou commande texte.
+    """
     import database
+    
+    # Extraire chat_id si callback
+    chat_id = None
+    if callback_query:
+        try:
+            msg = callback_query.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = str(chat.get("id") or "")
+        except Exception:
+            pass
     
     # Exécuter le reset SOFT
     try:
@@ -630,10 +643,10 @@ def tg_reset_stats(update, context):
         msg += f"\n🕐 Reset effectué à : <code>{result['reset_date']}</code>\n"
         msg += f"\n💡 <i>Les statistiques compteront uniquement les trades à partir de maintenant.</i>"
         
-        update.message.reply_text(msg, parse_mode="HTML")
+        tg_send(msg, chat_id=chat_id or TG_CHAT_ID)
         
     except Exception as e:
-        update.message.reply_text(f"❌ Erreur lors du reset : {str(e)}")
+        tg_send(f"❌ Erreur lors du reset : {str(e)}", chat_id=chat_id or TG_CHAT_ID)
 
 
 # ==============================================================================
@@ -650,6 +663,7 @@ def get_config_menu_keyboard() -> Dict:
             [{"text": cw_label, "callback_data": "toggle_cutwick"}],
             [{"text": "💹 Offset TP/SL", "callback_data": "OFS:ROOT"}],
             [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
+            [{"text": "🔄 Réinitialiser Stats", "callback_data": "reset_stats"}],
             [{"text": "🛑 Redémarrer le bot", "callback_data": "restart_bot"}],
             [{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]
         ]
