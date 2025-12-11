@@ -32,19 +32,19 @@ RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
-# Copier requirements.txt
+# Copier requirements.txt (pour référence seulement)
 COPY requirements.txt .
 
-# CRITIQUE : Forcer numpy 1.x AVANT tout
+# Installer TOUTES les dépendances dans le bon ordre
 RUN pip install --no-cache-dir --root-user-action ignore --upgrade pip && \
-    pip install --no-cache-dir --root-user-action ignore "numpy>=1.26.0,<2.0"
-
-# Installer TA-Lib ENSUITE avec numpy 1.x déjà présent
-RUN CFLAGS="-I/usr/include/ta-lib" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore TA-Lib==0.4.28
-
-# Installer le reste SANS mettre à jour numpy
-RUN pip install --no-cache-dir --root-user-action ignore --no-deps -r requirements.txt && \
-    pip install --no-cache-dir --root-user-action ignore -r requirements.txt
+    pip install --no-cache-dir --root-user-action ignore "numpy>=1.26.0,<2.0" && \
+    pip install --no-cache-dir --root-user-action ignore "pandas==2.2.0" && \
+    CFLAGS="-I/usr/include/ta-lib" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore "TA-Lib==0.4.28" && \
+    pip install --no-cache-dir --root-user-action ignore \
+        "ccxt==4.2.25" \
+        "python-telegram-bot==21.0.1" \
+        "requests==2.31.0" \
+        "python-dotenv==1.0.1"
 
 # ========================================
 # ÉTAPE 4 : Sécurité (utilisateur non-root)
