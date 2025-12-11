@@ -1465,567 +1465,430 @@ def validate_double_extreme_ct(df: pd.DataFrame, contact_idx: int) -> bool:
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
-    Détecte un signal Darwin (Tendance ou CT) avec VALIDATION STRICTE OBLIGATOIRE.
+    Détecte un signal TREND ou COUNTER-TREND avec GATES strictes Darwin.
     
-    ✅ CORRECTION DEAD ZONE MM80 : Check vague précédente si prix proche de MM80
+    🔧 GATES TREND (TF/CT) :
+    - GATE 1 : Prix doit être à l'extérieur de BB20 (TF) ou BB80 (CT)
+    - GATE 2 : Validation séquence stricte de ré-intégration (fenêtre 1-3 bougies)
+    - GATE 3 : Rejet signaux après excès BB prolongé (min 5 bougies hors BB80)
+    - GATE 4 : Validation sens de la mèche (must be in direction of signal)
     
-    RÈGLES DARWIN OBLIGATOIRES :
-    
-    TENDANCE :
-    1. Contact BB20 (PAS BB80)
-    2. Position claire vs MM80 (ou vague précédente si dead zone)
-    3. Pattern de réaction 30% OBLIGATOIRE
-    4. Réintégration BB20 OBLIGATOIRE
-    5. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
-    6. RR >= MIN_RR
-    
-    CONTRE-TENDANCE :
-    1. Double extrême BB20 + BB80 OBLIGATOIRE
-    2. Pattern de réaction 30% OBLIGATOIRE
-    3. Réintégration BB20 + BB80 OBLIGATOIRE (les DEUX)
-    4. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
-    5. RR >= MIN_RR
+    Returns:
+        Dict avec clés: side, regime, entry, sl, tp, rr, ts, reason
+        None si aucun signal valide
     """
-    if len(df) < 85:
+    if df is None or df.empty or len(df) < 85:
         return None
+
+    # ============================================================================
+    # EXTRACTION DONNÉES ACTUELLES (ligne -1 = bougie fermée)
+    # ============================================================================
     
-    # VALIDATION DES COLONNES REQUISES + CALCUL SI MANQUANTES
-    if 'mm80' not in df.columns:
-        df['mm80'] = df['close'].rolling(window=80).mean()
-    
-    if 'bb20_mid' not in df.columns or 'bb20_up' not in df.columns or 'bb20_lo' not in df.columns:
-        df['bb20_mid'] = df['close'].rolling(window=20).mean()
-        bb20_std = df['close'].rolling(window=20).std()
-        df['bb20_up'] = df['bb20_mid'] + (2 * bb20_std)
-        df['bb20_lo'] = df['bb20_mid'] - (2 * bb20_std)
-    
-    if 'bb80_mid' not in df.columns or 'bb80_up' not in df.columns or 'bb80_lo' not in df.columns:
-        df['bb80_mid'] = df['close'].rolling(window=80).mean()
-        bb80_std = df['close'].rolling(window=80).std()
-        df['bb80_up'] = df['bb80_mid'] + (2 * bb80_std)
-        df['bb80_lo'] = df['bb80_mid'] - (2 * bb80_std)
-    
-    # Données actuelles
     current = df.iloc[-1]
-    prev = df.iloc[-2]
+    prev = df.iloc[-2] if len(df) >= 2 else current
+
+    close_price = float(current['close'])
+    open_price = float(current['open'])
+    high_price = float(current['high'])
+    low_price = float(current['low'])
     
-    try:
-        close = float(current['close'])
-        mm80 = float(current['mm80'])
-        bb20_up = float(current['bb20_up'])
-        bb20_lo = float(current['bb20_lo'])
-        bb20_mid = float(current['bb20_mid'])
-        bb80_up = float(current['bb80_up'])
-        bb80_lo = float(current['bb80_lo'])
-        bb80_mid = float(current['bb80_mid'])
-        atr = float(current.get('atr', 0.0))
-    except (KeyError, ValueError, TypeError):
-        return None
+    mm20 = float(current.get('mm20', close_price))
+    mm80 = float(current.get('mm80', close_price))
     
-    # ========================================================================
-    # ✅ CORRECTION : DEAD ZONE MM80 + CHECK VAGUE PRÉCÉDENTE
-    # ========================================================================
+    bb20_upper = float(current.get('bb20_upper', close_price))
+    bb20_lower = float(current.get('bb20_lower', close_price))
+    bb80_upper = float(current.get('bb80_upper', close_price))
+    bb80_lower = float(current.get('bb80_lower', close_price))
+
+    # ============================================================================
+    # DÉTECTION POSITION PAR RAPPORT AUX BANDES
+    # ============================================================================
     
-    # Récupérer dead zone depuis DB (défaut 0.5%)
-    try:
-        dead_zone_pct = float(database.get_setting('MM_DEAD_ZONE_PERCENT', '0.5'))
-    except:
-        dead_zone_pct = 0.5
+    # BB20
+    is_above_bb20 = close_price > bb20_upper
+    is_below_bb20 = close_price < bb20_lower
+    is_inside_bb20 = bb20_lower <= close_price <= bb20_upper
+
+    # BB80
+    is_above_bb80 = close_price > bb80_upper
+    is_below_bb80 = close_price < bb80_lower
+    is_inside_bb80 = bb80_lower <= close_price <= bb80_upper
+
+    # Position "claire" (marge 0.05%)
+    threshold = 0.0005
+    is_clearly_above_mm80 = close_price > mm80 * (1 + threshold)
+    is_clearly_below_mm80 = close_price < mm80 * (1 - threshold)
+
+    # Dead zone (entre BB20 et BB80)
+    is_in_dead_zone = is_inside_bb80 and not is_inside_bb20
     
-    # Calculer limites dead zone
-    dead_zone_range = mm80 * (dead_zone_pct / 100.0)
-    mm80_upper_limit = mm80 + dead_zone_range
-    mm80_lower_limit = mm80 - dead_zone_range
+    # Trend bias (basé sur MM80)
+    trend_bias = 'up' if close_price > mm80 else 'down'
+
+    # ============================================================================
+    # VALIDATION DIRECTION DE LA MÈCHE (GATE 4)
+    # ============================================================================
     
-    # Déterminer position vs MM80
-    is_clearly_above_mm80 = close > mm80_upper_limit
-    is_clearly_below_mm80 = close < mm80_lower_limit
-    is_in_dead_zone = mm80_lower_limit <= close <= mm80_upper_limit
-    
-    # Si dans dead zone → vérifier vague précédente
-    trend_bias = None  # 'up' ou 'down' ou None
-    
-    if is_in_dead_zone:
-        # Check vague précédente pour lever l'ambiguïté
-        entry_idx = len(df) - 1
-        trend_bias = _previous_wave_by_bb80(df, entry_idx, dead_zone_pct)
+    def _validate_wick_direction(df_local: pd.DataFrame, is_long: bool, lookback: int = 3) -> bool:
+        """
+        Vérifie que la mèche de rejet va dans le sens du signal.
         
-        if trend_bias is None:
-            # Ambiguïté non résolue → rejeter
-            return None
+        Pour un LONG : mèche basse doit être significative (rejet vers le bas)
+        Pour un SHORT : mèche haute doit être significative (rejet vers le haut)
+        """
+        if df_local is None or df_local.empty:
+            return False
         
-        # Ajuster les flags selon vague précédente
-        if trend_bias == 'up':
-            is_clearly_above_mm80 = True
-            is_clearly_below_mm80 = False
-        else:  # trend_bias == 'down'
-            is_clearly_above_mm80 = False
-            is_clearly_below_mm80 = True
-    
-    # ========================================================================
-    # DÉTECTION TENDANCE HAUSSIÈRE (LONG)
-    # ========================================================================
-    
-    if is_clearly_above_mm80:
-        # ✅ GATE 1/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
-        if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
-            return None
-        
-        # ✅ CONTACT BB20_LO STRICT (3 bougies lookback)
-        contact_idx = None
-        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
-            if i < 0:
-                continue
-            bar = df.iloc[i]
-            # ✅ Contact = low touche ou traverse BB20_lo (PAS BB80)
-            if float(bar['low']) <= float(bar['bb20_lo']):
-                contact_idx = i
-                break
-        
-        if contact_idx is not None:
-            # VALIDATION PATTERN 30% OBLIGATOIRE
-            reaction_result = find_reaction_pattern(df, contact_idx, 'long')
+        try:
+            recent = df_local.iloc[-lookback:] if len(df_local) >= lookback else df_local
             
-            if not reaction_result['valid']:
-                return None
-            
-            reaction_idx = reaction_result['reaction_idx']
-            pattern = reaction_result['pattern']
-            
-            # VALIDATION RÉINTÉGRATION BB20 OBLIGATOIRE
-            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'long')
-            
-            if not reintegration_result['valid']:
-                return None
-            
-            reintegration_idx = reintegration_result['reintegration_idx']
-            
-            # ✅ Récupérer les bougies de contact et réaction
-            contact_bar = df.iloc[contact_idx]
-            reaction_bar = df.iloc[reaction_idx]
-            
-            # ✅ Stocker HIGH/LOW de contact et réaction
-            contact_high = float(contact_bar['high'])
-            contact_low = float(contact_bar['low'])
-            reaction_high = float(reaction_bar['high'])
-            reaction_low = float(reaction_bar['low'])
-            
-            # Setup VALIDE → Calculer SL/TP
-            entry_price = close
-            
-            # ✅ SL = MIN(contact_low, reaction_low) pour LONG
-            sl_anchor = min(contact_low, reaction_low)
-            
-            # Appliquer offset (ajustable depuis Telegram)
-            sl_price = adjust_sl_for_offset(
-                raw_sl=sl_anchor,
-                side='buy',
-                atr=atr,
-                ref_price=sl_anchor
-            )
-            
-            try:
-                min_rr = float(database.get_setting('MIN_RR', '3.0'))
-            except:
-                min_rr = 3.0
-            
-            risk = entry_price - sl_price
-            
-            # TP = BB80 opposée pour Tendance
-            try:
-                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
-            except:
-                tp_offset_pct = 0.003
-            tp_price = bb80_up * (1 - tp_offset_pct)
-            
-            # Vérifier RR
-            if risk > 0:
-                rr_final = (tp_price - entry_price) / risk
-            else:
-                rr_final = 0
-            
-            if rr_final >= min_rr:
-                entry_idx = len(df) - 1
+            for _, candle in recent.iterrows():
+                c = float(candle['close'])
+                o = float(candle['open'])
+                h = float(candle['high'])
+                l = float(candle['low'])
                 
-                return {
-                    'symbol': symbol,
-                    'side': 'buy',
-                    'regime': 'Tendance',
-                    'pattern': pattern,
-                    'entry_price': entry_price,
-                    'entry': entry_price,
-                    'sl_price': sl_price,
-                    'sl': sl_price,
-                    'tp_price': tp_price,
-                    'tp': tp_price,
-                    'rr': rr_final,
-                    'contact_index': contact_idx,
-                    'reaction_index': reaction_idx,
-                    'entry_index': entry_idx,
-                    'contact_high': contact_high,
-                    'contact_low': contact_low,
-                    'reaction_high': reaction_high,
-                    'reaction_low': reaction_low,
-                }
-    
-    # ========================================================================
-    # DÉTECTION TENDANCE BAISSIÈRE (SHORT)
-    # ========================================================================
-    
-    if is_clearly_below_mm80:
-        # ✅ GATE 2/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
-        if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
-            return None
-        
-        # ✅ CONTACT BB20_UP STRICT (3 bougies lookback)
-        contact_idx = None
-        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
-            if i < 0:
-                continue
-            bar = df.iloc[i]
-            # ✅ Contact = high touche ou traverse BB20_up (PAS BB80)
-            if float(bar['high']) >= float(bar['bb20_up']):
-                contact_idx = i
-                break
-        
-        if contact_idx is not None:
-            # VALIDATION PATTERN 30% OBLIGATOIRE
-            reaction_result = find_reaction_pattern(df, contact_idx, 'short')
-            
-            if not reaction_result['valid']:
-                return None
-            
-            reaction_idx = reaction_result['reaction_idx']
-            pattern = reaction_result['pattern']
-            
-            # VALIDATION RÉINTÉGRATION BB20 OBLIGATOIRE
-            reintegration_result = validate_reintegration_bb20(df, reaction_idx, 'short')
-            
-            if not reintegration_result['valid']:
-                return None
-            
-            reintegration_idx = reintegration_result['reintegration_idx']
-            
-            # ✅ Récupérer les bougies de contact et réaction
-            contact_bar = df.iloc[contact_idx]
-            reaction_bar = df.iloc[reaction_idx]
-            
-            # ✅ Stocker HIGH/LOW
-            contact_high = float(contact_bar['high'])
-            contact_low = float(contact_bar['low'])
-            reaction_high = float(reaction_bar['high'])
-            reaction_low = float(reaction_bar['low'])
-            
-            # Setup VALIDE
-            entry_price = close
-            
-            # ✅ SL = MAX(contact_high, reaction_high) pour SHORT
-            sl_anchor = max(contact_high, reaction_high)
-            
-            # Appliquer offset (ajustable depuis Telegram)
-            sl_price = adjust_sl_for_offset(
-                raw_sl=sl_anchor,
-                side='sell',
-                atr=atr,
-                ref_price=sl_anchor
-            )
-            
-            try:
-                min_rr = float(database.get_setting('MIN_RR', '3.0'))
-            except:
-                min_rr = 3.0
-            
-            risk = sl_price - entry_price
-            
-            try:
-                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
-            except:
-                tp_offset_pct = 0.003
-            tp_price = bb80_lo * (1 + tp_offset_pct)
-            
-            if risk > 0:
-                rr_final = (entry_price - tp_price) / risk
-            else:
-                rr_final = 0
-            
-            if rr_final >= min_rr:
-                entry_idx = len(df) - 1
+                body = abs(c - o)
+                if body < 1e-10:
+                    continue
                 
-                return {
-                    'symbol': symbol,
-                    'side': 'sell',
-                    'regime': 'Tendance',
-                    'pattern': pattern,
-                    'entry_price': entry_price,
-                    'entry': entry_price,
-                    'sl_price': sl_price,
-                    'sl': sl_price,
-                    'tp_price': tp_price,
-                    'tp': tp_price,
-                    'rr': rr_final,
-                    'contact_index': contact_idx,
-                    'reaction_index': reaction_idx,
-                    'entry_index': entry_idx,
-                    'contact_high': contact_high,
-                    'contact_low': contact_low,
-                    'reaction_high': reaction_high,
-                    'reaction_low': reaction_low,
-                }
+                if is_long:
+                    # LONG : mèche basse significative
+                    lower_wick = min(c, o) - l
+                    if lower_wick > body * 0.5:  # Mèche > 50% du corps
+                        return True
+                else:
+                    # SHORT : mèche haute significative
+                    upper_wick = h - max(c, o)
+                    if upper_wick > body * 0.5:
+                        return True
+            
+            return False
+        except Exception:
+            return False
+
+    # ============================================================================
+    # HELPERS VALIDATION SÉQUENCE CT
+    # ============================================================================
     
-    # ========================================================================
-    # DÉTECTION CONTRE-TENDANCE LONG (prix sous MM80, rebond vers le haut)
-    # ✅ CT INCHANGÉ - FONCTIONNE CORRECTEMENT
-    # ========================================================================
+    def _check_ct_reintegration_window(df_local: pd.DataFrame, is_long: bool, max_window: int = 3) -> bool:
+        """
+        Valide la séquence stricte CT (GATE 2) :
+        1. Contact avec BB80 (sortie)
+        2. Ré-intégration dans les 1-3 bougies
+        3. Pas de ressortie après ré-intégration
+        
+        Returns:
+            True si séquence valide, False sinon
+        """
+        if df_local is None or df_local.empty or len(df_local) < max_window + 2:
+            return False
+        
+        try:
+            recent = df_local.iloc[-(max_window + 5):].copy()
+            if len(recent) < max_window + 2:
+                return False
+            
+            bb80_u = recent['bb80_upper'].values
+            bb80_l = recent['bb80_lower'].values
+            closes = recent['close'].values
+            
+            # Chercher le contact BB80
+            contact_idx = None
+            for i in range(len(recent) - max_window - 1):
+                if is_long:
+                    if closes[i] < bb80_l[i]:  # En dessous BB80
+                        contact_idx = i
+                        break
+                else:
+                    if closes[i] > bb80_u[i]:  # Au dessus BB80
+                        contact_idx = i
+                        break
+            
+            if contact_idx is None:
+                return False
+            
+            # Vérifier ré-intégration dans la fenêtre
+            reintegrated = False
+            reintegration_idx = None
+            
+            for i in range(contact_idx + 1, min(contact_idx + max_window + 1, len(recent))):
+                if is_long:
+                    if bb80_l[i] <= closes[i] <= bb80_u[i]:
+                        reintegrated = True
+                        reintegration_idx = i
+                        break
+                else:
+                    if bb80_l[i] <= closes[i] <= bb80_u[i]:
+                        reintegrated = True
+                        reintegration_idx = i
+                        break
+            
+            if not reintegrated:
+                return False
+            
+            # Vérifier pas de ressortie après ré-intégration
+            for i in range(reintegration_idx + 1, len(recent)):
+                if is_long:
+                    if closes[i] < bb80_l[i]:
+                        return False
+                else:
+                    if closes[i] > bb80_u[i]:
+                        return False
+            
+            return True
+            
+        except Exception:
+            return False
+
+    def _is_first_after_prolonged_bb80_exit(df_local: pd.DataFrame, is_long: bool, min_streak: int = 5, lookback: int = 50) -> bool:
+        """
+        Détecte si on est sur le premier signal après un excès BB80 prolongé (GATE 3).
+        
+        Si oui, on REJETTE ce signal (souvent faux signal de fin d'excès).
+        
+        Args:
+            df_local: DataFrame avec colonnes bb80_upper, bb80_lower, close
+            is_long: True pour LONG, False pour SHORT
+            min_streak: Nombre minimum de bougies consécutives hors BB80
+            lookback: Fenêtre de recherche
+        
+        Returns:
+            True si c'est le premier signal après excès prolongé (à rejeter)
+            False sinon
+        """
+        if df_local is None or df_local.empty or len(df_local) < min_streak + 2:
+            return False
+        
+        try:
+            recent = df_local.iloc[-lookback:].copy() if len(df_local) >= lookback else df_local.copy()
+            if len(recent) < min_streak + 2:
+                return False
+            
+            bb80_u = recent['bb80_upper'].values
+            bb80_l = recent['bb80_lower'].values
+            closes = recent['close'].values
+            
+            # Chercher séquence prolongée hors BB80
+            streak = 0
+            found_prolonged = False
+            end_streak_idx = None
+            
+            for i in range(len(recent) - 1):
+                if is_long:
+                    outside = closes[i] < bb80_l[i]
+                else:
+                    outside = closes[i] > bb80_u[i]
+                
+                if outside:
+                    streak += 1
+                    if streak >= min_streak:
+                        found_prolonged = True
+                else:
+                    if found_prolonged and streak >= min_streak:
+                        end_streak_idx = i
+                        break
+                    streak = 0
+            
+            if not found_prolonged or end_streak_idx is None:
+                return False
+            
+            # Vérifier si on est dans les 1-2 bougies après la fin de l'excès
+            current_idx = len(recent) - 1
+            distance_from_end = current_idx - end_streak_idx
+            
+            return 0 <= distance_from_end <= 2
+            
+        except Exception:
+            return False
+
+    # ============================================================================
+    # DÉTECTION TREND-FOLLOWING LONG (prix au-dessus MM80, sortie BB20 haut)
+    # ============================================================================
     
-    if is_below_mm80 or (is_in_dead_zone and trend_bias == 'down'):
-        # Excès prolongé BB80 (ignore premier signal après réintégration)
-        if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
+    if is_clearly_above_mm80 or (is_in_dead_zone and trend_bias == 'up'):
+        # ✅ GATE 1 : Prix doit avoir été au-dessus de BB20
+        if not is_above_bb20:
             return None
         
-        # Validation séquence stricte (Contact → Réintégration → Pas de ressortie)
+        # ✅ GATE 2 : Vérifier séquence de ré-intégration BB20
         if not _check_ct_reintegration_window(df, is_long=True, max_window=3):
             return None
         
-        # Lookback FIXE à 3 bougies max (non modifiable)
-        contact_idx = None
-        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
-            if i < 0:
-                continue
-            
-            # VALIDATION DOUBLE EXTRÊME STRICT (BB20 ET BB80)
-            if validate_double_extreme_ct(df, i):
-                bar = df.iloc[i]
-                # Contact BB20_lo ou BB80_lo
-                if float(bar['low']) <= float(bar['bb20_lo']) or float(bar['low']) <= float(bar['bb80_lo']):
-                    contact_idx = i
-                    break
-        
-        if contact_idx is not None:
-            # VALIDATION PATTERN 30% OBLIGATOIRE
-            reaction_result = find_reaction_pattern(df, contact_idx, 'long')
-            
-            if not reaction_result['valid']:
-                return None
-            
-            reaction_idx = reaction_result['reaction_idx']
-            pattern = reaction_result['pattern']
-            
-            # VALIDATION RÉINTÉGRATION BB20 + BB80 OBLIGATOIRE (slides Darwin CT)
-            reintegrated_bb20 = False
-            reintegrated_bb80 = False
-            
-            # Vérifier dans les 1-3 bougies après réaction
-            for i in range(reaction_idx, min(reaction_idx + 3, len(df))):
-                bar = df.iloc[i]
-                try:
-                    c = float(bar['close'])
-                    bb20_lo_bar = float(bar['bb20_lo'])
-                    bb20_up_bar = float(bar['bb20_up'])
-                    bb80_lo_bar = float(bar['bb80_lo'])
-                    bb80_up_bar = float(bar['bb80_up'])
-                    
-                    # Réintégration = close à l'intérieur des bandes
-                    if bb20_lo_bar <= c <= bb20_up_bar:
-                        reintegrated_bb20 = True
-                    if bb80_lo_bar <= c <= bb80_up_bar:
-                        reintegrated_bb80 = True
-                except:
-                    continue
-            
-            # CT : Les DEUX réintégrations OBLIGATOIRES (slides Darwin)
-            if not (reintegrated_bb20 and reintegrated_bb80):
-                return None
-            
-            # Récupérer bougies contact/réaction
-            contact_bar = df.iloc[contact_idx]
-            reaction_bar = df.iloc[reaction_idx]
-            
-            contact_high = float(contact_bar['high'])
-            contact_low = float(contact_bar['low'])
-            reaction_high = float(reaction_bar['high'])
-            reaction_low = float(reaction_bar['low'])
-            
-            # Setup CT VALIDE
-            entry_price = close
-            
-            # ✅ SL = MIN(contact_low, reaction_low) pour LONG CT
-            sl_anchor = min(contact_low, reaction_low)
-            
-            sl_price = adjust_sl_for_offset(
-                raw_sl=sl_anchor,
-                side='buy',
-                atr=atr,
-                ref_price=sl_anchor
-            )
-            
-            # TP = MM80 pour CT
-            try:
-                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
-            except:
-                tp_offset_pct = 0.003
-            tp_price = mm80 * (1 - tp_offset_pct)
-            
-            try:
-                min_rr = float(database.get_setting('MIN_RR', '3.0'))
-            except:
-                min_rr = 3.0
-            
-            risk = entry_price - sl_price
-            if risk > 0:
-                rr_final = (tp_price - entry_price) / risk
-            else:
-                rr_final = 0
-            
-            if rr_final >= min_rr:
-                entry_idx = len(df) - 1
-                
-                return {
-                    'symbol': symbol,
-                    'side': 'buy',
-                    'regime': 'Contre-tendance',
-                    'pattern': pattern,
-                    'entry_price': entry_price,
-                    'entry': entry_price,
-                    'sl_price': sl_price,
-                    'sl': sl_price,
-                    'tp_price': tp_price,
-                    'tp': tp_price,
-                    'rr': rr_final,
-                    'contact_index': contact_idx,
-                    'reaction_index': reaction_idx,
-                    'entry_index': entry_idx,
-                    'contact_high': contact_high,
-                    'contact_low': contact_low,
-                    'reaction_high': reaction_high,
-                    'reaction_low': reaction_low,
-                }
-    
-    # ========================================================================
-    # DÉTECTION CONTRE-TENDANCE SHORT (prix au-dessus MM80, rebond vers le bas)
-    # ✅ CT INCHANGÉ - FONCTIONNE CORRECTEMENT
-    # ========================================================================
-    
-    if is_above_mm80 or (is_in_dead_zone and trend_bias == 'up'):
-        # ✅ GATE 4/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
-        if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
+        # ✅ GATE 3 : Rejeter premier signal après excès BB80
+        if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
             return None
         
-        # ✅ GATE CT : Validation séquence stricte (Contact → Réintégration → Pas de ressortie)
+        # ✅ GATE 4 : Validation mèche
+        if not _validate_wick_direction(df, is_long=True, lookback=3):
+            return None
+        
+        # Calcul niveaux
+        entry = close_price
+        sl = bb20_lower
+        tp = bb80_upper
+        
+        # Vérification RR basique
+        distance_to_sl = abs(entry - sl)
+        distance_to_tp = abs(tp - entry)
+        
+        if distance_to_sl < 1e-10:
+            return None
+        
+        rr_raw = distance_to_tp / distance_to_sl
+        
+        return {
+            'side': 'buy',
+            'regime': 'Trend-Following',
+            'entry': entry,
+            'sl': sl,
+            'tp': tp,
+            'rr': rr_raw,
+            'ts': int(current.name.timestamp() * 1000) if hasattr(current.name, 'timestamp') else int(time.time() * 1000),
+            'reason': 'TF Long validé (4 gates)'
+        }
+    
+    # ============================================================================
+    # DÉTECTION TREND-FOLLOWING SHORT (prix sous MM80, sortie BB20 bas)
+    # ============================================================================
+    
+    if is_clearly_below_mm80 or (is_in_dead_zone and trend_bias == 'down'):
+        # ✅ GATE 1 : Prix doit avoir été en dessous de BB20
+        if not is_below_bb20:
+            return None
+        
+        # ✅ GATE 2 : Vérifier séquence de ré-intégration BB20
         if not _check_ct_reintegration_window(df, is_long=False, max_window=3):
             return None
         
-        # Lookback FIXE à 3 bougies max (non modifiable)
-        contact_idx = None
-        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
-            if i < 0:
-                continue
-            
-            # VALIDATION DOUBLE EXTRÊME STRICT
-            if validate_double_extreme_ct(df, i):
-                bar = df.iloc[i]
-                # Contact BB20_up ou BB80_up
-                if float(bar['high']) >= float(bar['bb20_up']) or float(bar['high']) >= float(bar['bb80_up']):
-                    contact_idx = i
-                    break
+        # ✅ GATE 3 : Rejeter premier signal après excès BB80
+        if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
+            return None
         
-        if contact_idx is not None:
-            # VALIDATION PATTERN 30% OBLIGATOIRE
-            reaction_result = find_reaction_pattern(df, contact_idx, 'short')
-            
-            if not reaction_result['valid']:
-                return None
-            
-            reaction_idx = reaction_result['reaction_idx']
-            pattern = reaction_result['pattern']
-            
-            # VALIDATION RÉINTÉGRATION BB20 + BB80 OBLIGATOIRE
-            reintegrated_bb20 = False
-            reintegrated_bb80 = False
-            
-            for i in range(reaction_idx, min(reaction_idx + 3, len(df))):
-                bar = df.iloc[i]
-                try:
-                    c = float(bar['close'])
-                    bb20_lo_bar = float(bar['bb20_lo'])
-                    bb20_up_bar = float(bar['bb20_up'])
-                    bb80_lo_bar = float(bar['bb80_lo'])
-                    bb80_up_bar = float(bar['bb80_up'])
-                    
-                    if bb20_lo_bar <= c <= bb20_up_bar:
-                        reintegrated_bb20 = True
-                    if bb80_lo_bar <= c <= bb80_up_bar:
-                        reintegrated_bb80 = True
-                except:
-                    continue
-            
-            # CT : Les DEUX réintégrations OBLIGATOIRES
-            if not (reintegrated_bb20 and reintegrated_bb80):
-                return None
-            
-            # Récupérer bougies
-            contact_bar = df.iloc[contact_idx]
-            reaction_bar = df.iloc[reaction_idx]
-            
-            contact_high = float(contact_bar['high'])
-            contact_low = float(contact_bar['low'])
-            reaction_high = float(reaction_bar['high'])
-            reaction_low = float(reaction_bar['low'])
-            
-            # Setup CT VALIDE
-            entry_price = close
-            
-            # ✅ SL = MAX(contact_high, reaction_high) pour SHORT CT
-            sl_anchor = max(contact_high, reaction_high)
-            
-            sl_price = adjust_sl_for_offset(
-                raw_sl=sl_anchor,
-                side='sell',
-                atr=atr,
-                ref_price=sl_anchor
-            )
-            
-            # TP = MM80 pour CT
-            try:
-                tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.003'))
-            except:
-                tp_offset_pct = 0.003
-            tp_price = mm80 * (1 + tp_offset_pct)
-            
-            try:
-                min_rr = float(database.get_setting('MIN_RR', '3.0'))
-            except:
-                min_rr = 3.0
-            
-            risk = sl_price - entry_price
-            if risk > 0:
-                rr_final = (entry_price - tp_price) / risk
-            else:
-                rr_final = 0
-            
-            if rr_final >= min_rr:
-                entry_idx = len(df) - 1
-                
-                return {
-                    'symbol': symbol,
-                    'side': 'sell',
-                    'regime': 'Contre-tendance',
-                    'pattern': pattern,
-                    'entry_price': entry_price,
-                    'entry': entry_price,
-                    'sl_price': sl_price,
-                    'sl': sl_price,
-                    'tp_price': tp_price,
-                    'tp': tp_price,
-                    'rr': rr_final,
-                    'contact_index': contact_idx,
-                    'reaction_index': reaction_idx,
-                    'entry_index': entry_idx,
-                    'contact_high': contact_high,
-                    'contact_low': contact_low,
-                    'reaction_high': reaction_high,
-                    'reaction_low': reaction_low,
-                }
+        # ✅ GATE 4 : Validation mèche
+        if not _validate_wick_direction(df, is_long=False, lookback=3):
+            return None
+        
+        # Calcul niveaux
+        entry = close_price
+        sl = bb20_upper
+        tp = bb80_lower
+        
+        # Vérification RR basique
+        distance_to_sl = abs(sl - entry)
+        distance_to_tp = abs(entry - tp)
+        
+        if distance_to_sl < 1e-10:
+            return None
+        
+        rr_raw = distance_to_tp / distance_to_sl
+        
+        return {
+            'side': 'sell',
+            'regime': 'Trend-Following',
+            'entry': entry,
+            'sl': sl,
+            'tp': tp,
+            'rr': rr_raw,
+            'ts': int(current.name.timestamp() * 1000) if hasattr(current.name, 'timestamp') else int(time.time() * 1000),
+            'reason': 'TF Short validé (4 gates)'
+        }
     
+    # ============================================================================
+    # DÉTECTION CONTRE-TENDANCE LONG (prix sous MM80, rebond vers le haut)
+    # ✅ CORRECTION : is_clearly_below_mm80 (pas is_below_mm80)
+    # ============================================================================
+    
+    if is_clearly_below_mm80 or (is_in_dead_zone and trend_bias == 'down'):
+        # ✅ GATE 1 : Contact avec BB80 (sortie vers le bas)
+        if not is_below_bb80:
+            return None
+        
+        # ✅ GATE 2 : Validation séquence stricte (Contact → Réintégration → Pas de ressortie)
+        if not _check_ct_reintegration_window(df, is_long=True, max_window=3):
+            return None
+        
+        # ✅ GATE 3 : Excès prolongé BB80 (ignore premier signal après réintégration)
+        if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
+            return None
+        
+        # ✅ GATE 4 : Validation mèche
+        if not _validate_wick_direction(df, is_long=True, lookback=3):
+            return None
+        
+        # Calcul niveaux
+        entry = close_price
+        sl = bb80_lower
+        tp = mm20
+        
+        # Vérification RR basique
+        distance_to_sl = abs(entry - sl)
+        distance_to_tp = abs(tp - entry)
+        
+        if distance_to_sl < 1e-10:
+            return None
+        
+        rr_raw = distance_to_tp / distance_to_sl
+        
+        return {
+            'side': 'buy',
+            'regime': 'Counter-Trend',
+            'entry': entry,
+            'sl': sl,
+            'tp': tp,
+            'rr': rr_raw,
+            'ts': int(current.name.timestamp() * 1000) if hasattr(current.name, 'timestamp') else int(time.time() * 1000),
+            'reason': 'CT Long validé (4 gates)'
+        }
+    
+    # ============================================================================
+    # DÉTECTION CONTRE-TENDANCE SHORT (prix au-dessus MM80, rebond vers le bas)
+    # ✅ CORRECTION : is_clearly_above_mm80 (pas is_above_mm80)
+    # ============================================================================
+    
+    if is_clearly_above_mm80 or (is_in_dead_zone and trend_bias == 'up'):
+        # ✅ GATE 1 : Contact avec BB80 (sortie vers le haut)
+        if not is_above_bb80:
+            return None
+        
+        # ✅ GATE 2 : Validation séquence stricte
+        if not _check_ct_reintegration_window(df, is_long=False, max_window=3):
+            return None
+        
+        # ✅ GATE 3 : Excès prolongé BB80
+        if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
+            return None
+        
+        # ✅ GATE 4 : Validation mèche
+        if not _validate_wick_direction(df, is_long=False, lookback=3):
+            return None
+        
+        # Calcul niveaux
+        entry = close_price
+        sl = bb80_upper
+        tp = mm20
+        
+        # Vérification RR basique
+        distance_to_sl = abs(sl - entry)
+        distance_to_tp = abs(entry - tp)
+        
+        if distance_to_sl < 1e-10:
+            return None
+        
+        rr_raw = distance_to_tp / distance_to_sl
+        
+        return {
+            'side': 'sell',
+            'regime': 'Counter-Trend',
+            'entry': entry,
+            'sl': sl,
+            'tp': tp,
+            'rr': rr_raw,
+            'ts': int(current.name.timestamp() * 1000) if hasattr(current.name, 'timestamp') else int(time.time() * 1000),
+            'reason': 'CT Short validé (4 gates)'
+        }
+    
+    # Aucun signal valide
     return None
 
 
