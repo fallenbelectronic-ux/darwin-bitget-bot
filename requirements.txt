@@ -1,6 +1,5 @@
 ccxt
 pandas
-numpy
 requests
 ta
 matplotlib
