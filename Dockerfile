@@ -39,8 +39,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --root-user-action ignore --upgrade pip && \
     pip install --no-cache-dir --root-user-action ignore numpy==1.26.3
 
-# Installer TA-Lib avec flags de compilation explicites
-RUN CFLAGS="-I/usr/include" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore TA-Lib==0.4.28
+# Installer TA-Lib avec le BON chemin des headers
+RUN CFLAGS="-I/usr/include/ta-lib" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore TA-Lib==0.4.28
 
 # Installer le reste des dépendances
 RUN pip install --no-cache-dir --root-user-action ignore -r requirements.txt
