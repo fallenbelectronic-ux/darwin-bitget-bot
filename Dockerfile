@@ -1,7 +1,7 @@
 # ========================================
-# BASE IMAGE
+# BASE IMAGE - Python 3.10 pour compatibilité TA-Lib
 # ========================================
-FROM python:3.11
+FROM python:3.10
 
 # ========================================
 # ÉTAPE 1 : Dépendances système pour TA-Lib
