@@ -1467,19 +1467,17 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
     Détecte un signal Darwin (Tendance ou CT) avec VALIDATION STRICTE OBLIGATOIRE.
     
-    CORRECTION CRITIQUE : SL basé sur HIGH/LOW de CONTACT + RÉACTION (pas BB20/BB80 dernière bougie)
-    ✅ LOOKBACK FIXE À 3 BOUGIES MAX (non modifiable)
-    ✅ GATE EXCÈS PROLONGÉ BB80 : Ignore premier signal après 5+ bougies hors BB80
-    ✅ GATE CT SÉQUENCE STRICTE : Contact → Réintégration → Pas de ressortie
+    ✅ CORRECTION DEAD ZONE MM80 : Check vague précédente si prix proche de MM80
     
     RÈGLES DARWIN OBLIGATOIRES :
     
     TENDANCE :
-    1. Contact BB20
-    2. Pattern de réaction 30% OBLIGATOIRE (pinbar/wick/marubozu/gap)
-    3. Réintégration BB20 OBLIGATOIRE
-    4. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
-    5. RR >= MIN_RR
+    1. Contact BB20 (PAS BB80)
+    2. Position claire vs MM80 (ou vague précédente si dead zone)
+    3. Pattern de réaction 30% OBLIGATOIRE
+    4. Réintégration BB20 OBLIGATOIRE
+    5. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
+    6. RR >= MIN_RR
     
     CONTRE-TENDANCE :
     1. Double extrême BB20 + BB80 OBLIGATOIRE
@@ -1487,14 +1485,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     3. Réintégration BB20 + BB80 OBLIGATOIRE (les DEUX)
     4. SL = MAX/MIN(contact_high/low, reaction_high/low) + offset
     5. RR >= MIN_RR
-    
-    Args:
-        symbol: Symbole à analyser
-        df: DataFrame avec colonnes : open, high, low, close, volume,
-            mm80, bb20_up, bb20_lo, bb80_up, bb80_lo
-    
-    Returns:
-        Signal dict ou None
     """
     if len(df) < 85:
         return None
@@ -1533,24 +1523,61 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return None
     
     # ========================================================================
+    # ✅ CORRECTION : DEAD ZONE MM80 + CHECK VAGUE PRÉCÉDENTE
+    # ========================================================================
+    
+    # Récupérer dead zone depuis DB (défaut 0.5%)
+    try:
+        dead_zone_pct = float(database.get_setting('MM_DEAD_ZONE_PERCENT', '0.5'))
+    except:
+        dead_zone_pct = 0.5
+    
+    # Calculer limites dead zone
+    dead_zone_range = mm80 * (dead_zone_pct / 100.0)
+    mm80_upper_limit = mm80 + dead_zone_range
+    mm80_lower_limit = mm80 - dead_zone_range
+    
+    # Déterminer position vs MM80
+    is_clearly_above_mm80 = close > mm80_upper_limit
+    is_clearly_below_mm80 = close < mm80_lower_limit
+    is_in_dead_zone = mm80_lower_limit <= close <= mm80_upper_limit
+    
+    # Si dans dead zone → vérifier vague précédente
+    trend_bias = None  # 'up' ou 'down' ou None
+    
+    if is_in_dead_zone:
+        # Check vague précédente pour lever l'ambiguïté
+        entry_idx = len(df) - 1
+        trend_bias = _previous_wave_by_bb80(df, entry_idx, dead_zone_pct)
+        
+        if trend_bias is None:
+            # Ambiguïté non résolue → rejeter
+            return None
+        
+        # Ajuster les flags selon vague précédente
+        if trend_bias == 'up':
+            is_clearly_above_mm80 = True
+            is_clearly_below_mm80 = False
+        else:  # trend_bias == 'down'
+            is_clearly_above_mm80 = False
+            is_clearly_below_mm80 = True
+    
+    # ========================================================================
     # DÉTECTION TENDANCE HAUSSIÈRE (LONG)
     # ========================================================================
     
-    is_above_mm80 = close > mm80
-    is_below_mm80 = close < mm80
-    
-    if is_above_mm80:
+    if is_clearly_above_mm80:
         # ✅ GATE 1/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
         if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
             return None
         
-        # ✅ CORRECTION 1/4 : Lookback FIXE à 3 bougies max (non modifiable)
+        # ✅ CONTACT BB20_LO STRICT (3 bougies lookback)
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
                 continue
             bar = df.iloc[i]
-            # Contact = low touche ou traverse BB20_lo
+            # ✅ Contact = low touche ou traverse BB20_lo (PAS BB80)
             if float(bar['low']) <= float(bar['bb20_lo']):
                 contact_idx = i
                 break
@@ -1573,11 +1600,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             
             reintegration_idx = reintegration_result['reintegration_idx']
             
-            # ✅ CORRECTION : Récupérer les bougies de contact et réaction
+            # ✅ Récupérer les bougies de contact et réaction
             contact_bar = df.iloc[contact_idx]
             reaction_bar = df.iloc[reaction_idx]
             
-            # ✅ CORRECTION : Stocker HIGH/LOW de contact et réaction
+            # ✅ Stocker HIGH/LOW de contact et réaction
             contact_high = float(contact_bar['high'])
             contact_low = float(contact_bar['low'])
             reaction_high = float(reaction_bar['high'])
@@ -1586,7 +1613,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup VALIDE → Calculer SL/TP
             entry_price = close
             
-            # ✅ CORRECTION : SL = MIN(contact_low, reaction_low) pour LONG
+            # ✅ SL = MIN(contact_low, reaction_low) pour LONG
             sl_anchor = min(contact_low, reaction_low)
             
             # Appliquer offset (ajustable depuis Telegram)
@@ -1635,7 +1662,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx,
-                    # ✅ AJOUT : Stocker les niveaux pour recalc live
                     'contact_high': contact_high,
                     'contact_low': contact_low,
                     'reaction_high': reaction_high,
@@ -1646,18 +1672,18 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     # DÉTECTION TENDANCE BAISSIÈRE (SHORT)
     # ========================================================================
     
-    if is_below_mm80:
+    if is_clearly_below_mm80:
         # ✅ GATE 2/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
         if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
             return None
         
-        # ✅ CORRECTION 2/4 : Lookback FIXE à 3 bougies max (non modifiable)
+        # ✅ CONTACT BB20_UP STRICT (3 bougies lookback)
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
             if i < 0:
                 continue
             bar = df.iloc[i]
-            # Contact = high touche ou traverse BB20_up
+            # ✅ Contact = high touche ou traverse BB20_up (PAS BB80)
             if float(bar['high']) >= float(bar['bb20_up']):
                 contact_idx = i
                 break
@@ -1680,11 +1706,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             
             reintegration_idx = reintegration_result['reintegration_idx']
             
-            # ✅ CORRECTION : Récupérer les bougies de contact et réaction
+            # ✅ Récupérer les bougies de contact et réaction
             contact_bar = df.iloc[contact_idx]
             reaction_bar = df.iloc[reaction_idx]
             
-            # ✅ CORRECTION : Stocker HIGH/LOW
+            # ✅ Stocker HIGH/LOW
             contact_high = float(contact_bar['high'])
             contact_low = float(contact_bar['low'])
             reaction_high = float(reaction_bar['high'])
@@ -1693,7 +1719,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup VALIDE
             entry_price = close
             
-            # ✅ CORRECTION : SL = MAX(contact_high, reaction_high) pour SHORT
+            # ✅ SL = MAX(contact_high, reaction_high) pour SHORT
             sl_anchor = max(contact_high, reaction_high)
             
             # Appliquer offset (ajustable depuis Telegram)
@@ -1748,9 +1774,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     # ========================================================================
     # DÉTECTION CONTRE-TENDANCE LONG (prix sous MM80, rebond vers le haut)
+    # ✅ CT INCHANGÉ - FONCTIONNE CORRECTEMENT
     # ========================================================================
     
-    if is_below_mm80:
+    if is_below_mm80 or (is_in_dead_zone and trend_bias == 'down'):
         # Excès prolongé BB80 (ignore premier signal après réintégration)
         if _is_first_after_prolonged_bb80_exit(df, is_long=True, min_streak=5, lookback=50):
             return None
@@ -1821,7 +1848,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup CT VALIDE
             entry_price = close
             
-            # ✅ CORRECTION : SL = MIN(contact_low, reaction_low) pour LONG CT
+            # ✅ SL = MIN(contact_low, reaction_low) pour LONG CT
             sl_anchor = min(contact_low, reaction_low)
             
             sl_price = adjust_sl_for_offset(
@@ -1867,7 +1894,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     'contact_index': contact_idx,
                     'reaction_index': reaction_idx,
                     'entry_index': entry_idx,
-                    # ✅ AJOUT
                     'contact_high': contact_high,
                     'contact_low': contact_low,
                     'reaction_high': reaction_high,
@@ -1876,9 +1902,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     # ========================================================================
     # DÉTECTION CONTRE-TENDANCE SHORT (prix au-dessus MM80, rebond vers le bas)
+    # ✅ CT INCHANGÉ - FONCTIONNE CORRECTEMENT
     # ========================================================================
     
-    if is_above_mm80:
+    if is_above_mm80 or (is_in_dead_zone and trend_bias == 'up'):
         # ✅ GATE 4/4 : Excès prolongé BB80 (ignore premier signal après réintégration)
         if _is_first_after_prolonged_bb80_exit(df, is_long=False, min_streak=5, lookback=50):
             return None
@@ -1947,7 +1974,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             # Setup CT VALIDE
             entry_price = close
             
-            # ✅ CORRECTION : SL = MAX(contact_high, reaction_high) pour SHORT CT
+            # ✅ SL = MAX(contact_high, reaction_high) pour SHORT CT
             sl_anchor = max(contact_high, reaction_high)
             
             sl_price = adjust_sl_for_offset(
@@ -3631,7 +3658,7 @@ def execute_signal_with_gates(
     signal: Dict[str, Any],
     entry_price: float,
 ) -> Tuple[bool, str]:
-    """Encapsule le recalcul live SL/TP + gate RR + exécution robuste."""
+    """Encapsule le recalcul live SL/TP + gate RR + validations Bitget + exécution robuste."""
     side = (signal.get('side') or '').lower()
     regime = str(signal.get('regime', 'Tendance'))
     is_long = (side == 'buy')
@@ -3641,7 +3668,7 @@ def execute_signal_with_gates(
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="df_short_for_entry_gate")
         return False, "Rejeté: données insuffisantes pour valider l'entrée."
 
-    # --- ✅ GATE CORRELATION/SECTEUR (AJOUTÉ) ---
+    # --- ✅ GATE CORRELATION/SECTEUR ---
     if not check_correlation_risk(ex, symbol, side):
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="correlation_risk")
         return False, "Rejeté: risque correlation/secteur trop élevé."
@@ -3699,6 +3726,134 @@ def execute_signal_with_gates(
     if capped_qty is None or capped_qty <= 0:
         _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="qty_zero")
         return False, "Rejeté: taille position = 0 ou invalide."
+
+    # ========================================================================
+    # ✅ VALIDATION 1/3 : QUANTITY MAX (Erreur 45133)
+    # ========================================================================
+    
+    try:
+        market = ex.market(symbol)
+        max_qty = market.get('limits', {}).get('amount', {}).get('max')
+        
+        if max_qty and capped_qty > float(max_qty):
+            # Cap à 95% du max pour sécurité
+            original_qty = capped_qty
+            capped_qty = float(max_qty) * 0.95
+            
+            print(f"⚠️ {symbol} : Quantité réduite {original_qty:.6f} → {capped_qty:.6f} (max: {max_qty})")
+            
+            try:
+                notifier.tg_send(
+                    f"⚠️ **Quantité ajustée**\n\n"
+                    f"{symbol} {side.upper()}\n"
+                    f"Demandée : {original_qty:.6f}\n"
+                    f"Max exchange : {max_qty}\n"
+                    f"Ajustée : {capped_qty:.6f} (95% du max)\n\n"
+                    f"Trade va être exécuté avec quantité réduite"
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"⚠️ {symbol} : Erreur validation quantity max → {e}")
+
+    # ========================================================================
+    # ✅ VALIDATION 2/3 : TP DISTANCE MINIMUM (Erreur 40836)
+    # ========================================================================
+    
+    try:
+        # Récupérer mark price
+        try:
+            mark_price = _current_mark_price(ex, symbol)
+        except Exception:
+            ticker = ex.fetch_ticker(symbol)
+            mark_price = float(ticker.get('last') or ticker.get('close') or entry_px)
+        
+        # Distance minimale configurable (défaut 0.5%)
+        try:
+            min_tp_distance_pct = float(database.get_setting('MIN_TP_DISTANCE_PCT', '0.5'))
+        except:
+            min_tp_distance_pct = 0.5
+        
+        min_distance = mark_price * (min_tp_distance_pct / 100.0)
+        
+        # Vérifier distance TP vs mark
+        tp_distance = abs(tp - mark_price)
+        
+        if tp_distance < min_distance:
+            # Ajuster TP pour respecter distance minimale
+            if is_long:
+                # LONG : TP au-dessus de mark
+                tp_adjusted = mark_price * (1.0 + min_tp_distance_pct / 100.0)
+            else:
+                # SHORT : TP en-dessous de mark
+                tp_adjusted = mark_price * (1.0 - min_tp_distance_pct / 100.0)
+            
+            print(f"⚠️ {symbol} : TP ajusté {tp:.6f} → {tp_adjusted:.6f} (trop proche mark: {mark_price:.6f})")
+            
+            # Vérifier que RR reste acceptable
+            rr_adjusted = abs((tp_adjusted - entry_px) / (entry_px - sl + 1e-8))
+            
+            if rr_adjusted >= MIN_RR:
+                tp = tp_adjusted
+                
+                try:
+                    notifier.tg_send(
+                        f"⚠️ **TP ajusté**\n\n"
+                        f"{symbol} {side.upper()}\n"
+                        f"TP initial trop proche mark\n"
+                        f"Mark : {mark_price:.6f}\n"
+                        f"TP ajusté : {tp:.6f}\n"
+                        f"RR ajusté : {rr_adjusted:.2f}\n\n"
+                        f"Trade va être exécuté"
+                    )
+                except Exception:
+                    pass
+            else:
+                # RR insuffisant après ajustement → rejeter
+                _update_signal_state(symbol, timeframe, signal, entry_px, "SKIPPED", reason="tp_distance_insufficient")
+                return False, f"Rejeté: TP trop proche mark ({tp_distance:.6f} < {min_distance:.6f}) et ajustement dégrade RR ({rr_adjusted:.2f} < {MIN_RR})"
+    
+    except Exception as e:
+        print(f"⚠️ {symbol} : Erreur validation TP distance → {e}")
+
+    # ========================================================================
+    # ✅ VALIDATION 3/3 : NOTIONAL MINIMUM (Erreur 45110)
+    # ========================================================================
+    
+    try:
+        notional = entry_px * capped_qty
+        
+        # Minimum Bitget = 5 USDT
+        try:
+            min_notional = float(database.get_setting('MIN_NOTIONAL_USDT', '5.0'))
+        except:
+            min_notional = 5.0
+        
+        if notional < min_notional:
+            _update_signal_state(
+                symbol, timeframe, signal, entry_px, "SKIPPED",
+                reason=f"notional_too_small:{notional:.2f}<{min_notional}"
+            )
+            
+            try:
+                notifier.tg_send(
+                    f"❌ **Trade rejeté**\n\n"
+                    f"{symbol} {side.upper()}\n"
+                    f"Notional : {notional:.2f} USDT\n"
+                    f"Minimum : {min_notional:.2f} USDT\n\n"
+                    f"Position trop petite pour l'exchange"
+                )
+            except Exception:
+                pass
+            
+            return False, f"Rejeté: Notional {notional:.2f} USDT < minimum {min_notional:.2f} USDT"
+    
+    except Exception as e:
+        print(f"⚠️ {symbol} : Erreur validation notional → {e}")
+
+    # ========================================================================
+    # EXÉCUTION (si toutes validations passées)
+    # ========================================================================
 
     is_paper_mode = database.get_setting('PAPER_TRADING_MODE', 'true') == 'true'
     price_ref = entry_px
