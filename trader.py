@@ -35,6 +35,7 @@ FEE_ENTRY_PCT   = float(os.getenv("FEE_ENTRY_PCT", "0.0010"))  # 0.1% typique ta
 FEE_EXIT_PCT    = float(os.getenv("FEE_EXIT_PCT",  "0.0010"))  # 0.1% typique taker
 BE_BUFFER_PCT   = float(os.getenv("BE_BUFFER_PCT", "0.0020"))  # +0.2% au-dessus du VRAI BE
 BE_BUFFER_USDT  = float(os.getenv("BE_BUFFER_USDT","0.0"))     # buffer absolu optionnel (USDT). Laisse 0 si tu n’en veux pas.
+BE_OFFSET_PCT   = float(os.getenv("BE_OFFSET_PCT", "0.005"))   # 0.5% pour couvrir frais + funding + slippage + margin
 
 # ==============================================================================
 # ANALYSE DE LA BOUGIE (Nouvelle Section)
