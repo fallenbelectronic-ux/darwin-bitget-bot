@@ -1295,7 +1295,7 @@ def send_main_menu(is_paused: bool):
     # ✅ CORRECTION : Clavier avec bouton Debug au lieu de Ping
     pause_resume_btn = {"text": "💹 Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pause", "callback_data": "pause"}
     keyboard = {"inline_keyboard": [
-        [pause_resume_btn, {"text": "🔍 Debug", "callback_data": "ping"}],
+        [pause_resume_btn, {"text": "🔍 Test", "callback_data": "ping"}],
         [{"text": "🚀 Signaux (6h)", "callback_data": "signals_6h"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
         [{"text": "📊 Positions", "callback_data": "list_positions"}, {"text": "⚙️ Configuration", "callback_data": "menu_config"}]
     ]}
