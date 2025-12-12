@@ -1494,23 +1494,24 @@ def _is_first_after_prolonged_bb80_exit(df: pd.DataFrame, is_long: bool, min_str
         print(f"Erreur _is_first_after_prolonged_bb80_exit: {e}")
         return False  # En cas d'erreur, ne pas rejeter le signal    
 
+
+
+
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
     Détecte un signal Darwin (Tendance ou CT) avec validation stricte.
     
-    ✅ LOGS DEBUG ACTIVÉS pour diagnostiquer pourquoi aucun signal détecté.
-    
-    SÉQUENCE OBLIGATOIRE (slides Darwin) :
-    1. Contact BB
-    2. Réaction 1-2 bougies (pattern 30%)
-    3. RÉINTÉGRATION BB20 ← CRITIQUE
-    4. Entrée (bougie actuelle)
+    ✅ CORRECTION CRITIQUE : SL basé sur LOW (BUY) ou HIGH (SELL) du contact.
     
     LOOKBACK FIXE : 3 bougies max (non modifiable)
+    
+    RÈGLES DARWIN :
+    - TENDANCE : Contact BB20 + Réintégration BB20
+    - CT : Double extrême BB20+BB80 + Réintégration BB20+BB80
     """
     
-    # ✅ MODE DEBUG ACTIVÉ
-    DEBUG = True
+    # ✅ MODE DEBUG DÉSACTIVÉ (production)
+    DEBUG = False
     
     if DEBUG:
         print(f"\n{'='*60}")
@@ -1525,7 +1526,6 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     if DEBUG:
         print(f"[DETECT] ✅ DF length: {len(df)}")
-        print(f"[DETECT] Colonnes disponibles: {list(df.columns)}")
     
     # Validation colonnes requises
     required_cols = ['close', 'high', 'low', 'mm80', 'bb20_mid', 'bb20_up', 'bb20_lo', 'bb80_up', 'bb80_lo']
@@ -1536,12 +1536,8 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             print(f"[DETECT] ❌ REJETÉ: Colonnes manquantes: {missing}")
         return None
     
-    if DEBUG:
-        print(f"[DETECT] ✅ Toutes les colonnes requises présentes")
-    
     # Données actuelles
     current = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else current
     
     close_now = float(current['close'])
     mm80 = float(current['mm80'])
@@ -1554,20 +1550,10 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if DEBUG:
         print(f"\n[DETECT] 📊 Prix actuel: {close_now:.4f}")
         print(f"[DETECT] MM80: {mm80:.4f}")
-        print(f"[DETECT] BB20: [{bb20_lo:.4f} - {bb20_mid:.4f} - {bb20_up:.4f}]")
-        print(f"[DETECT] BB80: [{bb80_lo:.4f} - {bb80_up:.4f}]")
     
-    # Déterminer position par rapport à MM80
+    # Position par rapport à MM80
     is_above_mm80 = close_now > mm80
     is_below_mm80 = close_now < mm80
-    
-    if DEBUG:
-        if is_above_mm80:
-            print(f"[DETECT] 📈 Prix AU-DESSUS MM80 → Recherche TENDANCE LONG ou CT SHORT")
-        elif is_below_mm80:
-            print(f"[DETECT] 📉 Prix EN-DESSOUS MM80 → Recherche TENDANCE SHORT ou CT LONG")
-        else:
-            print(f"[DETECT] ⚪ Prix SUR MM80 → Aucune tendance claire")
     
     # ============================================================================
     # TENDANCE LONG (prix > MM80, contact BB20_lo)
@@ -1575,42 +1561,38 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     if is_above_mm80:
         if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche TENDANCE LONG (contact BB20_lo)...")
+            print(f"\n[DETECT] 🔍 Recherche TENDANCE LONG...")
         
-        # Lookback FIXE à 3 bougies max
         contact_idx = None
-        for i in range(len(df) - 4, len(df) - 1):  # Vérifie 3 bougies clôturées
+        for i in range(len(df) - 4, len(df) - 1):
             bar = df.iloc[i]
             
-            # Contact = low touche BB20_lo
-            if float(bar['low']) <= float(bar['bb20_lo']) * 1.002:  # Tolérance 0.2%
+            if float(bar['low']) <= float(bar['bb20_lo']) * 1.002:
                 contact_idx = i
                 if DEBUG:
-                    print(f"[DETECT] ✅ Contact BB20_lo trouvé à index {i} (bougie {i - len(df)})")
+                    print(f"[DETECT] ✅ Contact BB20_lo trouvé à index {i}")
                 break
         
         if contact_idx is None:
             if DEBUG:
-                print(f"[DETECT] ❌ Aucun contact BB20_lo dans les 3 dernières bougies")
-            # Continuer vers CT SHORT
+                print(f"[DETECT] ❌ Aucun contact BB20_lo")
         else:
-            # Vérifier réintégration BB20
+            # Réintégration BB20
             reintegrated = False
             for j in range(contact_idx + 1, len(df)):
                 if float(df.iloc[j]['close']) > float(df.iloc[j]['bb20_lo']):
                     reintegrated = True
                     if DEBUG:
-                        print(f"[DETECT] ✅ Réintégration BB20 confirmée à index {j}")
+                        print(f"[DETECT] ✅ Réintégration BB20 confirmée")
                     break
             
             if not reintegrated:
                 if DEBUG:
-                    print(f"[DETECT] ❌ Pas de réintégration BB20 après contact")
+                    print(f"[DETECT] ❌ Pas de réintégration BB20")
             else:
-                # Calcul SL/TP
                 contact_bar = df.iloc[contact_idx]
                 
-                # SL = LOW du contact + offset
+                # ✅ CORRECTION : SL sur le LOW (pour BUY)
                 try:
                     sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1618,7 +1600,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 
                 sl = float(contact_bar['low']) * (1 - sl_offset_pct / 100)
                 
-                # TP = BB80_up + offset
+                # TP sur BB80_up
                 try:
                     tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1635,17 +1617,15 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 if DEBUG:
                     print(f"\n[DETECT] 💰 Calcul RR:")
                     print(f"[DETECT] Entry: {entry:.4f}")
-                    print(f"[DETECT] SL: {sl:.4f} (contact low + offset)")
-                    print(f"[DETECT] TP: {tp:.4f} (BB80_up + offset)")
-                    print(f"[DETECT] Risk: {risk:.4f}")
-                    print(f"[DETECT] Reward: {reward:.4f}")
+                    print(f"[DETECT] SL: {sl:.4f} (LOW du contact)")
+                    print(f"[DETECT] TP: {tp:.4f}")
                     print(f"[DETECT] RR: {rr:.2f}")
                 
                 # Vérifier RR minimum
                 try:
-                    min_rr = float(database.get_setting('MIN_RR', '3.0'))
+                    min_rr = float(database.get_setting('MIN_RR', '2.0'))
                 except Exception:
-                    min_rr = 3.0
+                    min_rr = 2.0
                 
                 if rr < min_rr:
                     if DEBUG:
@@ -1671,7 +1651,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     if is_below_mm80:
         if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche TENDANCE SHORT (contact BB20_up)...")
+            print(f"\n[DETECT] 🔍 Recherche TENDANCE SHORT...")
         
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
@@ -1680,12 +1660,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if float(bar['high']) >= float(bar['bb20_up']) * 0.998:
                 contact_idx = i
                 if DEBUG:
-                    print(f"[DETECT] ✅ Contact BB20_up trouvé à index {i}")
+                    print(f"[DETECT] ✅ Contact BB20_up trouvé")
                 break
         
         if contact_idx is None:
             if DEBUG:
-                print(f"[DETECT] ❌ Aucun contact BB20_up dans les 3 dernières bougies")
+                print(f"[DETECT] ❌ Aucun contact BB20_up")
         else:
             reintegrated = False
             for j in range(contact_idx + 1, len(df)):
@@ -1701,6 +1681,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             else:
                 contact_bar = df.iloc[contact_idx]
                 
+                # ✅ CORRECTION : SL sur le HIGH (pour SELL)
                 try:
                     sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1708,6 +1689,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 
                 sl = float(contact_bar['high']) * (1 + sl_offset_pct / 100)
                 
+                # TP sur BB80_lo
                 try:
                     tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1723,14 +1705,14 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 if DEBUG:
                     print(f"\n[DETECT] 💰 Calcul RR:")
                     print(f"[DETECT] Entry: {entry:.4f}")
-                    print(f"[DETECT] SL: {sl:.4f}")
+                    print(f"[DETECT] SL: {sl:.4f} (HIGH du contact)")
                     print(f"[DETECT] TP: {tp:.4f}")
                     print(f"[DETECT] RR: {rr:.2f}")
                 
                 try:
-                    min_rr = float(database.get_setting('MIN_RR', '3.0'))
+                    min_rr = float(database.get_setting('MIN_RR', '2.0'))
                 except Exception:
-                    min_rr = 3.0
+                    min_rr = 2.0
                 
                 if rr < min_rr:
                     if DEBUG:
@@ -1756,27 +1738,25 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     if is_below_mm80:
         if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche CT LONG (double extrême bas)...")
+            print(f"\n[DETECT] 🔍 Recherche CT LONG...")
         
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
             bar = df.iloc[i]
             
-            # Double extrême = BB20_lo ET BB80_lo touchées
             touch_bb20 = float(bar['low']) <= float(bar['bb20_lo']) * 1.002
             touch_bb80 = float(bar['low']) <= float(bar['bb80_lo']) * 1.002
             
             if touch_bb20 and touch_bb80:
                 contact_idx = i
                 if DEBUG:
-                    print(f"[DETECT] ✅ Double extrême BAS trouvé à index {i}")
+                    print(f"[DETECT] ✅ Double extrême BAS trouvé")
                 break
         
         if contact_idx is None:
             if DEBUG:
-                print(f"[DETECT] ❌ Aucun double extrême dans les 3 dernières bougies")
+                print(f"[DETECT] ❌ Aucun double extrême")
         else:
-            # Réintégration BB20 ET BB80 obligatoire
             reint_bb20 = False
             reint_bb80 = False
             
@@ -1791,13 +1771,14 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             
             if not (reint_bb20 and reint_bb80):
                 if DEBUG:
-                    print(f"[DETECT] ❌ Réintégration incomplète (BB20: {reint_bb20}, BB80: {reint_bb80})")
+                    print(f"[DETECT] ❌ Réintégration incomplète")
             else:
                 if DEBUG:
                     print(f"[DETECT] ✅ Réintégration BB20 + BB80 confirmée")
                 
                 contact_bar = df.iloc[contact_idx]
                 
+                # ✅ CORRECTION : SL sur le LOW (pour CT BUY)
                 try:
                     sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1805,6 +1786,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 
                 sl = float(contact_bar['low']) * (1 - sl_offset_pct / 100)
                 
+                # TP sur BB20_up
                 try:
                     tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1818,17 +1800,16 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 rr = reward / risk if risk > 0 else 0
                 
                 if DEBUG:
-                    print(f"\n[DETECT] 💰 Calcul RR:")
-                    print(f"[DETECT] RR: {rr:.2f}")
+                    print(f"\n[DETECT] 💰 RR: {rr:.2f}")
                 
                 try:
-                    min_rr = float(database.get_setting('MIN_RR', '3.0'))
+                    min_rr = float(database.get_setting('MIN_RR', '2.0'))
                 except Exception:
-                    min_rr = 3.0
+                    min_rr = 2.0
                 
                 if rr < min_rr:
                     if DEBUG:
-                        print(f"[DETECT] ❌ RR insuffisant: {rr:.2f} < {min_rr}")
+                        print(f"[DETECT] ❌ RR insuffisant")
                 else:
                     if DEBUG:
                         print(f"[DETECT] ✅✅✅ SIGNAL CT LONG VALIDE!")
@@ -1850,7 +1831,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     if is_above_mm80:
         if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche CT SHORT (double extrême haut)...")
+            print(f"\n[DETECT] 🔍 Recherche CT SHORT...")
         
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
@@ -1862,12 +1843,12 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             if touch_bb20 and touch_bb80:
                 contact_idx = i
                 if DEBUG:
-                    print(f"[DETECT] ✅ Double extrême HAUT trouvé à index {i}")
+                    print(f"[DETECT] ✅ Double extrême HAUT trouvé")
                 break
         
         if contact_idx is None:
             if DEBUG:
-                print(f"[DETECT] ❌ Aucun double extrême dans les 3 dernières bougies")
+                print(f"[DETECT] ❌ Aucun double extrême")
         else:
             reint_bb20 = False
             reint_bb80 = False
@@ -1886,10 +1867,11 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     print(f"[DETECT] ❌ Réintégration incomplète")
             else:
                 if DEBUG:
-                    print(f"[DETECT] ✅ Réintégration BB20 + BB80 confirmée")
+                    print(f"[DETECT] ✅ Réintégration confirmée")
                 
                 contact_bar = df.iloc[contact_idx]
                 
+                # ✅ CORRECTION : SL sur le HIGH (pour CT SELL)
                 try:
                     sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1897,6 +1879,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 
                 sl = float(contact_bar['high']) * (1 + sl_offset_pct / 100)
                 
+                # TP sur BB20_lo
                 try:
                     tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
                 except Exception:
@@ -1910,16 +1893,16 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                 rr = reward / risk if risk > 0 else 0
                 
                 if DEBUG:
-                    print(f"\n[DETECT] 💰 Calcul RR: {rr:.2f}")
+                    print(f"\n[DETECT] 💰 RR: {rr:.2f}")
                 
                 try:
-                    min_rr = float(database.get_setting('MIN_RR', '3.0'))
+                    min_rr = float(database.get_setting('MIN_RR', '2.0'))
                 except Exception:
-                    min_rr = 3.0
+                    min_rr = 2.0
                 
                 if rr < min_rr:
                     if DEBUG:
-                        print(f"[DETECT] ❌ RR insuffisant: {rr:.2f} < {min_rr}")
+                        print(f"[DETECT] ❌ RR insuffisant")
                 else:
                     if DEBUG:
                         print(f"[DETECT] ✅✅✅ SIGNAL CT SHORT VALIDE!")
@@ -1937,8 +1920,7 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     # Aucun signal trouvé
     if DEBUG:
-        print(f"\n[DETECT] ❌ Aucun signal valide pour {symbol}")
-        print(f"{'='*60}\n")
+        print(f"\n[DETECT] ❌ Aucun signal valide pour {symbol}\n")
     
     return None
 
