@@ -1050,8 +1050,9 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     except Exception:
         cw_min_rr = 2.8
 
-    # Lecture DB
+    # ✅ CORRECTION : Utiliser database.get_signals() au lieu de SQL direct
     try:
+        # Récupérer VALID_TAKEN et VALID_SKIPPED séparément
         raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=100) or []
         raw_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=100) or []
         raw_all = raw_taken + raw_skipped
