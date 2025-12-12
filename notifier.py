@@ -1025,8 +1025,11 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     """
     Affiche 'Signaux valides des 6 dernières heures' avec pagination.
     
-    ✅ CORRECTION : Utilise database.get_signals() au lieu de requêtes SQL directes.
-    Exclut strictement les signaux PENDING (pas encore confirmés).
+    ✅ CORRECTIONS :
+    - Tri par RR décroissant (meilleurs signaux en premier)
+    - Raison skipped affichée sur ligne séparée
+    - Double espace entre chaque signal pour lisibilité
+    - Exclut strictement les signaux PENDING
     
     Args:
         limit_per_page: Nombre de signaux par page (défaut 10)
@@ -1047,9 +1050,8 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     except Exception:
         cw_min_rr = 2.8
 
-    # ✅ CORRECTION : Utiliser database.get_signals() au lieu de SQL direct
+    # Lecture DB
     try:
-        # Récupérer VALID_TAKEN et VALID_SKIPPED séparément
         raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=100) or []
         raw_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=100) or []
         raw_all = raw_taken + raw_skipped
@@ -1063,15 +1065,14 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
         edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal validé sur les 6 dernières heures.", keyboard)
         return
 
-    # Filtrage strict RR + exclusion explicite PENDING
+    # Filtrage strict RR + exclusion PENDING
     signals = []
     for s in raw_all:
         try:
-            # ✅ TRIPLE VÉRIFICATION : Exclure explicitement PENDING
             st = str(s.get("state", "")).upper()
             if st not in ("VALID_TAKEN", "VALID_SKIPPED"):
                 continue
-            if st == "PENDING":  # Exclusion explicite redondante (sécurité)
+            if st == "PENDING":
                 continue
 
             rr_val = float(s.get("rr", 0) or 0.0)
@@ -1087,13 +1088,13 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
 
         signals.append(s)
 
-    # Tri du plus récent au plus ancien
-    signals = sorted(signals, key=lambda s: int(s.get("ts", 0)), reverse=True)
-
     if not signals:
         keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
         edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal validé respectant les critères RR.", keyboard)
         return
+
+    # ✅ TRI PAR RR DÉCROISSANT (du plus élevé au plus bas)
+    signals = sorted(signals, key=lambda s: float(s.get("rr", 0) or 0.0), reverse=True)
 
     # ========================================================================
     # PAGINATION
@@ -1101,15 +1102,13 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     
     total_signals = len(signals)
     total_pages = (total_signals + limit_per_page - 1) // limit_per_page
-    page = max(1, min(page, total_pages))  # Clamp page
+    page = max(1, min(page, total_pages))
     
-    # Calcul index
     start_idx = (page - 1) * limit_per_page
     end_idx = min(start_idx + limit_per_page, total_signals)
     
     page_signals = signals[start_idx:end_idx]
     
-    # Mémoriser state pagination
     if chat_id:
         _PAGINATION_STATE[chat_id] = {
             'page': page,
@@ -1129,20 +1128,41 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
             return "⏭️ Skipped"
         return "ℹ️"
 
-    def _reason(s: dict) -> str:
-        payload = s.get("payload") or s.get("data") or {}
-        reason = s.get("reason") or (payload.get("reason") if isinstance(payload, dict) else "")
-        return f"  (raison: {html.escape(str(reason))})" if reason else ""
+    def _get_reason(s: dict) -> str:
+        """Extrait la raison du skip depuis payload ou champs directs."""
+        # Essayer plusieurs emplacements possibles
+        try:
+            # 1. Champ direct 'reason'
+            if 'reason' in s and s['reason']:
+                return str(s['reason'])
+            
+            # 2. Dans payload.reason
+            payload = s.get("payload") or s.get("data") or {}
+            if isinstance(payload, dict) and 'reason' in payload and payload['reason']:
+                return str(payload['reason'])
+            
+            # 3. Dans metadata
+            metadata = s.get("metadata") or {}
+            if isinstance(metadata, dict) and 'reason' in metadata and metadata['reason']:
+                return str(metadata['reason'])
+            
+            return ""
+        except Exception:
+            return ""
 
     # Titre + info pagination
     lines = [
         f"<b>⏱️ Signaux valides (6h)</b>",
-        f"<i>Page {page}/{total_pages} — {total_signals} signaux au total</i>",
+        f"<i>Page {page}/{total_pages} — {total_signals} signaux au total (triés par RR)</i>",
         ""
     ]
     
     for s in page_signals:
+        # Ligne principale du signal
         row = _format_signal_row(s)
+        
+        # Badge + note RR
+        badge = _badge(s)
         note = ""
         try:
             rr_val = float(s.get("rr", 0) or 0.0)
@@ -1150,9 +1170,19 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
                 note = "  ⚠ RR<MIN_RR (cut-wick)"
         except Exception:
             pass
-        lines.append(f"{row}  —  {_badge(s)}{note}{_reason(s)}")
+        
+        lines.append(f"{row}  —  {badge}{note}")
+        
+        # ✅ RAISON SUR LIGNE SÉPARÉE (si skipped)
+        if str(s.get("state", "")).upper() == "VALID_SKIPPED":
+            reason = _get_reason(s)
+            if reason:
+                lines.append(f"   <i>↳ Raison: {html.escape(reason)}</i>")
+        
+        # ✅ DOUBLE ESPACE ENTRE CHAQUE SIGNAL
+        lines.append("")
     
-    message = "\n\n".join(lines)
+    message = "\n".join(lines).strip()
     
     # ========================================================================
     # CLAVIER PAGINATION
@@ -1160,7 +1190,6 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     
     keyboard_rows = []
     
-    # Ligne navigation
     nav_row = []
     if page > 1:
         nav_row.append({"text": "⬅️ Précédent", "callback_data": f"signals_page:{page-1}"})
@@ -1170,7 +1199,6 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     if nav_row:
         keyboard_rows.append(nav_row)
     
-    # Ligne retour
     keyboard_rows.append([{"text": "↩️ Retour", "callback_data": "main_menu"}])
     
     keyboard = {"inline_keyboard": keyboard_rows}
