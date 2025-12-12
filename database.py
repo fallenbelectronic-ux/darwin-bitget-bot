@@ -14,6 +14,7 @@ try:
 except Exception:
     pass
 
+
 # -------- Connexion + pragmas sécu/perf --------
 def get_db_connection() -> sqlite3.Connection:
     """
@@ -75,7 +76,7 @@ def setup_database():
         # Dédup avant contrainte d'unicité (garde le dernier enregistrement)
         _dedup_signals(conn)
 
-        # Unicité logique d’un signal : même symbol/side/timeframe/ts
+        # Unicité logique d'un signal : même symbol/side/timeframe/ts
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_uni
             ON signals(symbol, side, timeframe, ts)
@@ -87,6 +88,7 @@ def setup_database():
         _ensure_column(conn, "trades", "entry_rsi", "REAL", "0")
         _ensure_column(conn, "trades", "management_strategy", "TEXT", "'NORMAL'")
         _ensure_column(conn, "trades", "breakeven_status", "TEXT", "'PENDING'")
+        _ensure_column(conn, "trades", "meta", "TEXT", "'{}'")
 
         # Index utiles
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
@@ -95,6 +97,7 @@ def setup_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_state_ts ON signals(state, ts DESC)")
         conn.commit()
+
 
 def update_trade_core(trade_id: int,
                       side: Optional[str] = None,
@@ -136,7 +139,8 @@ def _store():
         st = {"settings": {}, "trades": [], "signals": [], "next_trade_id": 1}
         _store._st = st
     return st
-    
+
+
 def _dedup_signals(conn: sqlite3.Connection) -> None:
     """Supprime les doublons (symbol, side, timeframe, ts) en gardant le plus récent."""
     try:
@@ -153,6 +157,7 @@ def _dedup_signals(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         # table peut ne pas exister lors du tout premier run
         pass
+
 
 def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """
@@ -212,9 +217,11 @@ def get_signals(state: Optional[str] = None, since_minutes: Optional[int] = None
 
     return out
 
+
 def upsert_open_position(rec: Dict[str, Any]) -> bool:
     """Compatibilité: pas de table 'open_positions' dédiée — no-op pour rester compatible avec l'appelant."""
     return True
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, coltype: str, default_sql_literal: str):
     cur = conn.cursor()
@@ -223,6 +230,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col: str, coltype: str,
     if col not in cols:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype} DEFAULT {default_sql_literal}")
         conn.commit()
+
 
 # -------- CRUD Trades --------
 def create_trade(
@@ -266,6 +274,7 @@ def create_trade(
         conn.commit()
         return cur.lastrowid
 
+
 def update_signal_state(symbol: str, timeframe: str, ts: int, new_state: str, meta: Optional[Dict[str, Any]] = None) -> bool:
     """
     Alias compat : met à jour l'état d'un signal sans exiger 'side'.
@@ -284,6 +293,7 @@ def update_signal_state(symbol: str, timeframe: str, ts: int, new_state: str, me
         """, (str(new_state), str(symbol), str(timeframe), int(ts)))
         conn.commit()
         return res.rowcount > 0
+
 
 def upsert_signal_pending(symbol: str, timeframe: str, ts: int, side: str, regime: str,
                           rr: float, entry: float, sl: float, tp: float) -> None:
@@ -311,6 +321,7 @@ def upsert_signal_pending(symbol: str, timeframe: str, ts: int, side: str, regim
                       float(entry), float(sl), float(tp), float(rr), int(ts)))
         finally:
             conn.commit()
+
 
 def mark_signal_validated(symbol: str, ts: int, payload: Dict[str, Any], taken: bool) -> None:
     """
@@ -365,6 +376,7 @@ def update_trade_to_breakeven(trade_id: int, remaining_quantity: float, new_sl: 
         """, (remaining_quantity, new_sl, trade_id))
         conn.commit()
     print(f"DB: Trade #{trade_id} mis à breakeven. Quantité restante: {remaining_quantity}")
+
 
 def close_trade(trade_id: int, status: str, pnl: float):
     """Ferme un trade (status: CLOSED / CLOSED_MANUAL / ERROR...).
@@ -427,6 +439,7 @@ def close_trade(trade_id: int, status: str, pnl: float):
         f"PnL={pnl_val:.4f} USDT, PnL%={pnl_pct:.4f}%."
     )
 
+
 def update_trade_tp(trade_id: int, new_tp_price: float):
     """Met à jour le TP."""
     with get_db_connection() as conn:
@@ -434,6 +447,7 @@ def update_trade_tp(trade_id: int, new_tp_price: float):
         cur.execute("UPDATE trades SET tp_price = ? WHERE id = ?", (new_tp_price, trade_id))
         conn.commit()
     print(f"DB: TP pour le trade #{trade_id} mis à jour à {new_tp_price}.")
+
 
 def update_trade_sl(trade_id: int, new_sl_price: float):
     """Met à jour le SL."""
@@ -443,11 +457,114 @@ def update_trade_sl(trade_id: int, new_sl_price: float):
         conn.commit()
     print(f"DB: SL pour le trade #{trade_id} mis à jour à {new_sl_price}.")
 
+
+def update_trade_pyramid(
+    trade_id: int,
+    new_quantity: float,
+    new_avg_entry: float,
+    new_sl: float,
+    new_tp: float,
+    pyramid_count: int
+) -> None:
+    """
+    Met à jour un trade après pyramiding.
+    
+    Args:
+        trade_id: ID du trade
+        new_quantity: Nouvelle quantité totale
+        new_avg_entry: Nouveau prix d'entrée moyen
+        new_sl: Nouveau stop loss
+        new_tp: Nouveau take profit
+        pyramid_count: Nombre d'ajouts pyramiding effectués
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades
+               SET quantity = ?,
+                   entry_price = ?,
+                   sl_price = ?,
+                   tp_price = ?
+             WHERE id = ?
+        """, (
+            float(new_quantity),
+            float(new_avg_entry),
+            float(new_sl),
+            float(new_tp),
+            int(trade_id)
+        ))
+        conn.commit()
+    
+    print(f"DB: Trade #{trade_id} pyramiding - qty={new_quantity:.6f}, avg_entry={new_avg_entry:.2f}, count={pyramid_count}")
+
+
+def update_trade_quantity(trade_id: int, new_quantity: float) -> None:
+    """
+    Met à jour uniquement la quantité d'un trade (partial exits).
+    
+    Args:
+        trade_id: ID du trade
+        new_quantity: Nouvelle quantité après sortie partielle
+    """
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades
+               SET quantity = ?
+             WHERE id = ?
+        """, (float(new_quantity), int(trade_id)))
+        conn.commit()
+    
+    print(f"DB: Trade #{trade_id} quantity updated to {new_quantity:.6f}")
+
+
+def update_trade_meta(trade_id: int, meta_dict: dict) -> None:
+    """
+    Met à jour les métadonnées d'un trade (stockage JSON).
+    
+    Stocke des infos supplémentaires comme l'historique des partial exits,
+    pyramiding details, etc.
+    
+    Args:
+        trade_id: ID du trade
+        meta_dict: Dict de métadonnées à stocker en JSON
+    """
+    import json
+    
+    try:
+        meta_json = json.dumps(meta_dict, ensure_ascii=False)
+        
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            
+            # Vérifier si colonne meta existe
+            cur.execute("PRAGMA table_info(trades)")
+            cols = [r["name"] for r in cur.fetchall()]
+            
+            if "meta" not in cols:
+                # Ajouter la colonne si elle n'existe pas
+                cur.execute("ALTER TABLE trades ADD COLUMN meta TEXT DEFAULT '{}'")
+                conn.commit()
+            
+            cur.execute("""
+                UPDATE trades
+                   SET meta = ?
+                 WHERE id = ?
+            """, (meta_json, int(trade_id)))
+            conn.commit()
+        
+        print(f"DB: Trade #{trade_id} meta updated")
+    
+    except Exception as e:
+        print(f"⚠️ Erreur update_trade_meta (trade #{trade_id}): {e}")
+
+
 def is_position_open(symbol: str) -> bool:
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM trades WHERE symbol = ? AND status = 'OPEN' LIMIT 1", (symbol,))
         return cur.fetchone() is not None
+
 
 def get_open_positions() -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
@@ -455,12 +572,14 @@ def get_open_positions() -> List[Dict[str, Any]]:
         cur.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY open_timestamp DESC")
         return [dict(r) for r in cur.fetchall()]
 
+
 def get_trade_by_id(trade_id: int) -> Optional[Dict[str, Any]]:
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
         row = cur.fetchone()
         return dict(row) if row else None
+
 
 def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
     """
@@ -488,8 +607,8 @@ def get_closed_trades_since(timestamp: int) -> List[Dict[str, Any]]:
 # -------- Settings (key/value) --------
 def get_setting(key: str, default: Any = None) -> Any:
     """
-    Lecture robuste d’un paramètre. Retourne `default` si la clé est absente
-    ou en cas d’erreur DB (table/connexion/etc.).
+    Lecture robuste d'un paramètre. Retourne `default` si la clé est absente
+    ou en cas d'erreur DB (table/connexion/etc.).
     """
     try:
         with get_db_connection() as conn:
@@ -517,13 +636,14 @@ def set_setting(key: str, value: Any) -> None:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """, (str(key), str(value)))
         conn.commit()
-        
+
 
 def toggle_setting_bool(key: str, default_true: bool = False) -> bool:
     curr = str(get_setting(key, 'true' if default_true else 'false')).lower() in ("1","true","yes","on")
     new_val = not curr
     set_setting(key, str(new_val).lower())
     return new_val
+
 
 def _load_json_setting(key: str, default):
     """Charge un setting JSON (dict/list) en sûreté."""
@@ -537,14 +657,17 @@ def _load_json_setting(key: str, default):
     except Exception:
         return default
 
+
 def _save_json_setting(key: str, value) -> None:
     """Sauvegarde un setting JSON (dict/list) en sûreté."""
     import json
     set_setting(key, json.dumps(value, ensure_ascii=False))
 
+
 def _now_ms() -> int:
     import time
     return int(time.time() * 1000)
+
 
 def _purge_by_age_and_size(items: list, max_days: int, max_items: int, ts_field: str = "created_at") -> list:
     """Purge liste par âge (jours) et taille max, tri desc par ts_field."""
@@ -554,6 +677,7 @@ def _purge_by_age_and_size(items: list, max_days: int, max_items: int, ts_field:
     kept = [x for x in items if int(x.get(ts_field, 0)) >= min_ts]
     kept.sort(key=lambda x: int(x.get(ts_field, 0)), reverse=True)
     return kept[:max(1, int(max_items))]
+
 
 def save_execution_open(exec_data: Dict[str, Any]) -> str:
     """
@@ -589,6 +713,7 @@ def save_execution_open(exec_data: Dict[str, Any]) -> str:
     _save_json_setting('EXECUTIONS_LOG', executions)
     return payload['exec_id']
 
+
 def close_execution(exec_id: str, close_price: float, closed_at_ms: Optional[int] = None,
                     pnl_abs: Optional[float] = None, pnl_pct: Optional[float] = None,
                     fees: Optional[float] = None, status: str = 'closed') -> None:
@@ -609,12 +734,14 @@ def close_execution(exec_id: str, close_price: float, closed_at_ms: Optional[int
             break
     _save_json_setting('EXECUTIONS_LOG', executions)
 
+
 def fetch_open_executions(limit: int = 100) -> List[Dict[str, Any]]:
     """Retourne les exécutions avec status == 'open' triées par opened_at desc."""
     executions = _load_json_setting('EXECUTIONS_LOG', [])
     items = [x for x in executions if str(x.get('status', '')).lower() == 'open']
     items.sort(key=lambda x: int(x.get('opened_at', 0)), reverse=True)
     return items[:max(1, int(limit))]
+
 
 def fetch_recent_executions(hours: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
     """
@@ -645,6 +772,7 @@ def fetch_recent_executions(hours: Optional[int] = None, limit: int = 100) -> Li
     items.sort(key=lambda x: int(x.get('opened_at', 0)), reverse=True)
     return items[:max(1, int(limit))]
 
+
 def save_order_record(order_data: Dict[str, Any]) -> str:
     """
     Ajoute un ordre dans ORDERS_LOG (JSON list).
@@ -667,6 +795,7 @@ def save_order_record(order_data: Dict[str, Any]) -> str:
     _save_json_setting('ORDERS_LOG', orders)
     return payload['order_id']
 
+
 def fetch_recent_orders(hours: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
     """Retourne les ordres récents, optionnellement filtrés par fenêtre horaire."""
     orders = _load_json_setting('ORDERS_LOG', [])
@@ -676,6 +805,7 @@ def fetch_recent_orders(hours: Optional[int] = None, limit: int = 200) -> List[D
         items = [x for x in items if int(x.get('placed_at', 0)) >= min_ts]
     items.sort(key=lambda x: int(x.get('placed_at', 0)), reverse=True)
     return items[:max(1, int(limit))]
+
 
 def save_stats_snapshot(horizon: str, snapshot: Dict[str, Any]) -> None:
     """
@@ -689,14 +819,17 @@ def save_stats_snapshot(horizon: str, snapshot: Dict[str, Any]) -> None:
     stats[h]['ts'] = _now_ms()
     _save_json_setting('STATS_CACHE', stats)
 
+
 def fetch_latest_stats(horizon: str) -> Dict[str, Any]:
     """Retourne le dernier snapshot pour un horizon ('7d' ou '30d'), ou {}."""
     stats = _load_json_setting('STATS_CACHE', {})
     return stats.get(str(horizon).lower(), {}) if isinstance(stats, dict) else {}
 
+
 def get_stats_24h():
     import time
     return get_closed_trades_since(int(time.time()) - 24 * 60 * 60)
+
 
 def recompute_stats_from_executions(horizon: str) -> Dict[str, Any]:
     """
@@ -842,6 +975,7 @@ def purge_persistence(retention_days: int = 180, max_execs: int = 10000, max_ord
     orders = _purge_by_age_and_size(orders, retention_days, max_orders, ts_field="placed_at")
     _save_json_setting('ORDERS_LOG', orders)
 
+
 def remove_open_position(symbol: str) -> int:
     """
     Alias compat pour trader.sync_positions_with_exchange():
@@ -858,7 +992,7 @@ def remove_open_position(symbol: str) -> int:
         ).fetchall()
         ids = [int(r["id"]) for r in rows]
 
-    # On ferme chaque trade via l’API existante (ouvre sa propre connexion).
+    # On ferme chaque trade via l'API existante (ouvre sa propre connexion).
     for tid in ids:
         try:
             close_trade(tid, status='CLOSED_BY_EXCHANGE', pnl=0.0)
@@ -867,6 +1001,7 @@ def remove_open_position(symbol: str) -> int:
             pass
 
     return len(ids)
+
 
 def upsert_signal(sig: Dict[str, Any], state: str = "PENDING") -> int:
     """
@@ -919,8 +1054,9 @@ def upsert_signal(sig: Dict[str, Any], state: str = "PENDING") -> int:
             conn.commit()
             return int(cur.lastrowid)
 
+
 def set_signal_state(symbol: str, side: str, timeframe: str, ts: int, new_state: str) -> bool:
-    """Change l'état d’un signal identifié par (symbol, side, timeframe, ts). Retourne True si modifié."""
+    """Change l'état d'un signal identifié par (symbol, side, timeframe, ts). Retourne True si modifié."""
     with get_db_connection() as conn:
         cur = conn.cursor()
         res = cur.execute("""
@@ -928,6 +1064,7 @@ def set_signal_state(symbol: str, side: str, timeframe: str, ts: int, new_state:
         """, (str(new_state), str(symbol), str(side).lower(), str(timeframe), int(ts)))
         conn.commit()
         return res.rowcount > 0
+
 
 def insert_signal(**payload):
     """Alias compat: insert → upsert_signal, avec normalisation légère des champs."""
@@ -944,6 +1081,7 @@ def insert_signal(**payload):
     state = str(sig.pop('state', 'PENDING'))
     return upsert_signal(sig, state=state)
 
+
 def save_signal(**payload):
     """Alias compat: save → upsert_signal, même normalisation que insert_signal."""
     sig = dict(payload.pop('sig', {})) if isinstance(payload.get('sig'), dict) else dict(payload)
@@ -956,6 +1094,7 @@ def save_signal(**payload):
             sig['ts'] = int(time.time() * 1000)
     state = str(sig.pop('state', 'PENDING'))
     return upsert_signal(sig, state=state)
+
 
 def reset_statistics_soft() -> dict:
     """
