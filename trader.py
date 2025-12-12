@@ -3249,28 +3249,56 @@ def _update_signal_state(
     tp: Optional[float] = None,
     sl: Optional[float] = None,
 ) -> None:
-    """Met à jour l'état d'un signal déjà persisté."""
+    """
+    Met à jour l'état d'un signal déjà persisté.
+    
+    ✅ CORRECTION : Enregistre la raison du skip pour affichage Telegram.
+    """
     try:
         ts_sig = int(signal.get("ts", 0) or 0)
         if ts_sig <= 0:
             return
         
-        # ✅ CORRECTION: Utiliser database.insert_signal() au lieu de record_signal_from_trader()
+        # ✅ CORRECTION : Utiliser mark_signal_validated() pour enregistrer la raison
         try:
-            database.insert_signal(
+            payload = {
+                "side": signal.get("side", "-"),
+                "regime": str(signal.get("regime", "-")),
+                "rr": float(signal.get("rr", 0.0)),
+                "entry": float(entry_price),
+                "sl": float(sl or signal.get("sl", 0.0)),
+                "tp": float(tp or signal.get("tp", 0.0)),
+                "timeframe": timeframe,
+                "signal": dict(signal or {}),
+                "reason": str(reason or "")  # ✅ CRITIQUE : Raison persistée
+            }
+            
+            # Déterminer si pris ou skipped
+            taken = (state == "VALID_TAKEN")
+            
+            database.mark_signal_validated(
                 symbol=symbol,
-                side=signal.get("side", "-"),
-                timeframe=timeframe,
                 ts=ts_sig,
-                regime=str(signal.get("regime", "-")),
-                entry=float(entry_price),
-                sl=float(sl or signal.get("sl", 0.0)),
-                tp=float(tp or signal.get("tp", 0.0)),
-                rr=float(signal.get("rr", 0.0)),
-                state=state
+                payload=payload,
+                taken=taken
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # Fallback : insert_signal classique
+            try:
+                database.insert_signal(
+                    symbol=symbol,
+                    side=signal.get("side", "-"),
+                    timeframe=timeframe,
+                    ts=ts_sig,
+                    regime=str(signal.get("regime", "-")),
+                    entry=float(entry_price),
+                    sl=float(sl or signal.get("sl", 0.0)),
+                    tp=float(tp or signal.get("tp", 0.0)),
+                    rr=float(signal.get("rr", 0.0)),
+                    state=state
+                )
+            except Exception:
+                pass
         
     except Exception:
         pass
