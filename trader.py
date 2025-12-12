@@ -27,7 +27,7 @@ IMPULSE_MIN_BODY = 0.35     # ≥ 35% du range
 SIMPLE_WICK_MIN = 0.35      # ≥ 35% du range
 
 # Confirmation obligatoire après une pinbar-contact
-PINBAR_CONFIRM_MAX_BARS = 2     # nb de bougies max pour voir la réaction
+PINBAR_CONFIRM_MAX_BARS = 2     # nb de bougies max pour voir la réaction 
 PINBAR_CONFIRM_MIN_BODY = 0.20  # corps min de la bougie de réaction
 
 # --- Frais & BE ---
