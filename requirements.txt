@@ -8,3 +8,4 @@ pytz
 tabulate
 scipy
 dropbox==11.36.2
+pandas_ta>=0.3.14b
