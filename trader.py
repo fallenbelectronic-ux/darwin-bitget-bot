@@ -4963,20 +4963,69 @@ def execute_partial_exit(ex, exit_info: Dict[str, Any]) -> bool:
         print(f"Erreur execute_partial_exit: {e}")
         return False
 
-
+def _detect_manual_tp_change(ex, pos: Dict[str, Any]) -> bool:
+    """
+    Détecte si l'utilisateur a modifié le TP manuellement.
+    
+    Compare TP DB vs TP exchange.
+    Si différence > 0.1% → TP manuel détecté.
+    
+    Returns:
+        True si TP manuel, False sinon
+    """
+    try:
+        symbol = pos['symbol']
+        tp_db = float(pos.get('tp_price', 0))
+        
+        if tp_db <= 0:
+            return False
+        
+        # Récupérer TP sur exchange
+        tp_ex, _ = _fetch_existing_tp_sl(ex, symbol)
+        
+        if not tp_ex:
+            return False
+        
+        tp_ex = float(tp_ex)
+        
+        # Calculer différence
+        diff_pct = abs(tp_ex - tp_db) / tp_db
+        
+        # Si différence > 0.1% → TP manuel
+        if diff_pct > 0.001:
+            # Marquer comme manuel dans meta
+            try:
+                meta = pos.get('meta', {})
+                if isinstance(meta, str):
+                    import json
+                    meta = json.loads(meta)
+                
+                meta['tp_manual'] = True
+                meta['tp_manual_price'] = tp_ex
+                
+                database.update_trade_meta(pos['id'], meta)
+                database.update_trade_tp(pos['id'], tp_ex)
+                
+                print(f"✋ {symbol} : TP manuel détecté ({tp_db:.6f} → {tp_ex:.6f})")
+                
+                return True
+            except Exception:
+                pass
+        
+        return False
+    
+    except Exception as e:
+        print(f"Erreur _detect_manual_tp_change: {e}")
+        return False
 
 def manage_open_positions(ex):
     """
     Gestion positions ouvertes : sync, fermeture, TP dynamique, BE, trailing, pyramiding, partial exits.
-    Inclut protection anti-recul BE + notification PnL sécurisé RÉEL + ANTI-SPAM BE.
     
-    ✅ CORRECTIONS FINALES :
-    - Variable pnl_secured définie avant utilisation
-    - Migration TA-Lib → Colonnes DataFrame (utils.py)
-    - Pyramiding : create_market_order_smart
-    - Partial exits : create_market_order_smart
-    - TP DYNAMIQUE : Utilise adjust_tp_for_bb_offset
-    - BE ANTI-SPAM : Mise à jour meta['be_notified'] = True
+    ✅ CORRECTIONS APPLIQUÉES :
+    - Tolérance BE réduite (0.2% → 0.05%)
+    - Détection TP manuel (bloque TP dynamique)
+    - Protection anti-recul BE renforcée
     """
     
     def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
@@ -5047,6 +5096,12 @@ def manage_open_positions(ex):
             
             if qty <= 0:
                 continue
+            
+            # ✅ CORRECTION 1 : DÉTECTER MODIFICATION MANUELLE TP
+            try:
+                _detect_manual_tp_change(ex, pos)
+            except Exception:
+                pass
             
             # ========== DÉTECTION FERMETURE + NOTIFICATION PNL ==========
             if symbol not in pos_map:
@@ -5177,14 +5232,32 @@ def manage_open_positions(ex):
                 sl_price = float(pos.get('sl_price') or 0.0)
                 
                 if tp_price > 0:
+                    # ✅ CORRECTION 2 : BLOQUER SI TP MANUEL
                     try:
-                        # ✅ MIGRATION : Les colonnes BB/ATR sont déjà calculées par utils.fetch_and_prepare_df()
+                        meta = pos.get('meta', {})
+                        if isinstance(meta, str):
+                            import json
+                            meta = json.loads(meta)
+                        
+                        tp_manual = meta.get('tp_manual', False)
+                        
+                        if tp_manual:
+                            print(f"✋ {symbol} : TP manuel détecté, skip TP dynamique")
+                            raise Exception("TP_MANUAL_SKIP")
+                    except Exception as e:
+                        if "TP_MANUAL_SKIP" in str(e):
+                            pass
+                        else:
+                            pass
+                    
+                    try:
+                        # Migration : Les colonnes BB/ATR sont déjà calculées par utils.fetch_and_prepare_df()
                         df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
                         
                         if df is None or len(df) < 80:
                             raise Exception("DataFrame insuffisant pour TP dynamique")
                         
-                        # Accès direct aux colonnes (déjà calculées par utils.py)
+                        # Accès direct aux colonnes
                         last_row = df.iloc[-1]
                         
                         bb80_up_val = float(last_row.get('bb80_up', 0.0))
@@ -5196,14 +5269,14 @@ def manage_open_positions(ex):
                         if bb80_up_val <= 0 or bb80_lo_val <= 0 or bb20_up_val <= 0 or bb20_lo_val <= 0:
                             raise Exception("Colonnes BB manquantes ou invalides")
                         
-                        # ✅ CORRECTION : Déterminer bande selon régime
+                        # Déterminer bande selon régime
                         if regime == 'Tendance':
                             tp_raw = bb80_up_val if is_long else bb80_lo_val
                         else:
                             tp_raw = bb20_up_val if is_long else bb20_lo_val
                         
                         if tp_raw > 0:
-                            # ✅ CORRECTION : Utiliser fonction offset existante
+                            # Utiliser fonction offset existante
                             target_tp = adjust_tp_for_bb_offset(
                                 raw_tp=float(tp_raw),
                                 side=('buy' if is_long else 'sell'),
@@ -5249,7 +5322,8 @@ def manage_open_positions(ex):
                                     print(f"✅ {symbol} TP dynamique : {current_tp:.4f} → {target_tp:.4f}")
                     
                     except Exception as e:
-                        print(f"❌ Erreur TP dynamique {symbol}: {e}")
+                        if "TP_MANUAL_SKIP" not in str(e):
+                            print(f"❌ Erreur TP dynamique {symbol}: {e}")
             
             except Exception as e:
                 print(f"❌ Erreur TP dynamique {symbol}: {e}")
@@ -5297,7 +5371,7 @@ def manage_open_positions(ex):
                         prev_be_status = be_status
                         
                         try:
-                            # ✅ MIGRATION : Les colonnes BB sont déjà calculées par utils.fetch_and_prepare_df()
+                            # Les colonnes BB sont déjà calculées par utils.fetch_and_prepare_df()
                             df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
                             
                             if df is None or len(df) < 25:
@@ -5324,19 +5398,20 @@ def manage_open_positions(ex):
                                 h_val = float(last_n_high[i])
                                 l_val = float(last_n_low[i])
                                 
+                                # ✅ CORRECTION 3 : TOLÉRANCE RÉDUITE 0.2% → 0.05%
                                 if is_long:
-                                    if c_val >= bb20_mid_val * 0.998 or h_val >= bb20_mid_val * 0.998:
+                                    if c_val >= bb20_mid_val * 0.9995 or h_val >= bb20_mid_val * 0.9995:
                                         touched_bb20_mid = True
                                         break
                                 else:
-                                    if c_val <= bb20_mid_val * 1.002 or l_val <= bb20_mid_val * 1.002:
+                                    if c_val <= bb20_mid_val * 1.0005 or l_val <= bb20_mid_val * 1.0005:
                                         touched_bb20_mid = True
                                         break
                             
                             improve_sl = False
                             want_sl = sl_current
                             
-                            # ✅ CORRECTION : Initialiser pnl_secured AVANT le bloc
+                            # Initialiser pnl_secured AVANT le bloc
                             pnl_secured = 0.0
                             
                             if touched_bb20_mid and be_status != 'ACTIVE':
@@ -5352,7 +5427,7 @@ def manage_open_positions(ex):
                                 
                                 improve_sl = True
                             
-                            # ✅ PROTECTION ANTI-RECUL
+                            # PROTECTION ANTI-RECUL
                             if improve_sl and _sl_improves_or_equal(want_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
                                 
@@ -5385,7 +5460,7 @@ def manage_open_positions(ex):
                                     except Exception:
                                         pass
                                     
-                                    # ✅ ANTI-SPAM : Vérifier si déjà notifié
+                                    # ANTI-SPAM : Vérifier si déjà notifié
                                     try:
                                         meta = pos.get('meta', {})
                                         if isinstance(meta, str):
@@ -5395,14 +5470,14 @@ def manage_open_positions(ex):
                                     except Exception:
                                         be_already_notified = False
                                     
-                                    # ✅ NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
+                                    # NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
                                     if prev_be_status != 'ACTIVE' and not be_already_notified:
                                         try:
                                             remaining_qty = float(qty)
                                             entry_price_be = float(pos.get('entry_price') or 0.0)
                                             be_price_placed = float(want_sl)
                                             
-                                            # ✅ CALCUL PNL SÉCURISÉ RÉEL (BE - Entry)
+                                            # CALCUL PNL SÉCURISÉ RÉEL (BE - Entry)
                                             if entry_price_be <= 0 or remaining_qty <= 0:
                                                 pnl_secured = 0.0
                                             else:
@@ -5425,7 +5500,7 @@ def manage_open_positions(ex):
                                                     remaining_qty=float(remaining_qty)
                                                 )
                                             
-                                            # ✅ MARQUER COMME NOTIFIÉ (CORRECTION CRITIQUE ANTI-SPAM)
+                                            # MARQUER COMME NOTIFIÉ
                                             try:
                                                 if not isinstance(meta, dict):
                                                     meta = {}
@@ -5517,7 +5592,7 @@ def manage_open_positions(ex):
                                     target_sl = entry - (distance * step_50_pct)
                                 new_step = 25
                             
-                            # ✅ PROTECTION ANTI-RECUL
+                            # PROTECTION ANTI-RECUL
                             if target_sl and _sl_improves_or_equal(target_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
                                 
@@ -5587,7 +5662,7 @@ def manage_open_positions(ex):
                                 want_sl = current_price * (1.0 + trail_offset)
                                 move = (sl_current - want_sl) / sl_current if sl_current > 0 else 0
                             
-                            # ✅ PROTECTION ANTI-RECUL
+                            # PROTECTION ANTI-RECUL
                             if move >= trail_min_move and _sl_improves_or_equal(want_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
                                 
