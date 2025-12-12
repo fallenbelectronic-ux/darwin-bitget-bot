@@ -1,14 +1,20 @@
 # ========================================
-# BASE IMAGE - Python 3.10 pour compatibilité TA-Lib
+# BASE IMAGE - Debian Bullseye pour meilleure compatibilité
 # ========================================
-FROM python:3.10
+FROM python:3.10-bullseye
 
 # ========================================
-# ÉTAPE 1 : Dépendances système pour TA-Lib
+# ÉTAPE 1 : Dépendances système complètes
 # ========================================
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
+    gcc \
+    g++ \
+    make \
+    libssl-dev \
+    libffi-dev \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ========================================
@@ -31,32 +37,26 @@ RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
 # ========================================
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=/usr/lib:$LD_LIBRARY_PATH
 
-# Copier requirements.txt (pour référence seulement)
+# Copier requirements.txt
 COPY requirements.txt .
 
-# Installer TOUTES les dépendances dans le bon ordre avec versions compatibles
-RUN pip install --no-cache-dir --root-user-action ignore --upgrade pip && \
-    pip install --no-cache-dir --root-user-action ignore "numpy>=1.26.0,<2.0" && \
-    pip install --no-cache-dir --root-user-action ignore "pandas>=2.1.0,<2.2.0" && \
-    CFLAGS="-I/usr/include/ta-lib" LDFLAGS="-L/usr/lib" pip install --no-cache-dir --root-user-action ignore "TA-Lib==0.4.19" && \
-    pip install --no-cache-dir --root-user-action ignore \
-        "ccxt==4.2.25" \
-        "python-telegram-bot==21.0.1" \
-        "requests==2.31.0" \
-        "python-dotenv==1.0.1"
+# Installer dépendances Python dans le bon ordre
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir "numpy>=1.21.0,<1.24.0" && \
+    pip install --no-cache-dir "pandas>=2.0.0,<2.1.0" && \
+    pip install --no-cache-dir "TA-Lib==0.4.19" && \
+    pip install --no-cache-dir -r requirements.txt
 
 # ========================================
 # ÉTAPE 4 : Sécurité (utilisateur non-root)
 # ========================================
-# Copier le code source
 COPY . .
 
-# Créer utilisateur non-root et donner permissions
 RUN useradd --create-home appuser && \
     chown -R appuser:appuser /app
 
-# Passer à l'utilisateur non-root
 USER appuser
 
 # ========================================
