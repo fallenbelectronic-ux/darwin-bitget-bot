@@ -1287,13 +1287,19 @@ def send_main_menu(is_paused: bool):
         f"{cw_chip}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>🛠️ Commandes</b>\n"
-        f"💰 <code>/setrisk &lt;%&gt;</code> — Risque par trade\n"
         f"🌐 <code>/setuniverse &lt;nombre&gt;</code> — Taille du scan\n"
         f"🔢 <code>/setmaxpos &lt;nombre&gt;</code> — Nb max de trades\n"
-        
+        f"💰 <code>/setrisk &lt;%&gt;</code> — Risque par trade"
     )
 
-    keyboard = get_main_menu_keyboard(is_paused)
+    # ✅ CORRECTION : Clavier avec bouton Debug au lieu de Ping
+    pause_resume_btn = {"text": "💹 Relancer", "callback_data": "resume"} if is_paused else {"text": "⏸️ Pause", "callback_data": "pause"}
+    keyboard = {"inline_keyboard": [
+        [pause_resume_btn, {"text": "🔍 Debug", "callback_data": "ping"}],
+        [{"text": "🚀 Signaux (6h)", "callback_data": "signals_6h"}, {"text": "📈 Stats", "callback_data": "get_stats"}],
+        [{"text": "📊 Positions", "callback_data": "list_positions"}, {"text": "⚙️ Configuration", "callback_data": "menu_config"}]
+    ]}
+
     msg_id = database.get_setting('MAIN_MENU_MESSAGE_ID', None)
 
     if TG_TOKEN and TG_CHAT_ID and msg_id:
