@@ -1,11 +1,22 @@
-ccxt
-pandas
-requests
-ta
-matplotlib
-mplfinance
-pytz
-tabulate
-scipy
+# ===== EXCHANGE & API =====
+ccxt>=4.0.0
+
+# ===== DATA PROCESSING =====
+pandas>=1.5.0
+numpy>=1.24.0
+
+# ===== TECHNICAL ANALYSIS =====
+ta>=0.10.2
+
+# ===== CHARTS & VISUALIZATION =====
+matplotlib>=3.7.0
+mplfinance>=0.12.9b0
+
+# ===== UTILITIES =====
+requests>=2.31.0
+pytz>=2023.3
+tabulate>=0.9.0
+scipy>=1.10.0
+
+# ===== STORAGE =====
 dropbox==11.36.2
-pandas_ta>=0.3.14b
