@@ -1025,10 +1025,8 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     """
     Affiche 'Signaux valides des 6 dernières heures' avec pagination.
     
-    ⚡ OPTIMISATION : 
-    - 10 signaux par page (configurable)
-    - Boutons Précédent/Suivant
-    - Cache state pagination par chat
+    ✅ CORRECTION : Exclut strictement les signaux PENDING (pas encore confirmés).
+    Affiche UNIQUEMENT VALID_TAKEN et VALID_SKIPPED.
     
     Args:
         limit_per_page: Nombre de signaux par page (défaut 10)
@@ -1049,27 +1047,85 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     except Exception:
         cw_min_rr = 2.8
 
-    # Lecture DB : signaux validés uniquement (TOUS pour pagination)
+    # ✅ CORRECTION : Lecture DB directe avec filtrage SQL strict
     try:
-        raw_taken = database.get_signals(state="VALID_TAKEN", since_minutes=360, limit=100) or []
-        raw_skipped = database.get_signals(state="VALID_SKIPPED", since_minutes=360, limit=100) or []
+        import sqlite3
+        
+        # Chercher la DB
+        possible_paths = [
+            'data/trades.db',
+            'trades.db',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'trades.db'),
+            '/app/data/trades.db'
+        ]
+        
+        db_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                db_path = path
+                break
+        
+        if not db_path:
+            keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
+            edit_main("❌ Base de données introuvable.", keyboard)
+            return
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Timestamp 6h en arrière
+        ts_6h_ago = int((time.time() - 6 * 3600) * 1000)
+        
+        # ✅ REQUÊTE SQL STRICTE : Seulement VALID_TAKEN et VALID_SKIPPED (pas PENDING)
+        cursor.execute("""
+            SELECT symbol, side, regime, entry, sl, tp, rr, state, timestamp, timeframe
+            FROM signals
+            WHERE timestamp > ? 
+            AND state IN ('VALID_TAKEN', 'VALID_SKIPPED')
+            ORDER BY timestamp DESC
+        """, (ts_6h_ago,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
     except Exception as e:
         keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
         edit_main(f"⚠️ Erreur lecture signaux valides (6h) : <code>{_escape(e)}</code>", keyboard)
         return
 
-    raw_all = (raw_taken or []) + (raw_skipped or [])
+    # Convertir en dict
+    raw_all = []
+    for row in rows:
+        try:
+            raw_all.append({
+                'symbol': row[0],
+                'side': row[1],
+                'regime': row[2],
+                'entry': row[3],
+                'sl': row[4],
+                'tp': row[5],
+                'rr': row[6],
+                'state': row[7],
+                'ts': row[8],
+                'timeframe': row[9] if len(row) > 9 else '1h'
+            })
+        except Exception:
+            continue
+    
     if not raw_all:
         keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
-        edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal valide sur les 6 dernières heures.", keyboard)
+        edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal validé sur les 6 dernières heures.", keyboard)
         return
 
     # Filtrage strict RR
     signals = []
     for s in raw_all:
         try:
+            # ✅ DOUBLE VÉRIFICATION : Exclure explicitement PENDING
             st = str(s.get("state", "")).upper()
             if st not in ("VALID_TAKEN", "VALID_SKIPPED"):
+                continue
+            if st == "PENDING":  # Exclusion explicite
                 continue
 
             rr_val = float(s.get("rr", 0) or 0.0)
@@ -1090,7 +1146,7 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
 
     if not signals:
         keyboard = {"inline_keyboard": [[{"text": "↩️ Retour", "callback_data": "main_menu"}]]}
-        edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal valide sur les 6 dernières heures.", keyboard)
+        edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal validé respectant les critères RR.", keyboard)
         return
 
     # ========================================================================
@@ -1122,9 +1178,9 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
     def _badge(s: dict) -> str:
         st = str(s.get("state", "")).upper()
         if st == "VALID_TAKEN":
-            return "✅ Pris"
+            return "✅ Pris en trade"
         if st == "VALID_SKIPPED":
-            return "☑️ Valide (non pris)"
+            return "⏭️ Skipped"
         return "ℹ️"
 
     def _reason(s: dict) -> str:
