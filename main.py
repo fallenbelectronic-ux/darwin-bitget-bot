@@ -569,7 +569,7 @@ def process_callback_query(callback_query: Dict):
             notifier.send_main_menu(_paused)
 
         elif data == 'ping':
-            # ✅ CORRECTION : Remplacer Ping par Debug
+            # ✅ CORRECTION : Remplacer Ping par Debug complet avec gestion DB robuste
             from state import get_pending_signals
             
             with _lock:
@@ -605,26 +605,46 @@ def process_callback_query(callback_query: Dict):
             signals_db = []
             try:
                 import sqlite3
-                conn = sqlite3.connect('data/trades.db')
-                cursor = conn.cursor()
+                import os
                 
-                ts_24h_ago = int((time.time() - 86400) * 1000)
-                cursor.execute("""
-                    SELECT symbol, side, regime, rr, state, timestamp 
-                    FROM signals 
-                    WHERE timestamp > ?
-                    ORDER BY timestamp DESC
-                    LIMIT 10
-                """, (ts_24h_ago,))
+                # ✅ CORRECTION : Chercher le fichier DB dans plusieurs emplacements
+                possible_paths = [
+                    'data/trades.db',
+                    'trades.db',
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'trades.db'),
+                    '/app/data/trades.db'  # Chemin Render
+                ]
                 
-                signals_db = cursor.fetchall()
-                conn.close()
+                db_path = None
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        db_path = path
+                        break
                 
-                print(f"\n💾 Signaux DB (24h): {len(signals_db)}")
-                for row in signals_db:
-                    symbol, side, regime, rr, state, ts = row
-                    dt = datetime.fromtimestamp(ts/1000).strftime('%d/%m %H:%M')
-                    print(f"   - [{dt}] {symbol} | {side.upper()} {regime} | RR={rr:.2f} | {state}")
+                if db_path:
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    
+                    ts_24h_ago = int((time.time() - 86400) * 1000)
+                    cursor.execute("""
+                        SELECT symbol, side, regime, rr, state, timestamp 
+                        FROM signals 
+                        WHERE timestamp > ?
+                        ORDER BY timestamp DESC
+                        LIMIT 10
+                    """, (ts_24h_ago,))
+                    
+                    signals_db = cursor.fetchall()
+                    conn.close()
+                    
+                    print(f"\n💾 Signaux DB (24h): {len(signals_db)}")
+                    for row in signals_db:
+                        symbol, side, regime, rr, state, ts = row
+                        dt = datetime.fromtimestamp(ts/1000).strftime('%d/%m %H:%M')
+                        print(f"   - [{dt}] {symbol} | {side.upper()} {regime} | RR={rr:.2f} | {state}")
+                else:
+                    print(f"   ⚠️ Fichier DB introuvable (chemins testés: {len(possible_paths)})")
+                    
             except Exception as e:
                 print(f"   ❌ Erreur lecture DB: {e}")
             
@@ -645,6 +665,8 @@ def process_callback_query(callback_query: Dict):
                 valid_taken = sum(1 for s in signals_db if s[4] == 'VALID_TAKEN')
                 valid_skipped = sum(1 for s in signals_db if s[4] == 'VALID_SKIPPED')
                 msg += f"   ✅ Pris: <b>{valid_taken}</b> | ⏭️ Skipped: <b>{valid_skipped}</b>\n"
+            else:
+                msg += f"💾 Signaux DB (24h): <b>Non disponible</b>\n"
             
             if len(recent) == 0 and len(pendings) == 0:
                 msg += f"\n⚠️ <b>Aucun signal détecté depuis 6h</b>\n"
