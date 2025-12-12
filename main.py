@@ -569,16 +569,94 @@ def process_callback_query(callback_query: Dict):
             notifier.send_main_menu(_paused)
 
         elif data == 'ping':
-            notifier.send_main_menu(_paused)
+            # ✅ CORRECTION : Remplacer Ping par Debug
+            from state import get_pending_signals
+            
+            with _lock:
+                is_paused = _paused
+            
+            print("\n" + "="*60)
+            print("🔍 DIAGNOSTIC BOT DARWIN")
+            print("="*60)
+            
+            open_pos = database.get_open_positions()
+            max_pos = database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+            print(f"📊 Positions: {len(open_pos)}/{max_pos}")
+            for pos in open_pos:
+                print(f"   - {pos['symbol']} {pos['side'].upper()} (Entry: {pos['entry_price']})")
+            
+            pendings = get_pending_signals()
+            print(f"\n⏱️ Signaux PENDING: {len(pendings)}")
+            if pendings:
+                for symbol, data_p in pendings.items():
+                    sig = data_p.get('signal', {})
+                    print(f"   - {symbol} | {sig.get('side', '?').upper()} {sig.get('regime', '?')} | RR={sig.get('rr', 0):.2f}")
+            
+            cleanup_recent_signals(6)
+            with _lock:
+                recent = _recent_signals.copy()
+            print(f"\n📈 Signaux détectés (6h): {len(recent)}")
+            if recent:
+                for s in recent[-5:]:
+                    ts = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S')
+                    sig = s['signal']
+                    print(f"   - [{ts}] {s['symbol']} | {sig.get('side', '?').upper()} | RR={sig.get('rr', 0):.2f}")
+            
+            signals_db = []
+            try:
+                import sqlite3
+                conn = sqlite3.connect('data/trades.db')
+                cursor = conn.cursor()
+                
+                ts_24h_ago = int((time.time() - 86400) * 1000)
+                cursor.execute("""
+                    SELECT symbol, side, regime, rr, state, timestamp 
+                    FROM signals 
+                    WHERE timestamp > ?
+                    ORDER BY timestamp DESC
+                    LIMIT 10
+                """, (ts_24h_ago,))
+                
+                signals_db = cursor.fetchall()
+                conn.close()
+                
+                print(f"\n💾 Signaux DB (24h): {len(signals_db)}")
+                for row in signals_db:
+                    symbol, side, regime, rr, state, ts = row
+                    dt = datetime.fromtimestamp(ts/1000).strftime('%d/%m %H:%M')
+                    print(f"   - [{dt}] {symbol} | {side.upper()} {regime} | RR={rr:.2f} | {state}")
+            except Exception as e:
+                print(f"   ❌ Erreur lecture DB: {e}")
+            
+            print(f"\n⚙️ État: {'⏸️ PAUSE' if is_paused else '▶️ ACTIF'}")
+            print(f"⏱️ Timeframe: {TIMEFRAME}")
+            print(f"📊 RR Min: {MIN_RR}")
+            
+            print("="*60 + "\n")
+            
+            msg = f"🔍 <b>DIAGNOSTIC BOT</b>\n\n"
+            msg += f"⚙️ État: {'⏸️ PAUSE' if is_paused else '▶️ ACTIF'}\n"
+            msg += f"📊 Positions: <b>{len(open_pos)}/{max_pos}</b>\n"
+            msg += f"⏱️ Signaux pending: <b>{len(pendings)}</b>\n"
+            msg += f"📈 Signaux détectés (6h): <b>{len(recent)}</b>\n"
+            
+            if signals_db:
+                msg += f"💾 Signaux DB (24h): <b>{len(signals_db)}</b>\n"
+                valid_taken = sum(1 for s in signals_db if s[4] == 'VALID_TAKEN')
+                valid_skipped = sum(1 for s in signals_db if s[4] == 'VALID_SKIPPED')
+                msg += f"   ✅ Pris: <b>{valid_taken}</b> | ⏭️ Skipped: <b>{valid_skipped}</b>\n"
+            
+            if len(recent) == 0 and len(pendings) == 0:
+                msg += f"\n⚠️ <b>Aucun signal détecté depuis 6h</b>\n"
+                msg += f"Vérifiez : univers, conditions marché, RR min"
+            
+            notifier.tg_send(msg)
 
         elif data == 'list_positions':
             try:
-                # 1) Affichage IMMÉDIAT des positions connues en DB
                 db_positions = database.get_open_positions()
-                # On passe une liste vide pour les positions exchange : affichage centré DB, ultra rapide
                 notifier.format_synced_open_positions([], db_positions)
 
-                # 2) Rafraîchissement silencieux en arrière-plan pour la prochaine consultation
                 def _refresh_positions():
                     try:
                         ex_local = create_exchange()
@@ -598,7 +676,6 @@ def process_callback_query(callback_query: Dict):
             ex = create_exchange()
             balance = trader.get_usdt_balance(ex)
 
-            # Sauvegarde si solde valide, sinon fallback sur la dernière valeur connue
             if balance is not None:
                 try:
                     database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
@@ -689,6 +766,157 @@ def process_message(message: Dict):
         chat_id = (message.get("chat") or {}).get("id")
         notifier.offset_command(chat_id=chat_id)
 
+    elif command == "/pending":
+        from state import get_pending_signals
+        pendings = get_pending_signals()
+        
+        if not pendings:
+            print("📊 SIGNAUX PENDING : Aucun signal en attente")
+            notifier.tg_send("⏱️ Aucun signal en attente actuellement.")
+        else:
+            print(f"📊 SIGNAUX PENDING : {len(pendings)} signal(s) détecté(s)")
+            for symbol, data in pendings.items():
+                sig = data.get('signal', {})
+                side = sig.get('side', 'N/A')
+                regime = sig.get('regime', 'N/A')
+                rr = sig.get('rr', 0.0)
+                entry = sig.get('entry', 0.0)
+                sl = sig.get('sl', 0.0)
+                tp = sig.get('tp', 0.0)
+                
+                print(f"  - {symbol} | {side.upper()} {regime} | RR={rr:.2f}")
+                print(f"    Entry={entry:.6f} | SL={sl:.6f} | TP={tp:.6f}")
+            
+            msg = get_pending_signals_message()
+            notifier.tg_send(msg)
+
+    elif command == "/debug":
+        from state import get_pending_signals
+        
+        with _lock:
+            is_paused = _paused
+        
+        print("\n" + "="*60)
+        print("🔍 DIAGNOSTIC BOT DARWIN")
+        print("="*60)
+        
+        open_pos = database.get_open_positions()
+        max_pos = database.get_setting('MAX_OPEN_POSITIONS', MAX_OPEN_POSITIONS)
+        print(f"📊 Positions: {len(open_pos)}/{max_pos}")
+        for pos in open_pos:
+            print(f"   - {pos['symbol']} {pos['side'].upper()} (Entry: {pos['entry_price']})")
+        
+        pendings = get_pending_signals()
+        print(f"\n⏱️ Signaux PENDING: {len(pendings)}")
+        if pendings:
+            for symbol, data in pendings.items():
+                sig = data.get('signal', {})
+                print(f"   - {symbol} | {sig.get('side', '?').upper()} {sig.get('regime', '?')} | RR={sig.get('rr', 0):.2f}")
+        
+        cleanup_recent_signals(6)
+        with _lock:
+            recent = _recent_signals.copy()
+        print(f"\n📈 Signaux détectés (6h): {len(recent)}")
+        if recent:
+            for s in recent[-5:]:
+                ts = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S')
+                sig = s['signal']
+                print(f"   - [{ts}] {s['symbol']} | {sig.get('side', '?').upper()} | RR={sig.get('rr', 0):.2f}")
+        
+        try:
+            import sqlite3
+            conn = sqlite3.connect('data/trades.db')
+            cursor = conn.cursor()
+            
+            ts_24h_ago = int((time.time() - 86400) * 1000)
+            cursor.execute("""
+                SELECT symbol, side, regime, rr, state, timestamp 
+                FROM signals 
+                WHERE timestamp > ?
+                ORDER BY timestamp DESC
+                LIMIT 10
+            """, (ts_24h_ago,))
+            
+            signals_db = cursor.fetchall()
+            conn.close()
+            
+            print(f"\n💾 Signaux DB (24h): {len(signals_db)}")
+            for row in signals_db:
+                symbol, side, regime, rr, state, ts = row
+                dt = datetime.fromtimestamp(ts/1000).strftime('%d/%m %H:%M')
+                print(f"   - [{dt}] {symbol} | {side.upper()} {regime} | RR={rr:.2f} | {state}")
+        except Exception as e:
+            print(f"   ❌ Erreur lecture DB: {e}")
+            signals_db = []
+        
+        print(f"\n⚙️ État: {'⏸️ PAUSE' if is_paused else '▶️ ACTIF'}")
+        print(f"⏱️ Timeframe: {TIMEFRAME}")
+        print(f"📊 RR Min: {MIN_RR}")
+        
+        print("="*60 + "\n")
+        
+        msg = f"🔍 <b>DIAGNOSTIC BOT</b>\n\n"
+        msg += f"⚙️ État: {'⏸️ PAUSE' if is_paused else '▶️ ACTIF'}\n"
+        msg += f"📊 Positions: <b>{len(open_pos)}/{max_pos}</b>\n"
+        msg += f"⏱️ Signaux pending: <b>{len(pendings)}</b>\n"
+        msg += f"📈 Signaux détectés (6h): <b>{len(recent)}</b>\n"
+        
+        if signals_db:
+            msg += f"💾 Signaux DB (24h): <b>{len(signals_db)}</b>\n"
+            valid_taken = sum(1 for s in signals_db if s[4] == 'VALID_TAKEN')
+            valid_skipped = sum(1 for s in signals_db if s[4] == 'VALID_SKIPPED')
+            msg += f"   ✅ Pris: <b>{valid_taken}</b> | ⏭️ Skipped: <b>{valid_skipped}</b>\n"
+        
+        if len(recent) == 0 and len(pendings) == 0:
+            msg += f"\n⚠️ <b>Aucun signal détecté depuis 6h</b>\n"
+            msg += f"Vérifiez : univers, conditions marché, RR min"
+        
+        notifier.tg_send(msg)
+
+    elif command == "/lastscan":
+        print("\n" + "="*60)
+        print("🔎 DERNIER SCAN EN COURS...")
+        print("="*60)
+        
+        ex = create_exchange()
+        
+        try:
+            test_universe = get_or_build_universe(ex)
+            test_symbols = test_universe[:10] if test_universe else ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        except Exception:
+            test_symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        
+        detected = []
+        for symbol in test_symbols:
+            try:
+                df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+                if df is None:
+                    print(f"   ❌ {symbol} - Pas de données")
+                    continue
+                
+                signal = trader.detect_signal(symbol, df)
+                if signal:
+                    print(f"   ✅ {symbol} - SIGNAL DÉTECTÉ! RR={signal.get('rr', 0):.2f}")
+                    detected.append({
+                        'symbol': symbol,
+                        'signal': signal
+                    })
+                else:
+                    print(f"   ⚪ {symbol} - Pas de signal")
+            except Exception as e:
+                print(f"   ❌ {symbol} - Erreur: {e}")
+        
+        print("="*60 + "\n")
+        
+        if detected:
+            msg = f"✅ <b>SCAN TEST : {len(detected)} signal(s) détecté(s)!</b>\n\n"
+            for d in detected:
+                sig = d['signal']
+                msg += f"📈 {d['symbol']} | {sig.get('side', '?').upper()} {sig.get('regime', '?')} | RR={sig.get('rr', 0):.2f}\n"
+            notifier.tg_send(msg)
+        else:
+            notifier.tg_send(f"⚠️ <b>SCAN TEST</b> : Aucun signal sur les {len(test_symbols)} premières paires")
+
     elif command.startswith("/set"):
         if command == "/setuniverse" and len(parts) > 1:
             try:
@@ -729,7 +957,6 @@ def process_message(message: Dict):
         ex = create_exchange()
         balance = trader.get_usdt_balance(ex)
 
-        # Sauvegarde si solde valide, sinon fallback sur la dernière valeur connue
         if balance is not None:
             try:
                 database.set_setting('CURRENT_BALANCE_USDT', f"{float(balance):.2f}")
@@ -745,6 +972,7 @@ def process_message(message: Dict):
 
         trades = database.get_closed_trades_since(int(time.time()) - 7 * 24 * 60 * 60)
         notifier.send_report("📊 Bilan des 7 derniers jours", trades, balance)
+
 
 def check_scheduled_reports():
     """Gère les rapports automatiques."""
@@ -892,7 +1120,7 @@ def telegram_listener_loop():
 def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
     print("📈 Thread Trading démarré.")
     last_hour = -1
-    last_day = -1  # refresh univers 1×/jour
+    last_day = -1
     current_size = len(universe)
 
     while True:
@@ -903,13 +1131,11 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             if is_paused:
                 print("   -> (Pause)"); time.sleep(LOOP_DELAY); continue
 
-            # 🔄 Mise à jour du solde / équity USDT à chaque boucle
             try:
                 live_equity = float(trader.get_portfolio_equity_usdt(ex))
                 if live_equity > 0.0:
                     database.set_setting('CURRENT_BALANCE_USDT', f"{live_equity:.6f}")
             except Exception:
-                # On ne casse jamais la boucle de trading si la lecture du solde échoue
                 pass
 
             now_utc = datetime.now(timezone.utc)
@@ -950,20 +1176,25 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             trader.manage_open_positions(ex)
 
             from state import set_pending_signal, get_pending_signals
+            
+            # ✅ CORRECTION : Compteur de signaux détectés
             print(f"--- Scan de {len(universe)} paires ---")
+            signals_found_this_scan = 0
+            
             for symbol in universe:
                 df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
                 if df is None: continue
 
                 signal = trader.detect_signal(symbol, df)
                 if signal:
-                    # Timestamp ms de la bougie courante
+                    # ✅ CORRECTION : Incrémenter le compteur
+                    signals_found_this_scan += 1
+                    
                     try:
                         ts_ms = int(pd.Timestamp(df.index[-1]).value // 10**6)
                     except Exception:
                         ts_ms = int(time.time() * 1000)
 
-                    # Mémoire en RAM
                     if symbol not in get_pending_signals():
                         print(f"✅ Signal détecté pour {symbol}! En attente de clôture.")
                         set_pending_signal(symbol, {
@@ -972,7 +1203,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                             'candle_timestamp': df.index[-1],
                             'df': df
                         })
-                        # Persistance DB immédiate
                         try:
                             database.upsert_signal_pending(
                                 symbol=symbol, timeframe=TIMEFRAME, ts=ts_ms,
@@ -988,10 +1218,12 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                         if str(database.get_setting('PENDING_ALERTS', 'false')).lower() == 'true':
                             notifier.send_pending_signal_notification(symbol, signal)
 
-                    # Historique court des signaux récents (affichage 6h bouton)
                     if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
                         _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
 
+            # ✅ CORRECTION : Afficher le résultat du scan
+            print(f"--- Scan terminé : {signals_found_this_scan} signal(s) détecté(s) ---\n")
+            
             time.sleep(LOOP_DELAY)
 
         except Exception:
