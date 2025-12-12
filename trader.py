@@ -5053,12 +5053,12 @@ def manage_open_positions(ex):
     """
     Gestion positions ouvertes : sync, fermeture, TP dynamique, BE, trailing, pyramiding, partial exits.
     
-    ✅ CORRECTIONS APPLIQUÉES :
-    - Buffer BE augmenté (0.2% → 0.5%)
-    - Anti-spam TP (flag tp_placement_failed)
-    - Anti-spam BE (flag be_notified)
-    - Protection anti-recul BE renforcée
-    - Détection TP manuel (bloque TP dynamique)
+    ✅ CORRECTIONS CRITIQUES APPLIQUÉES :
+    1. BE : Filtre temporel (contact BB20_mid APRÈS open_timestamp)
+    2. BE : PNL réel (prix actuel - entry, pas be_price - entry)
+    3. Anti-spam TP (flag tp_placement_failed)
+    4. Anti-spam BE (flag be_notified)
+    5. Protection anti-recul BE renforcée
     """
     
     def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
@@ -5153,13 +5153,11 @@ def manage_open_positions(ex):
                         except Exception:
                             close_price = entry
                     
-                    # Calcul PnL
                     if is_long:
                         pnl = (close_price - entry) * qty
                     else:
                         pnl = (entry - close_price) * qty
                     
-                    # Déterminer TP ou SL
                     hit_tp = False
                     hit_sl = False
                     
@@ -5193,7 +5191,6 @@ def manage_open_positions(ex):
                     
                     database.close_trade(pos['id'], status)
                     
-                    # Notification riche avec PnL
                     try:
                         pnl_pct = (pnl / (entry * qty)) * 100 if (entry * qty) > 0 else 0
                         
@@ -5252,16 +5249,13 @@ def manage_open_positions(ex):
                     print(f"❌ Erreur sync qty manuel {symbol}: {e}")
                 continue
             
-            # ========================================================================
             # ========== TP DYNAMIQUE (SUIT BB80/BB20) - ANTI-SPAM ==========
-            # ========================================================================
             try:
                 regime = pos.get('regime', 'Tendance')
                 tp_price = float(pos.get('tp_price') or 0.0)
                 sl_price = float(pos.get('sl_price') or 0.0)
                 
                 if tp_price > 0:
-                    # ✅ CORRECTION 1 : BLOQUER SI TP MANUEL
                     try:
                         meta = pos.get('meta', {})
                         if isinstance(meta, str):
@@ -5279,7 +5273,6 @@ def manage_open_positions(ex):
                         else:
                             pass
                     
-                    # ✅ CORRECTION 2 : BLOQUER SI ERREUR 40836 DÉJÀ RENCONTRÉE
                     try:
                         meta = pos.get('meta', {})
                         if isinstance(meta, str):
@@ -5295,13 +5288,11 @@ def manage_open_positions(ex):
                         pass
                     
                     try:
-                        # Migration : Les colonnes BB/ATR sont déjà calculées par utils.fetch_and_prepare_df()
                         df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
                         
                         if df is None or len(df) < 80:
                             raise Exception("DataFrame insuffisant pour TP dynamique")
                         
-                        # Accès direct aux colonnes
                         last_row = df.iloc[-1]
                         
                         bb80_up_val = float(last_row.get('bb80_up', 0.0))
@@ -5313,14 +5304,12 @@ def manage_open_positions(ex):
                         if bb80_up_val <= 0 or bb80_lo_val <= 0 or bb20_up_val <= 0 or bb20_lo_val <= 0:
                             raise Exception("Colonnes BB manquantes ou invalides")
                         
-                        # Déterminer bande selon régime
                         if regime == 'Tendance':
                             tp_raw = bb80_up_val if is_long else bb80_lo_val
                         else:
                             tp_raw = bb20_up_val if is_long else bb20_lo_val
                         
                         if tp_raw > 0:
-                            # Utiliser fonction offset existante
                             target_tp = adjust_tp_for_bb_offset(
                                 raw_tp=float(tp_raw),
                                 side=('buy' if is_long else 'sell'),
@@ -5330,7 +5319,6 @@ def manage_open_positions(ex):
                             
                             current_tp = tp_price
                             
-                            # Vérifier amélioration significative
                             try:
                                 tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', '0.0005'))
                             except Exception:
@@ -5365,7 +5353,6 @@ def manage_open_positions(ex):
                                     database.update_trade_tp(pos['id'], float(target_tp))
                                     print(f"✅ {symbol} TP dynamique : {current_tp:.4f} → {target_tp:.4f}")
                                 
-                                # ✅ CORRECTION 3 : TRACKER ÉCHEC 40836 DANS META
                                 if not tp_ok:
                                     try:
                                         meta = pos.get('meta', {})
@@ -5376,7 +5363,6 @@ def manage_open_positions(ex):
                                         if not isinstance(meta, dict):
                                             meta = {}
                                         
-                                        # Marquer échec pour éviter réessais
                                         meta['tp_placement_failed'] = True
                                         
                                         database.update_trade_meta(pos['id'], meta)
@@ -5420,7 +5406,7 @@ def manage_open_positions(ex):
                 print(f"❌ Erreur partial exit {symbol}: {e}")
             
             # ========================================================================
-            # ========== BE DYNAMIQUE (CONTACT BB20_MID) + PNL SÉCURISÉ RÉEL + ANTI-SPAM ==========
+            # ========== BE DYNAMIQUE (CONTACT BB20_MID) - FILTRE TEMPOREL + PNL RÉEL ==========
             # ========================================================================
             try:
                 try:
@@ -5436,7 +5422,6 @@ def manage_open_positions(ex):
                         be_status = pos.get('be_status', 'INACTIVE')
                         prev_be_status = be_status
                         
-                        # ✅ CORRECTION 1 : ANTI-SPAM - Vérifier d'abord si déjà notifié
                         try:
                             meta = pos.get('meta', {})
                             if isinstance(meta, str):
@@ -5446,19 +5431,27 @@ def manage_open_positions(ex):
                         except Exception:
                             be_already_notified = False
                         
-                        # Si BE déjà actif ET déjà notifié → SKIP complètement
                         if be_status == 'ACTIVE' and be_already_notified:
                             continue
                         
                         try:
-                            # Les colonnes BB sont déjà calculées par utils.fetch_and_prepare_df()
                             df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
                             
                             if df is None or len(df) < 25:
                                 raise Exception("DataFrame insuffisant pour BE dynamique")
                             
-                            # Accès direct à la colonne bb20_mid
-                            bb20_mid_val = float(df.iloc[-1].get('bb20_mid', 0.0))
+                            # ✅ CORRECTION CRITIQUE 1 : FILTRER BOUGIES APRÈS OUVERTURE DU TRADE
+                            open_timestamp = int(pos.get('open_timestamp', 0))
+                            
+                            if open_timestamp > 0:
+                                df_after_entry = df[df['timestamp'] >= open_timestamp]
+                                
+                                if len(df_after_entry) < 1:
+                                    raise Exception("Aucune bougie après ouverture trade")
+                            else:
+                                df_after_entry = df
+                            
+                            bb20_mid_val = float(df_after_entry.iloc[-1].get('bb20_mid', 0.0))
                             
                             if bb20_mid_val <= 0:
                                 raise Exception("Colonne bb20_mid manquante ou invalide")
@@ -5468,9 +5461,9 @@ def manage_open_positions(ex):
                             except Exception:
                                 be_lookback = 2
                             
-                            last_n_close = df['close'].iloc[-be_lookback:].values
-                            last_n_high = df['high'].iloc[-be_lookback:].values
-                            last_n_low = df['low'].iloc[-be_lookback:].values
+                            last_n_close = df_after_entry['close'].iloc[-be_lookback:].values
+                            last_n_high = df_after_entry['high'].iloc[-be_lookback:].values
+                            last_n_low = df_after_entry['low'].iloc[-be_lookback:].values
                             
                             touched_bb20_mid = False
                             for i in range(len(last_n_close)):
@@ -5478,7 +5471,6 @@ def manage_open_positions(ex):
                                 h_val = float(last_n_high[i])
                                 l_val = float(last_n_low[i])
                                 
-                                # Tolérance 0.05% pour contact BB20_mid
                                 if is_long:
                                     if c_val >= bb20_mid_val * 0.9995 or h_val >= bb20_mid_val * 0.9995:
                                         touched_bb20_mid = True
@@ -5491,13 +5483,9 @@ def manage_open_positions(ex):
                             improve_sl = False
                             want_sl = sl_current
                             
-                            # Initialiser pnl_secured AVANT le bloc
-                            pnl_secured = 0.0
-                            
                             if touched_bb20_mid and be_status != 'ACTIVE':
-                                # ✅ CORRECTION 2 : Utiliser buffer 0.5% (nouvelle valeur)
                                 try:
-                                    be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.005'))  # ✅ 0.5% (was 0.001)
+                                    be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.005'))
                                 except Exception:
                                     be_offset_pct = 0.005
                                 
@@ -5508,7 +5496,6 @@ def manage_open_positions(ex):
                                 
                                 improve_sl = True
                             
-                            # PROTECTION ANTI-RECUL
                             if improve_sl and _sl_improves_or_equal(want_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
                                 
@@ -5541,27 +5528,31 @@ def manage_open_positions(ex):
                                     except Exception:
                                         pass
                                     
-                                    # ✅ CORRECTION 3 : NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
                                     if prev_be_status != 'ACTIVE' and not be_already_notified:
                                         try:
                                             remaining_qty = float(qty)
                                             entry_price_be = float(pos.get('entry_price') or 0.0)
-                                            be_price_placed = float(want_sl)
                                             
-                                            # CALCUL PNL SÉCURISÉ RÉEL (BE - Entry)
+                                            # ✅ CORRECTION CRITIQUE 2 : PNL RÉEL (prix actuel - entry)
+                                            try:
+                                                ticker = ex.fetch_ticker(symbol)
+                                                current_price_now = float(ticker.get('last') or ticker.get('close') or entry_price_be)
+                                            except Exception:
+                                                current_price_now = entry_price_be
+                                            
                                             if entry_price_be <= 0 or remaining_qty <= 0:
                                                 pnl_secured = 0.0
                                             else:
                                                 if is_long:
-                                                    pnl_secured = max(0.0, (be_price_placed - entry_price_be) * remaining_qty)
+                                                    pnl_secured = max(0.0, (current_price_now - entry_price_be) * remaining_qty)
                                                 else:
-                                                    pnl_secured = max(0.0, (entry_price_be - be_price_placed) * remaining_qty)
+                                                    pnl_secured = max(0.0, (entry_price_be - current_price_now) * remaining_qty)
                                             
                                             if is_manual_trade:
                                                 notifier.tg_send(
                                                     f"🔵 **Trade Manuel → BE Activé**\n\n"
                                                     f"📊 {symbol} {side}\n"
-                                                    f"$ PnL sécurisé : {pnl_secured:.2f} USDT\n"
+                                                    f"$ PnL actuel : {pnl_secured:.2f} USDT\n"
                                                     f"🛡️ SL déplacé au Break-Even"
                                                 )
                                             else:
@@ -5571,7 +5562,6 @@ def manage_open_positions(ex):
                                                     remaining_qty=float(remaining_qty)
                                                 )
                                             
-                                            # ✅ MARQUER COMME NOTIFIÉ POUR ÉVITER SPAM
                                             try:
                                                 if not isinstance(meta, dict):
                                                     meta = {}
@@ -5583,7 +5573,7 @@ def manage_open_positions(ex):
                                         except Exception as e:
                                             print(f"❌ Erreur notification BE {symbol}: {e}")
                                     
-                                    print(f"✅ {symbol} BE activé : SL {sl_current:.4f} → {want_sl:.4f} (PnL sécurisé: {pnl_secured:.2f} USDT)")
+                                    print(f"✅ {symbol} BE activé : SL {sl_current:.4f} → {want_sl:.4f} (PnL actuel: {pnl_secured:.2f} USDT)")
                             elif improve_sl:
                                 print(f"⚠️ {symbol} BE rejeté (recul interdit : {want_sl:.4f} vs {sl_current:.4f})")
                         
@@ -5663,7 +5653,6 @@ def manage_open_positions(ex):
                                     target_sl = entry - (distance * step_50_pct)
                                 new_step = 25
                             
-                            # PROTECTION ANTI-RECUL
                             if target_sl and _sl_improves_or_equal(target_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
                                 
@@ -5733,7 +5722,6 @@ def manage_open_positions(ex):
                                 want_sl = current_price * (1.0 + trail_offset)
                                 move = (sl_current - want_sl) / sl_current if sl_current > 0 else 0
                             
-                            # PROTECTION ANTI-RECUL
                             if move >= trail_min_move and _sl_improves_or_equal(want_sl, sl_current, is_long):
                                 close_side = 'sell' if is_long else 'buy'
                                 
@@ -5765,10 +5753,6 @@ def manage_open_positions(ex):
         except Exception as e:
             print(f"❌ Erreur manage_open_positions trade {pos.get('id')}: {e}")
             continue
-
-
-
-
 
 
 
