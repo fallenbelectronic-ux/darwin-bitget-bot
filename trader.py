@@ -2457,8 +2457,10 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
     """
     Place SL et TP de manière robuste avec détection des erreurs Bitget.
     
-    ✅ CORRECTION : Continue à placer le TP même si le SL échoue
-    ✅ Notifie si TP non placé (changement d'avis utilisateur)
+    ✅ CORRECTIONS :
+    - Continue à placer le TP même si le SL échoue
+    - Détecte erreur 40836 (TP invalide)
+    - NE notifie PAS en cas d'erreur 40836 (évite spam, gestion par caller)
     
     Returns:
         (sl_success: bool, tp_success: bool)
@@ -2503,7 +2505,7 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
                     print(f"⚠️ {symbol} SHORT : SL {sl_validated:.6f} <= mark {mark:.6f} → skip SL")
                     sl_invalid = True
             
-            # ✅ CORRECTION : Ne pas placer le SL si invalide, mais CONTINUER vers le TP
+            # Ne pas placer le SL si invalide, mais CONTINUER vers le TP
             if not sl_invalid:
                 # Placement SL
                 sl_side = 'sell' if is_long else 'buy'
@@ -2558,26 +2560,21 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
             except Exception as e_tp:
                 err_msg = str(e_tp)
                 
-                # Log détaillé pour debug
-                print(f"❌ {symbol} : Erreur placement TP")
-                print(f"   Prix TP : {tp_validated:.6f}")
-                print(f"   Prix mark : {mark:.6f}")
-                print(f"   Quantité : {qty:.6f}")
-                print(f"   Erreur : {err_msg}")
-                
-                # ✅ Notifier si erreur critique (remis suite changement d'avis)
+                # ✅ CORRECTION : DÉTECTER ERREUR 40836 MAIS NE PAS NOTIFIER
+                # La notification sera gérée par manage_open_positions qui marque le flag
                 if '40836' in err_msg or 'take profit price' in err_msg.lower():
-                    try:
-                        notifier.tg_send(
-                            f"⚠️ **TP NON PLACÉ**\n\n"
-                            f"{symbol} {side.upper()}\n"
-                            f"Prix TP : {tp_validated:.6f}\n"
-                            f"Prix mark : {mark:.6f}\n"
-                            f"Erreur : TP invalide (40836)\n\n"
-                            f"❗ Placer le TP manuellement"
-                        )
-                    except Exception:
-                        pass
+                    print(f"⚠️ {symbol} : TP invalide (40836)")
+                    print(f"   Prix TP : {tp_validated:.6f}")
+                    print(f"   Prix mark : {mark:.6f}")
+                    print(f"   Quantité : {qty:.6f}")
+                    # ✅ PAS de notification ici pour éviter spam
+                else:
+                    # Log détaillé pour autres erreurs
+                    print(f"❌ {symbol} : Erreur placement TP")
+                    print(f"   Prix TP : {tp_validated:.6f}")
+                    print(f"   Prix mark : {mark:.6f}")
+                    print(f"   Quantité : {qty:.6f}")
+                    print(f"   Erreur : {err_msg}")
         
         except Exception as e:
             print(f"❌ {symbol} : Erreur TP → {e}")
@@ -2591,19 +2588,6 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
     
     if tp and qty > 0 and not tp_ok:
         print(f"⚠️ {symbol} : TP NON placé")
-        
-        # ✅ NOTIFICATION TELEGRAM si TP échoue (remis suite changement d'avis)
-        try:
-            notifier.tg_send(
-                f"⚠️ **ALERTE TP**\n\n"
-                f"🎯 {symbol}\n"
-                f"TP non placé sur l'exchange\n\n"
-                f"{'✅' if sl_ok else '❌'} SL : {sl:.6f if sl else 'N/A'}\n"
-                f"❌ TP : {tp:.6f if tp else 'N/A'}\n\n"
-                f"❗ Vérifier et placer manuellement"
-            )
-        except Exception:
-            pass
     
     return sl_ok, tp_ok
 
@@ -4018,7 +4002,7 @@ def compute_fee_safe_be_price(
     qty: float,                # taille position (en "coin" pour linéaires USDT)
     fee_in_pct: float,
     fee_out_pct: float,
-    buffer_pct: float = 0.0,   # petit surplus pour finir > 0
+    buffer_pct: float = 0.0,   # surplus % pour couvrir funding + slippage (recommandé 0.5%)
     buffer_usdt: float = 0.0   # OU buffer absolu sur la position
 ) -> float:
     """
@@ -4027,6 +4011,15 @@ def compute_fee_safe_be_price(
       - frais d'entrée: fee_in_pct * entry * qty
       - frais de sortie: fee_out_pct * exit  * qty
       - buffer: soit % de notional d'entrée (buffer_pct * entry * qty), soit absolu USDT (buffer_usdt)
+    
+    ✅ CORRECTION : buffer_pct DOIT être au minimum 0.5% pour couvrir :
+       - Frais entry/exit : 0.2%
+       - Funding fees     : ~0.05% (3x par 24h)
+       - Slippage         : ~0.05%
+       - Marge sécurité   : +0.20%
+       ─────────────────────────────
+       TOTAL              : 0.50% minimum
+    
     Formules (linéaire USDT):
       Long  : exit >= (E*(1+fin) + b_per_qty)/(1 - fout)
       Short : exit <= (E*(1-fin) - b_per_qty)/(1 + fout)
@@ -5060,9 +5053,11 @@ def manage_open_positions(ex):
     Gestion positions ouvertes : sync, fermeture, TP dynamique, BE, trailing, pyramiding, partial exits.
     
     ✅ CORRECTIONS APPLIQUÉES :
-    - Tolérance BE réduite (0.2% → 0.05%)
-    - Détection TP manuel (bloque TP dynamique)
+    - Buffer BE augmenté (0.2% → 0.5%)
+    - Anti-spam TP (flag tp_placement_failed)
+    - Anti-spam BE (flag be_notified)
     - Protection anti-recul BE renforcée
+    - Détection TP manuel (bloque TP dynamique)
     """
     
     def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
@@ -5133,12 +5128,6 @@ def manage_open_positions(ex):
             
             if qty <= 0:
                 continue
-            
-            # ✅ CORRECTION 1 : DÉTECTER MODIFICATION MANUELLE TP
-            try:
-                _detect_manual_tp_change(ex, pos)
-            except Exception:
-                pass
             
             # ========== DÉTECTION FERMETURE + NOTIFICATION PNL ==========
             if symbol not in pos_map:
@@ -5262,14 +5251,16 @@ def manage_open_positions(ex):
                     print(f"❌ Erreur sync qty manuel {symbol}: {e}")
                 continue
             
-            # ========== TP DYNAMIQUE (SUIT BB80/BB20) ==========
+            # ========================================================================
+            # ========== TP DYNAMIQUE (SUIT BB80/BB20) - ANTI-SPAM ==========
+            # ========================================================================
             try:
                 regime = pos.get('regime', 'Tendance')
                 tp_price = float(pos.get('tp_price') or 0.0)
                 sl_price = float(pos.get('sl_price') or 0.0)
                 
                 if tp_price > 0:
-                    # ✅ CORRECTION 2 : BLOQUER SI TP MANUEL
+                    # ✅ CORRECTION 1 : BLOQUER SI TP MANUEL
                     try:
                         meta = pos.get('meta', {})
                         if isinstance(meta, str):
@@ -5286,6 +5277,21 @@ def manage_open_positions(ex):
                             pass
                         else:
                             pass
+                    
+                    # ✅ CORRECTION 2 : BLOQUER SI ERREUR 40836 DÉJÀ RENCONTRÉE
+                    try:
+                        meta = pos.get('meta', {})
+                        if isinstance(meta, str):
+                            import json
+                            meta = json.loads(meta)
+                        
+                        tp_placement_failed = meta.get('tp_placement_failed', False)
+                        
+                        if tp_placement_failed:
+                            print(f"⚠️ {symbol} : TP placement déjà échoué (40836), skip réessai")
+                            continue
+                    except Exception:
+                        pass
                     
                     try:
                         # Migration : Les colonnes BB/ATR sont déjà calculées par utils.fetch_and_prepare_df()
@@ -5357,6 +5363,26 @@ def manage_open_positions(ex):
                                 if tp_ok:
                                     database.update_trade_tp(pos['id'], float(target_tp))
                                     print(f"✅ {symbol} TP dynamique : {current_tp:.4f} → {target_tp:.4f}")
+                                
+                                # ✅ CORRECTION 3 : TRACKER ÉCHEC 40836 DANS META
+                                if not tp_ok:
+                                    try:
+                                        meta = pos.get('meta', {})
+                                        if isinstance(meta, str):
+                                            import json
+                                            meta = json.loads(meta)
+                                        
+                                        if not isinstance(meta, dict):
+                                            meta = {}
+                                        
+                                        # Marquer échec pour éviter réessais
+                                        meta['tp_placement_failed'] = True
+                                        
+                                        database.update_trade_meta(pos['id'], meta)
+                                        
+                                        print(f"⚠️ {symbol} : TP placement échoué, flag activé pour éviter spam")
+                                    except Exception as e:
+                                        print(f"❌ Erreur update meta tp_placement_failed: {e}")
                     
                     except Exception as e:
                         if "TP_MANUAL_SKIP" not in str(e):
@@ -5392,7 +5418,9 @@ def manage_open_positions(ex):
             except Exception as e:
                 print(f"❌ Erreur partial exit {symbol}: {e}")
             
+            # ========================================================================
             # ========== BE DYNAMIQUE (CONTACT BB20_MID) + PNL SÉCURISÉ RÉEL + ANTI-SPAM ==========
+            # ========================================================================
             try:
                 try:
                     be_enabled = str(database.get_setting('DYNAMIC_BE_ENABLED', 'true')).lower() == 'true'
@@ -5406,6 +5434,20 @@ def manage_open_positions(ex):
                     if entry > 0 and sl_current > 0:
                         be_status = pos.get('be_status', 'INACTIVE')
                         prev_be_status = be_status
+                        
+                        # ✅ CORRECTION 1 : ANTI-SPAM - Vérifier d'abord si déjà notifié
+                        try:
+                            meta = pos.get('meta', {})
+                            if isinstance(meta, str):
+                                import json
+                                meta = json.loads(meta)
+                            be_already_notified = meta.get('be_notified', False)
+                        except Exception:
+                            be_already_notified = False
+                        
+                        # Si BE déjà actif ET déjà notifié → SKIP complètement
+                        if be_status == 'ACTIVE' and be_already_notified:
+                            continue
                         
                         try:
                             # Les colonnes BB sont déjà calculées par utils.fetch_and_prepare_df()
@@ -5435,7 +5477,7 @@ def manage_open_positions(ex):
                                 h_val = float(last_n_high[i])
                                 l_val = float(last_n_low[i])
                                 
-                                # ✅ CORRECTION 3 : TOLÉRANCE RÉDUITE 0.2% → 0.05%
+                                # Tolérance 0.05% pour contact BB20_mid
                                 if is_long:
                                     if c_val >= bb20_mid_val * 0.9995 or h_val >= bb20_mid_val * 0.9995:
                                         touched_bb20_mid = True
@@ -5452,10 +5494,11 @@ def manage_open_positions(ex):
                             pnl_secured = 0.0
                             
                             if touched_bb20_mid and be_status != 'ACTIVE':
+                                # ✅ CORRECTION 2 : Utiliser buffer 0.5% (nouvelle valeur)
                                 try:
-                                    be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.001'))
+                                    be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.005'))  # ✅ 0.5% (was 0.001)
                                 except Exception:
-                                    be_offset_pct = 0.001
+                                    be_offset_pct = 0.005
                                 
                                 if is_long:
                                     want_sl = entry * (1.0 + be_offset_pct)
@@ -5497,17 +5540,7 @@ def manage_open_positions(ex):
                                     except Exception:
                                         pass
                                     
-                                    # ANTI-SPAM : Vérifier si déjà notifié
-                                    try:
-                                        meta = pos.get('meta', {})
-                                        if isinstance(meta, str):
-                                            import json
-                                            meta = json.loads(meta)
-                                        be_already_notified = meta.get('be_notified', False)
-                                    except Exception:
-                                        be_already_notified = False
-                                    
-                                    # NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
+                                    # ✅ CORRECTION 3 : NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
                                     if prev_be_status != 'ACTIVE' and not be_already_notified:
                                         try:
                                             remaining_qty = float(qty)
@@ -5537,7 +5570,7 @@ def manage_open_positions(ex):
                                                     remaining_qty=float(remaining_qty)
                                                 )
                                             
-                                            # MARQUER COMME NOTIFIÉ
+                                            # ✅ MARQUER COMME NOTIFIÉ POUR ÉVITER SPAM
                                             try:
                                                 if not isinstance(meta, dict):
                                                     meta = {}
