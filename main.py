@@ -325,73 +325,122 @@ async def _ws_sync_loop(ex_rest):
     else:
         _KEEPALIVE_SYMBOL = "BTC/USDT:USDT"
 
+    # ✅ CORRECTION : Compteurs d'échecs pour notification intelligente
+    positions_fail_count = 0
+    orders_fail_count = 0
+    NOTIFY_THRESHOLD = 5  # Notifier seulement après 5 échecs consécutifs
+
     # ------------ Loops robustes ------------
     async def watch_positions():
-        nonlocal ex_ws
+        nonlocal ex_ws, positions_fail_count
         attempt = 0
         while True:
             try:
                 await ex_ws.watch_positions()
                 attempt = 0  # reset backoff si ça vit
+                positions_fail_count = 0  # ✅ Reset compteur si succès
                 trader.sync_positions_with_exchange(ex_rest)
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                 msg = str(e)
                 if any(k in msg for k in ("1006", "1001", "Connection closed", "abnormal closure")):
-                    try:
-                        notifier.tg_send("⚠️ WS positions fermé (1006/1001). Reconnexion…")
-                    except Exception:
-                        pass
+                    # ✅ CORRECTION : Log console SEULEMENT (pas de Telegram)
+                    print(f"⚠️ WS positions fermé (1006/1001). Reconnexion automatique... (tentative {attempt + 1})")
+                    
                     ex_ws = await _recreate_exchange_safe(ex_ws)
                     attempt += 1
+                    positions_fail_count += 1
+                    
+                    # ✅ Notifier SEULEMENT si problème persistant (5+ échecs)
+                    if positions_fail_count >= NOTIFY_THRESHOLD:
+                        try:
+                            notifier.tg_send(f"⚠️ WS positions : {positions_fail_count} déconnexions consécutives. Surveillance active...")
+                            positions_fail_count = 0  # Reset après notification
+                        except Exception:
+                            pass
+                    
                     await _backoff_sleep(attempt)
                     continue
-                try:
-                    notifier.tg_send(f"⚠️ WS positions erreur réseau: {e}. Retry…")
-                except Exception:
-                    pass
+                
+                # Autres erreurs réseau (non 1006/1001)
+                print(f"⚠️ WS positions erreur réseau: {e}. Retry...")
                 attempt += 1
+                positions_fail_count += 1
+                
+                if positions_fail_count >= NOTIFY_THRESHOLD:
+                    try:
+                        notifier.tg_send(f"⚠️ WS positions : erreur réseau persistante ({e})")
+                        positions_fail_count = 0
+                    except Exception:
+                        pass
+                
                 await _backoff_sleep(attempt)
+                
             except Exception as e:
+                # Exceptions non-réseau (bugs code, etc.)
+                print(f"❌ WS positions exception: {e}. Restart loop...")
                 try:
-                    notifier.tg_send(f"❌ WS positions exception: {e}. Restart loop…")
+                    notifier.tg_send(f"❌ WS positions exception: {e}. Restart loop...")
                 except Exception:
                     pass
                 ex_ws = await _recreate_exchange_safe(ex_ws)
                 attempt = 0
+                positions_fail_count = 0
                 await asyncio.sleep(1.0)
 
     async def watch_orders():
-        nonlocal ex_ws
+        nonlocal ex_ws, orders_fail_count
         attempt = 0
         while True:
             try:
                 await ex_ws.watch_orders()
                 attempt = 0
+                orders_fail_count = 0  # ✅ Reset compteur si succès
                 trader.sync_positions_with_exchange(ex_rest)
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                 msg = str(e)
                 if any(k in msg for k in ("1006", "1001", "Connection closed", "abnormal closure")):
-                    try:
-                        notifier.tg_send("⚠️ WS orders fermé (1006/1001). Reconnexion…")
-                    except Exception:
-                        pass
+                    # ✅ CORRECTION : Log console SEULEMENT (pas de Telegram)
+                    print(f"⚠️ WS orders fermé (1006/1001). Reconnexion automatique... (tentative {attempt + 1})")
+                    
                     ex_ws = await _recreate_exchange_safe(ex_ws)
                     attempt += 1
+                    orders_fail_count += 1
+                    
+                    # ✅ Notifier SEULEMENT si problème persistant (5+ échecs)
+                    if orders_fail_count >= NOTIFY_THRESHOLD:
+                        try:
+                            notifier.tg_send(f"⚠️ WS orders : {orders_fail_count} déconnexions consécutives. Surveillance active...")
+                            orders_fail_count = 0  # Reset après notification
+                        except Exception:
+                            pass
+                    
                     await _backoff_sleep(attempt)
                     continue
-                try:
-                    notifier.tg_send(f"⚠️ WS orders erreur réseau: {e}. Retry…")
-                except Exception:
-                    pass
+                
+                # Autres erreurs réseau (non 1006/1001)
+                print(f"⚠️ WS orders erreur réseau: {e}. Retry...")
                 attempt += 1
+                orders_fail_count += 1
+                
+                if orders_fail_count >= NOTIFY_THRESHOLD:
+                    try:
+                        notifier.tg_send(f"⚠️ WS orders : erreur réseau persistante ({e})")
+                        orders_fail_count = 0
+                    except Exception:
+                        pass
+                
                 await _backoff_sleep(attempt)
+                
             except Exception as e:
+                # Exceptions non-réseau (bugs code, etc.)
+                print(f"❌ WS orders exception: {e}. Restart loop...")
                 try:
-                    notifier.tg_send(f"❌ WS orders exception: {e}. Restart loop…")
+                    notifier.tg_send(f"❌ WS orders exception: {e}. Restart loop...")
                 except Exception:
                     pass
                 ex_ws = await _recreate_exchange_safe(ex_ws)
                 attempt = 0
+                orders_fail_count = 0
                 await asyncio.sleep(1.0)
 
     # Keepalive public pour éviter certains NAT timeouts
