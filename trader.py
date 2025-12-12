@@ -4963,60 +4963,6 @@ def execute_partial_exit(ex, exit_info: Dict[str, Any]) -> bool:
         print(f"Erreur execute_partial_exit: {e}")
         return False
 
-def _detect_manual_tp_change(ex, pos: Dict[str, Any]) -> bool:
-    """
-    Détecte si l'utilisateur a modifié le TP manuellement.
-    
-    Compare TP DB vs TP exchange.
-    Si différence > 0.1% → TP manuel détecté.
-    
-    Returns:
-        True si TP manuel, False sinon
-    """
-    try:
-        symbol = pos['symbol']
-        tp_db = float(pos.get('tp_price', 0))
-        
-        if tp_db <= 0:
-            return False
-        
-        # Récupérer TP sur exchange
-        tp_ex, _ = _fetch_existing_tp_sl(ex, symbol)
-        
-        if not tp_ex:
-            return False
-        
-        tp_ex = float(tp_ex)
-        
-        # Calculer différence
-        diff_pct = abs(tp_ex - tp_db) / tp_db
-        
-        # Si différence > 0.1% → TP manuel
-        if diff_pct > 0.001:
-            # Marquer comme manuel dans meta
-            try:
-                meta = pos.get('meta', {})
-                if isinstance(meta, str):
-                    import json
-                    meta = json.loads(meta)
-                
-                meta['tp_manual'] = True
-                meta['tp_manual_price'] = tp_ex
-                
-                database.update_trade_meta(pos['id'], meta)
-                database.update_trade_tp(pos['id'], tp_ex)
-                
-                print(f"✋ {symbol} : TP manuel détecté ({tp_db:.6f} → {tp_ex:.6f})")
-                
-                return True
-            except Exception:
-                pass
-        
-        return False
-    
-    except Exception as e:
-        print(f"Erreur _detect_manual_tp_change: {e}")
-        return False
 
 def manage_open_positions(ex):
     """
