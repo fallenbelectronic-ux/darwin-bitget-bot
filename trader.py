@@ -4975,9 +4975,10 @@ def manage_open_positions(ex):
     
     ✅ CORRECTIONS FINALES :
     - Variable pnl_secured définie avant utilisation
-    - Gestion erreur talib (ImportError)
-    - Pyramiding : create_market_order_smart (CORRECTION CRITIQUE)
-    - Partial exits : create_market_order_smart (CORRECTION CRITIQUE)
+    - Migration TA-Lib → Colonnes DataFrame (utils.py)
+    - Pyramiding : create_market_order_smart
+    - Partial exits : create_market_order_smart
+    - TP DYNAMIQUE : Utilise adjust_tp_for_bb_offset
     """
     
     def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
@@ -5178,91 +5179,79 @@ def manage_open_positions(ex):
                 sl_price = float(pos.get('sl_price') or 0.0)
                 
                 if tp_price > 0:
-                    data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-                    if len(data_bars) >= 80:
-                        try:
-                            import pandas as pd
-                            import numpy as np
-                            import talib
+                    try:
+                        # ✅ MIGRATION : Les colonnes BB/ATR sont déjà calculées par utils.fetch_and_prepare_df()
+                        df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
+                        
+                        if df is None or len(df) < 80:
+                            raise Exception("DataFrame insuffisant pour TP dynamique")
+                        
+                        # Accès direct aux colonnes (déjà calculées par utils.py)
+                        last_row = df.iloc[-1]
+                        
+                        bb80_up_val = float(last_row.get('bb80_up', 0.0))
+                        bb80_lo_val = float(last_row.get('bb80_lo', 0.0))
+                        bb20_up_val = float(last_row.get('bb20_up', 0.0))
+                        bb20_lo_val = float(last_row.get('bb20_lo', 0.0))
+                        last_atr = float(last_row.get('atr', 0.0))
+                        
+                        if bb80_up_val <= 0 or bb80_lo_val <= 0 or bb20_up_val <= 0 or bb20_lo_val <= 0:
+                            raise Exception("Colonnes BB manquantes ou invalides")
+                        
+                        # ✅ CORRECTION : Déterminer bande selon régime
+                        if regime == 'Tendance':
+                            tp_raw = bb80_up_val if is_long else bb80_lo_val
+                        else:
+                            tp_raw = bb20_up_val if is_long else bb20_lo_val
+                        
+                        if tp_raw > 0:
+                            # ✅ CORRECTION : Utiliser fonction offset existante
+                            target_tp = adjust_tp_for_bb_offset(
+                                raw_tp=float(tp_raw),
+                                side=('buy' if is_long else 'sell'),
+                                atr=float(last_atr),
+                                ref_price=float(tp_raw)
+                            )
                             
-                            df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+                            current_tp = tp_price
                             
-                            bb80_up, _, bb80_lo = talib.BBANDS(df['close'].values, timeperiod=80, nbdevup=2, nbdevdn=2)
-                            bb20_up, _, bb20_lo = talib.BBANDS(df['close'].values, timeperiod=20, nbdevup=2, nbdevdn=2)
-                            atr_arr = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)
-                            
-                            bb80_up_val = float(bb80_up[-1]) if not np.isnan(bb80_up[-1]) else 0.0
-                            bb80_lo_val = float(bb80_lo[-1]) if not np.isnan(bb80_lo[-1]) else 0.0
-                            bb20_up_val = float(bb20_up[-1]) if not np.isnan(bb20_up[-1]) else 0.0
-                            bb20_lo_val = float(bb20_lo[-1]) if not np.isnan(bb20_lo[-1]) else 0.0
-                            last_atr = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
-                            
-                            try:
-                                offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.002'))
-                            except Exception:
-                                offset_pct = 0.002
-                            
-                            try:
-                                tp_atr_k = float(database.get_setting('TP_ATR_K', '0.5'))
-                            except Exception:
-                                tp_atr_k = 0.5
-                            
+                            # Vérifier amélioration significative
                             try:
                                 tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', '0.0005'))
                             except Exception:
                                 tp_update_eps = 0.0005
                             
-                            # Déterminer bande selon régime
-                            if regime == 'Tendance':
-                                ref = bb80_up_val if is_long else bb80_lo_val
+                            if is_long:
+                                improve = (target_tp < current_tp * (1.0 - tp_update_eps))
                             else:
-                                ref = bb20_up_val if is_long else bb20_lo_val
+                                improve = (target_tp > current_tp * (1.0 + tp_update_eps))
                             
-                            if ref > 0:
-                                eff_pct = max(offset_pct, (tp_atr_k * last_atr) / ref if ref > 0 else offset_pct)
+                            if improve:
+                                close_side = 'sell' if is_long else 'buy'
                                 
-                                if is_long:
-                                    target_tp = ref * (1.0 - eff_pct)
-                                else:
-                                    target_tp = ref * (1.0 + eff_pct)
+                                try:
+                                    market = ex.market(symbol) or {}
+                                    tick_size = _bitget_tick_size(market)
+                                except Exception:
+                                    tick_size = 0.0001
                                 
-                                current_tp = tp_price
+                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
                                 
-                                # Vérifier amélioration significative
-                                if is_long:
-                                    improve = (target_tp < current_tp * (1.0 - tp_update_eps))
-                                else:
-                                    improve = (target_tp > current_tp * (1.0 + tp_update_eps))
+                                sl_ok, tp_ok = _place_sl_tp_safe(
+                                    ex, symbol, close_side, qty,
+                                    sl=sl_price if sl_price > 0 else None,
+                                    tp=target_tp,
+                                    params=common_params,
+                                    is_long=is_long,
+                                    tick_size=tick_size
+                                )
                                 
-                                if improve:
-                                    close_side = 'sell' if is_long else 'buy'
-                                    
-                                    try:
-                                        market = ex.market(symbol) or {}
-                                        tick_size = _bitget_tick_size(market)
-                                    except Exception:
-                                        tick_size = 0.0001
-                                    
-                                    common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-                                    
-                                    sl_ok, tp_ok = _place_sl_tp_safe(
-                                        ex, symbol, close_side, qty,
-                                        sl=sl_price if sl_price > 0 else None,
-                                        tp=target_tp,
-                                        params=common_params,
-                                        is_long=is_long,
-                                        tick_size=tick_size
-                                    )
-                                    
-                                    if tp_ok:
-                                        database.update_trade_tp(pos['id'], float(target_tp))
-                                        print(f"✅ {symbol} TP dynamique : {current_tp:.4f} → {target_tp:.4f}")
-                        
-                        except ImportError:
-                            print(f"⚠️ {symbol} : talib non installé, TP dynamique skippé")
-                        except Exception as e:
-                            print(f"❌ Erreur TP dynamique {symbol}: {e}")
+                                if tp_ok:
+                                    database.update_trade_tp(pos['id'], float(target_tp))
+                                    print(f"✅ {symbol} TP dynamique : {current_tp:.4f} → {target_tp:.4f}")
+                    
+                    except Exception as e:
+                        print(f"❌ Erreur TP dynamique {symbol}: {e}")
             
             except Exception as e:
                 print(f"❌ Erreur TP dynamique {symbol}: {e}")
@@ -5500,146 +5489,143 @@ def manage_open_positions(ex):
                         be_status = pos.get('be_status', 'INACTIVE')
                         prev_be_status = be_status
                         
-                        data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                        
-                        if len(data_bars) >= 25:
+                        try:
+                            # ✅ MIGRATION : Les colonnes BB sont déjà calculées par utils.fetch_and_prepare_df()
+                            df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
+                            
+                            if df is None or len(df) < 25:
+                                raise Exception("DataFrame insuffisant pour BE dynamique")
+                            
+                            # Accès direct à la colonne bb20_mid
+                            bb20_mid_val = float(df.iloc[-1].get('bb20_mid', 0.0))
+                            
+                            if bb20_mid_val <= 0:
+                                raise Exception("Colonne bb20_mid manquante ou invalide")
+                            
                             try:
-                                import pandas as pd
-                                import numpy as np
-                                import talib
+                                be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', '2'))
+                            except Exception:
+                                be_lookback = 2
+                            
+                            last_n_close = df['close'].iloc[-be_lookback:].values
+                            last_n_high = df['high'].iloc[-be_lookback:].values
+                            last_n_low = df['low'].iloc[-be_lookback:].values
+                            
+                            touched_bb20_mid = False
+                            for i in range(len(last_n_close)):
+                                c_val = float(last_n_close[i])
+                                h_val = float(last_n_high[i])
+                                l_val = float(last_n_low[i])
                                 
-                                df = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                                df['close'] = pd.to_numeric(df['close'], errors='coerce')
+                                if is_long:
+                                    if c_val >= bb20_mid_val * 0.998 or h_val >= bb20_mid_val * 0.998:
+                                        touched_bb20_mid = True
+                                        break
+                                else:
+                                    if c_val <= bb20_mid_val * 1.002 or l_val <= bb20_mid_val * 1.002:
+                                        touched_bb20_mid = True
+                                        break
+                            
+                            improve_sl = False
+                            want_sl = sl_current
+                            
+                            # ✅ CORRECTION : Initialiser pnl_secured AVANT le bloc
+                            pnl_secured = 0.0
+                            
+                            if touched_bb20_mid and be_status != 'ACTIVE':
+                                try:
+                                    be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.001'))
+                                except Exception:
+                                    be_offset_pct = 0.001
                                 
-                                _, bb20_mid, _ = talib.BBANDS(df['close'].values, timeperiod=20, nbdevup=2, nbdevdn=2)
-                                bb20_mid_val = float(bb20_mid[-1]) if not np.isnan(bb20_mid[-1]) else 0.0
+                                if is_long:
+                                    want_sl = entry * (1.0 + be_offset_pct)
+                                else:
+                                    want_sl = entry * (1.0 - be_offset_pct)
+                                
+                                improve_sl = True
+                            
+                            # ✅ PROTECTION ANTI-RECUL
+                            if improve_sl and _sl_improves_or_equal(want_sl, sl_current, is_long):
+                                close_side = 'sell' if is_long else 'buy'
                                 
                                 try:
-                                    be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', '2'))
+                                    market = ex.market(symbol) or {}
+                                    tick_size = _bitget_tick_size(market)
                                 except Exception:
-                                    be_lookback = 2
+                                    tick_size = 0.0001
                                 
-                                last_n_close = df['close'].iloc[-be_lookback:].values
-                                last_n_high = df['high'].iloc[-be_lookback:].values
-                                last_n_low = df['low'].iloc[-be_lookback:].values
+                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
                                 
-                                touched_bb20_mid = False
-                                for i in range(len(last_n_close)):
-                                    c_val = float(last_n_close[i])
-                                    h_val = float(last_n_high[i])
-                                    l_val = float(last_n_low[i])
-                                    
-                                    if is_long:
-                                        if c_val >= bb20_mid_val * 0.998 or h_val >= bb20_mid_val * 0.998:
-                                            touched_bb20_mid = True
-                                            break
-                                    else:
-                                        if c_val <= bb20_mid_val * 1.002 or l_val <= bb20_mid_val * 1.002:
-                                            touched_bb20_mid = True
-                                            break
+                                sl_ok, tp_ok = _place_sl_tp_safe(
+                                    ex, symbol, close_side, qty,
+                                    sl=want_sl,
+                                    tp=float(pos.get('tp_price') or 0.0) if pos.get('tp_price') else None,
+                                    params=common_params,
+                                    is_long=is_long,
+                                    tick_size=tick_size
+                                )
                                 
-                                improve_sl = False
-                                want_sl = sl_current
-                                
-                                # ✅ CORRECTION : Initialiser pnl_secured AVANT le bloc
-                                pnl_secured = 0.0
-                                
-                                if touched_bb20_mid and be_status != 'ACTIVE':
-                                    try:
-                                        be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.001'))
-                                    except Exception:
-                                        be_offset_pct = 0.001
-                                    
-                                    if is_long:
-                                        want_sl = entry * (1.0 + be_offset_pct)
-                                    else:
-                                        want_sl = entry * (1.0 - be_offset_pct)
-                                    
-                                    improve_sl = True
-                                
-                                # ✅ PROTECTION ANTI-RECUL
-                                if improve_sl and _sl_improves_or_equal(want_sl, sl_current, is_long):
-                                    close_side = 'sell' if is_long else 'buy'
+                                if sl_ok:
+                                    database.update_trade_sl(pos['id'], float(want_sl))
                                     
                                     try:
-                                        market = ex.market(symbol) or {}
-                                        tick_size = _bitget_tick_size(market)
+                                        database.update_trade_to_breakeven(
+                                            pos['id'],
+                                            float(qty),
+                                            float(want_sl)
+                                        )
                                     except Exception:
-                                        tick_size = 0.0001
+                                        pass
                                     
-                                    common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
+                                    # ✅ VÉRIFIER SI DÉJÀ NOTIFIÉ (anti-spam)
+                                    try:
+                                        meta = pos.get('meta', {})
+                                        if isinstance(meta, str):
+                                            import json
+                                            meta = json.loads(meta)
+                                        be_already_notified = meta.get('be_notified', False)
+                                    except Exception:
+                                        be_already_notified = False
                                     
-                                    sl_ok, tp_ok = _place_sl_tp_safe(
-                                        ex, symbol, close_side, qty,
-                                        sl=want_sl,
-                                        tp=float(pos.get('tp_price') or 0.0) if pos.get('tp_price') else None,
-                                        params=common_params,
-                                        is_long=is_long,
-                                        tick_size=tick_size
-                                    )
-                                    
-                                    if sl_ok:
-                                        database.update_trade_sl(pos['id'], float(want_sl))
-                                        
+                                    # ✅ NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
+                                    if prev_be_status != 'ACTIVE' and not be_already_notified:
                                         try:
-                                            database.update_trade_to_breakeven(
-                                                pos['id'],
-                                                float(qty),
-                                                float(want_sl)
-                                            )
-                                        except Exception:
-                                            pass
-                                        
-                                        # ✅ VÉRIFIER SI DÉJÀ NOTIFIÉ (anti-spam)
-                                        try:
-                                            meta = pos.get('meta', {})
-                                            if isinstance(meta, str):
-                                                import json
-                                                meta = json.loads(meta)
-                                            be_already_notified = meta.get('be_notified', False)
-                                        except Exception:
-                                            be_already_notified = False
-                                        
-                                        # ✅ NOTIFIER SEULEMENT SI PAS DÉJÀ NOTIFIÉ
-                                        if prev_be_status != 'ACTIVE' and not be_already_notified:
-                                            try:
-                                                remaining_qty = float(qty)
-                                                entry_price_be = float(pos.get('entry_price') or 0.0)
-                                                be_price_placed = float(want_sl)
-                                                
-                                                # ✅ CALCUL PNL SÉCURISÉ RÉEL (BE - Entry)
-                                                if entry_price_be <= 0 or remaining_qty <= 0:
-                                                    pnl_secured = 0.0
+                                            remaining_qty = float(qty)
+                                            entry_price_be = float(pos.get('entry_price') or 0.0)
+                                            be_price_placed = float(want_sl)
+                                            
+                                            # ✅ CALCUL PNL SÉCURISÉ RÉEL (BE - Entry)
+                                            if entry_price_be <= 0 or remaining_qty <= 0:
+                                                pnl_secured = 0.0
+                                            else:
+                                                if is_long:
+                                                    pnl_secured = max(0.0, (be_price_placed - entry_price_be) * remaining_qty)
                                                 else:
-                                                    if is_long:
-                                                        pnl_secured = max(0.0, (be_price_placed - entry_price_be) * remaining_qty)
-                                                    else:
-                                                        pnl_secured = max(0.0, (entry_price_be - be_price_placed) * remaining_qty)
-                                                
-                                                if is_manual_trade:
-                                                    notifier.tg_send(
-                                                        f"🔵 **Trade Manuel → BE Activé**\n\n"
-                                                        f"📊 {symbol} {side}\n"
-                                                        f"$ PnL sécurisé : {pnl_secured:.2f} USDT\n"
-                                                        f"🛡️ SL déplacé au Break-Even"
-                                                    )
-                                                else:
-                                                    notifier.send_breakeven_notification(
-                                                        symbol=symbol,
-                                                        pnl_realised=float(pnl_secured),
-                                                        remaining_qty=float(remaining_qty)
-                                                    )
-                                            except Exception as e:
-                                                print(f"❌ Erreur notification BE {symbol}: {e}")
-                                        
-                                        print(f"✅ {symbol} BE activé : SL {sl_current:.4f} → {want_sl:.4f} (PnL sécurisé: {pnl_secured:.2f} USDT)")
-                                elif improve_sl:
-                                    print(f"⚠️ {symbol} BE rejeté (recul interdit : {want_sl:.4f} vs {sl_current:.4f})")
-                            
-                            except ImportError:
-                                print(f"⚠️ {symbol} : talib non installé, BE dynamique skippé")
-                            except Exception as e:
-                                print(f"❌ Erreur BE dynamique {symbol}: {e}")
+                                                    pnl_secured = max(0.0, (entry_price_be - be_price_placed) * remaining_qty)
+                                            
+                                            if is_manual_trade:
+                                                notifier.tg_send(
+                                                    f"🔵 **Trade Manuel → BE Activé**\n\n"
+                                                    f"📊 {symbol} {side}\n"
+                                                    f"$ PnL sécurisé : {pnl_secured:.2f} USDT\n"
+                                                    f"🛡️ SL déplacé au Break-Even"
+                                                )
+                                            else:
+                                                notifier.send_breakeven_notification(
+                                                    symbol=symbol,
+                                                    pnl_realised=float(pnl_secured),
+                                                    remaining_qty=float(remaining_qty)
+                                                )
+                                        except Exception as e:
+                                            print(f"❌ Erreur notification BE {symbol}: {e}")
+                                    
+                                    print(f"✅ {symbol} BE activé : SL {sl_current:.4f} → {want_sl:.4f} (PnL sécurisé: {pnl_secured:.2f} USDT)")
+                            elif improve_sl:
+                                print(f"⚠️ {symbol} BE rejeté (recul interdit : {want_sl:.4f} vs {sl_current:.4f})")
+                        
+                        except Exception as e:
+                            print(f"❌ Erreur BE dynamique {symbol}: {e}")
             
             except Exception as e:
                 print(f"❌ Erreur BE dynamique {symbol}: {e}")
