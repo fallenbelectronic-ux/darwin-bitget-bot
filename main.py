@@ -481,8 +481,9 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     """
     Sélectionne le meilleur signal en attente, marque en DB (pris / non pris) et exécute le meilleur.
     
-    ✅ MODIFICATION : Tri par (heure de détection, puis RR) au lieu de RR seul.
-    Cela permet de prioriser les signaux détectés plus tôt dans l'heure.
+    ✅ MODIFICATIONS :
+    - Tri par (heure de détection, puis RR) au lieu de RR seul
+    - Filtrage RR absurdes avec validate_rr_realistic()
     """
     from state import get_pending_signals, clear_pending_signals
     pendings = list(get_pending_signals().values())
@@ -508,13 +509,42 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         print("   -> Aucun signal n'a été re-validé.")
         return
 
-    # ✅ MODIFICATION : Tri par (candle_timestamp, puis RR décroissant)
+    # Tri par (candle_timestamp, puis RR décroissant)
     # Priorité 1 : Signal détecté plus tôt (timestamp)
     # Priorité 2 : Meilleur RR si même timestamp
     validated = sorted(
         validated,
         key=lambda x: (x.get('candle_timestamp', pd.Timestamp(0)), -x['signal']['rr'])
     )
+    
+    # ========================================================================
+    # ✅ NOUVEAU : FILTRAGE RR ABSURDES
+    # ========================================================================
+    
+    valid_signals = []
+    
+    for v in validated:
+        if trader.validate_rr_realistic(v['signal'], max_rr=20.0):
+            valid_signals.append(v)
+        else:
+            # Logger le signal rejeté
+            try:
+                sym = v.get('symbol', 'N/A')
+                rr = v['signal'].get('rr', 0)
+                print(f"⚠️ Signal {sym} rejeté: RR={rr:.2f} (hors limites)")
+            except Exception:
+                pass
+    
+    validated = valid_signals
+    
+    if not validated:
+        print("⚠️ Aucun signal valide après filtrage RR")
+        return
+    
+    # ========================================================================
+    # FIN FILTRAGE RR
+    # ========================================================================
+    
     best = validated[0]
     print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f}, Heure: {best.get('candle_timestamp')})")
 
