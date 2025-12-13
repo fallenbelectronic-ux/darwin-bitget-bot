@@ -491,7 +491,56 @@ def detect_market_regime(ex) -> str:
     except Exception as e:
         print(f"Erreur detect_market_regime: {e}")
         return 'NEUTRAL'
-
+def validate_rr_realistic(signal: Dict[str, Any], max_rr: float = 20.0) -> bool:
+    """
+    Valide que le RR est dans une plage réaliste.
+    
+    Args:
+        signal: Dictionnaire du signal avec entry, sl, tp, rr
+        max_rr: RR maximum acceptable (défaut 20)
+    
+    Returns:
+        True si RR valide, False sinon
+    """
+    try:
+        rr = float(signal.get('rr', 0) or 0)
+        entry = float(signal.get('entry', 0) or 0)
+        sl = float(signal.get('sl', 0) or 0)
+        tp = float(signal.get('tp', 0) or 0)
+        
+        # Vérification 1 : RR dans la plage [0, max_rr]
+        if rr <= 0 or rr > max_rr:
+            print(f"❌ RR invalide: {rr:.2f} (max={max_rr})")
+            return False
+        
+        # Vérification 2 : Distance SL minimale (0.1% de l'entry)
+        min_sl_distance = entry * 0.001  # 0.1%
+        sl_distance = abs(entry - sl)
+        
+        if sl_distance < min_sl_distance:
+            print(f"❌ SL trop proche de l'entry: {sl_distance:.8f} < {min_sl_distance:.8f}")
+            print(f"   Entry={entry:.6f}, SL={sl:.6f}, TP={tp:.6f}")
+            return False
+        
+        # Vérification 3 : Recalcul RR pour vérifier cohérence
+        side = str(signal.get('side', '')).lower()
+        
+        if side == 'buy':
+            calc_rr = (tp - entry) / (entry - sl) if (entry - sl) != 0 else 0
+        else:  # sell
+            calc_rr = (entry - tp) / (sl - entry) if (sl - entry) != 0 else 0
+        
+        # Tolérance 5% entre RR annoncé et calculé
+        if abs(calc_rr - rr) / max(rr, 0.01) > 0.05:
+            print(f"⚠️ Incohérence RR: annoncé={rr:.2f}, calculé={calc_rr:.2f}")
+            print(f"   Entry={entry:.6f}, SL={sl:.6f}, TP={tp:.6f}, Side={side}")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Erreur validation RR: {e}")
+        return False
 
 def adapt_strategy_to_regime(regime: str) -> dict:
     """
