@@ -185,7 +185,7 @@ def tg_show_signals_pending(limit: int = 50):
     
 def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]) -> None:
     """
-    Message Telegram propre pour un signal détecté (sans impacter le reste) + UPSERT en DB (state=PENDING).
+    Message Telegram propre pour un signal détecté + UPSERT en DB (state=PENDING).
     Envoie une image si charting renvoie un buffer, sinon texte seul.
     """
     try:
@@ -197,7 +197,7 @@ def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]
         rr = signal.get("rr")
         ts = int(signal.get("ts") or int(time.time() * 1000))
 
-        # --- Persist PENDING in DB (clé logique: symbol/side/timeframe/ts)
+        # --- Persist PENDING in DB ---
         try:
             if side in ("buy", "sell"):
                 database.upsert_signal_pending(
@@ -225,18 +225,67 @@ def send_signal_notification(symbol: str, timeframe: str, signal: Dict[str, Any]
 
         msg = "\n".join(lines)
 
+        # ✅ NOUVEAU : GÉNÉRATION GRAPHIQUE AVEC DEBUG COMPLET
+        img = None
+        chart_error = None
+        
         try:
-            img = charting.generate_trade_chart(symbol, None, signal)
-        except Exception:
-            img = None
+            print(f"📊 Tentative génération graphique pour {symbol}...")
+            
+            # Import explicite
+            import charting
+            
+            # Vérifier que la fonction existe
+            if not hasattr(charting, 'generate_trade_chart'):
+                chart_error = "Fonction generate_trade_chart introuvable dans charting.py"
+                print(f"❌ {chart_error}")
+            else:
+                # Appeler avec logging
+                img = charting.generate_trade_chart(symbol, None, signal)
+                
+                if img is None:
+                    chart_error = "charting.generate_trade_chart a retourné None"
+                    print(f"⚠️ {chart_error}")
+                elif not isinstance(img, io.BytesIO):
+                    chart_error = f"Type invalide: {type(img)} au lieu de BytesIO"
+                    print(f"❌ {chart_error}")
+                    img = None
+                else:
+                    # Vérifier que le buffer n'est pas vide
+                    img.seek(0)
+                    if len(img.read()) == 0:
+                        chart_error = "Buffer BytesIO vide"
+                        print(f"❌ {chart_error}")
+                        img = None
+                    else:
+                        img.seek(0)  # Reset pour envoi
+                        print(f"✅ Graphique généré: {len(img.getvalue())} bytes")
+        
+        except ImportError as e:
+            chart_error = f"Erreur import charting: {e}"
+            print(f"❌ {chart_error}")
+        except Exception as e:
+            chart_error = f"Erreur génération: {type(e).__name__}: {e}"
+            print(f"❌ {chart_error}")
+            import traceback
+            traceback.print_exc()
 
+        # Envoi avec ou sans graphique
         if img is not None:
+            print(f"📤 Envoi signal avec graphique pour {symbol}")
             tg_send_with_photo(photo_buffer=img, caption=msg)
         else:
+            # Ajouter info debug dans le message si pas de graphique
+            if chart_error:
+                msg += f"\n\n<i>⚠️ Graphique indisponible: {_escape(chart_error[:100])}</i>"
+            
+            print(f"📤 Envoi signal SANS graphique pour {symbol} (raison: {chart_error})")
             tg_send(msg)
-    except Exception:
-        pass
-
+            
+    except Exception as e:
+        print(f"❌ Erreur send_signal_notification: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ==============================================================================
 # FONCTIONS DE COMMUNICATION DE BASE
@@ -1167,8 +1216,8 @@ def tg_show_signals_6h(limit_per_page: int = 10, page: int = 1, chat_id: Optiona
         edit_main("<b>⏱️ Signaux valides (6h)</b>\n\nAucun signal validé respectant les critères RR.", keyboard)
         return
 
-    # ✅ TRI PAR RR DÉCROISSANT (du plus élevé au plus bas)
-    signals = sorted(signals, key=lambda s: float(s.get("rr", 0) or 0.0), reverse=True)
+    # ✅ NOUVEAU (tri par timestamp uniquement - plus récent en premier)
+    signals = sorted(signals, key=lambda s: int(s.get("ts", 0) or 0), reverse=True)
 
     # ========================================================================
     # PAGINATION
