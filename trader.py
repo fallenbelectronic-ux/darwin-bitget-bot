@@ -2208,39 +2208,6 @@ def _current_mark_price(exchange, symbol: str) -> float:
             except Exception: pass
     return float(t.get("last") or t.get("close") or 0.0)
 
-def _validate_sl_for_side(side: str, sl_price: float, current_mark: float, tick_size: float) -> float:
-    """
-    Bitget STRICT : 
-      - SHORT (sell) : SL > current_mark (protection au-dessus)
-      - LONG (buy)   : SL < current_mark (protection en-dessous)
-    
-    Ajoute 5 ticks de marge de sécurité (au lieu de 2) pour éviter rejets.
-    """
-    if tick_size <= 0: 
-        tick_size = 0.0001
-    
-    # Marge de sécurité augmentée : 5 ticks au lieu de 2
-    safety_margin = 5.0 * tick_size
-    
-    side_clean = str(side).lower().strip()
-    
-    if side_clean in ("sell", "short"):
-        # SHORT : SL doit être > current_mark
-        if sl_price <= current_mark:
-            sl_price = current_mark + safety_margin
-        # Double vérification après ajustement
-        elif sl_price <= current_mark + tick_size:
-            sl_price = current_mark + safety_margin
-    else:
-        # LONG : SL doit être < current_mark
-        if sl_price >= current_mark:
-            sl_price = current_mark - safety_margin
-        # Double vérification après ajustement
-        elif sl_price >= current_mark - tick_size:
-            sl_price = current_mark - safety_margin
-    
-    return sl_price
-
 def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float], tp: Optional[float], 
                       params: dict, is_long: bool, tick_size: float) -> tuple:
     """
@@ -2272,7 +2239,7 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
             # Validation STRICTE avant envoi
             if mark > 0:
                 sl_validated = _validate_sl_for_side(
-                    ('buy' if is_long else 'sell'),
+                    side,
                     float(sl),
                     mark,
                     tick_size
@@ -2350,13 +2317,11 @@ def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float
                 err_msg = str(e_tp)
                 
                 # ✅ CORRECTION : DÉTECTER ERREUR 40836 MAIS NE PAS NOTIFIER
-                # La notification sera gérée par manage_open_positions qui marque le flag
                 if '40836' in err_msg or 'take profit price' in err_msg.lower():
                     print(f"⚠️ {symbol} : TP invalide (40836)")
                     print(f"   Prix TP : {tp_validated:.6f}")
                     print(f"   Prix mark : {mark:.6f}")
                     print(f"   Quantité : {qty:.6f}")
-                    # ✅ PAS de notification ici pour éviter spam
                 else:
                     # Log détaillé pour autres erreurs
                     print(f"❌ {symbol} : Erreur placement TP")
@@ -5133,6 +5098,207 @@ def _update_exchange_sl(ex, symbol: str, side: str, new_sl: float):
     except Exception as e:
         raise Exception(f"Erreur _update_exchange_sl: {e}")
 
+def _validate_be_strict(symbol: str, side: str, new_sl: float, entry_price: float, current_sl: float = None) -> Tuple[bool, str]:
+    """
+    Validation STRICTE du breakeven selon 2 règles absolues:
+    
+    RÈGLE 1: BE ne peut JAMAIS être à l'entry price
+             Doit être minimum 0.7% dans la direction profitable
+    
+    RÈGLE 2: Un SL ne peut JAMAIS reculer
+             Une fois déplacé forward, il est verrouillé
+    
+    Args:
+        symbol: Paire de trading
+        side: 'buy' ou 'sell'
+        new_sl: Nouveau stop-loss proposé
+        entry_price: Prix d'entrée de la position
+        current_sl: Stop-loss actuel (None si premier placement)
+    
+    Returns:
+        (bool, str): (True, "") si valide, (False, "raison") sinon
+    """
+    MIN_BE_BUFFER = 0.007  # 0.7% minimum pour couvrir tous les frais
+    
+    # ===== RÈGLE 1: BE JAMAIS À L'ENTRY =====
+    side_clean = str(side).lower().strip()
+    
+    if side_clean in ('buy', 'long'):
+        # LONG: BE doit être AU-DESSUS de l'entry
+        distance_pct = (new_sl - entry_price) / entry_price if entry_price > 0 else 0
+        
+        if distance_pct <= 0:
+            return False, f"❌ BE invalide: SL={new_sl:.6f} est EN-DESSOUS de l'entry={entry_price:.6f} pour un LONG"
+        
+        if distance_pct < MIN_BE_BUFFER:
+            return False, f"❌ BE trop proche: {distance_pct*100:.2f}% < minimum requis {MIN_BE_BUFFER*100:.1f}%"
+    
+    else:  # sell/short
+        # SHORT: BE doit être EN-DESSOUS de l'entry
+        distance_pct = (entry_price - new_sl) / entry_price if entry_price > 0 else 0
+        
+        if distance_pct <= 0:
+            return False, f"❌ BE invalide: SL={new_sl:.6f} est AU-DESSUS de l'entry={entry_price:.6f} pour un SHORT"
+        
+        if distance_pct < MIN_BE_BUFFER:
+            return False, f"❌ BE trop proche: {distance_pct*100:.2f}% < minimum requis {MIN_BE_BUFFER*100:.1f}%"
+    
+    # ===== RÈGLE 2: SL NE RECULE JAMAIS =====
+    if current_sl is not None and current_sl > 0:
+        if side_clean in ('buy', 'long'):
+            # LONG: nouveau SL doit être >= ancien SL (monte ou reste)
+            if new_sl < current_sl:
+                return False, f"❌ SL recule: nouveau={new_sl:.6f} < actuel={current_sl:.6f} pour LONG"
+        else:
+            # SHORT: nouveau SL doit être <= ancien SL (descend ou reste)
+            if new_sl > current_sl:
+                return False, f"❌ SL recule: nouveau={new_sl:.6f} > actuel={current_sl:.6f} pour SHORT"
+    
+    # ===== VALIDATION OK =====
+    profit_pct = distance_pct * 100
+    print(f"✅ BE valide pour {symbol} {side}: SL={new_sl:.6f}, profit sécurisé={profit_pct:.2f}%")
+    return True, ""
+
+
+def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float], tp: Optional[float], 
+                      params: dict, is_long: bool, tick_size: float) -> tuple:
+    """
+    Place SL et TP de manière robuste avec détection des erreurs Bitget.
+    
+    ✅ CORRECTIONS :
+    - Continue à placer le TP même si le SL échoue
+    - Détecte erreur 40836 (TP invalide)
+    - NE notifie PAS en cas d'erreur 40836 (évite spam, gestion par caller)
+    
+    Returns:
+        (sl_success: bool, tp_success: bool)
+    """
+    sl_ok = False
+    tp_ok = False
+    
+    # Récupérer mark price pour validation
+    try:
+        mark = _current_mark_price(ex, symbol)
+    except Exception:
+        mark = 0.0
+    
+    # ========================================================================
+    # ========== PLACEMENT SL ==========
+    # ========================================================================
+    
+    if sl and qty > 0:
+        try:
+            # Validation STRICTE avant envoi
+            if mark > 0:
+                sl_validated = _validate_sl_for_side(
+                    ('buy' if is_long else 'sell'),
+                    float(sl),
+                    mark,
+                    tick_size
+                )
+            else:
+                sl_validated = float(sl)
+            
+            # Vérification finale des règles Bitget
+            sl_invalid = False
+            
+            if is_long:
+                # LONG : SL < mark
+                if sl_validated >= mark:
+                    print(f"⚠️ {symbol} LONG : SL {sl_validated:.6f} >= mark {mark:.6f} → skip SL")
+                    sl_invalid = True
+            else:
+                # SHORT : SL > mark
+                if sl_validated <= mark:
+                    print(f"⚠️ {symbol} SHORT : SL {sl_validated:.6f} <= mark {mark:.6f} → skip SL")
+                    sl_invalid = True
+            
+            # Ne pas placer le SL si invalide, mais CONTINUER vers le TP
+            if not sl_invalid:
+                # Placement SL
+                sl_side = 'sell' if is_long else 'buy'
+                
+                try:
+                    ex.create_order(
+                        symbol, 'market', sl_side, qty, price=None,
+                        params={**params, 'stopLossPrice': float(sl_validated), 'triggerType': 'mark'}
+                    )
+                    sl_ok = True
+                    print(f"✅ {symbol} : SL placé à {sl_validated:.6f}")
+                
+                except Exception as e_sl:
+                    err_msg = str(e_sl)
+                    # Détection erreur 40836 (SL invalide)
+                    if '40836' in err_msg or 'stop loss price' in err_msg.lower():
+                        print(f"⚠️ {symbol} : SL invalide (40836) → SL skippé, mais TP va être tenté")
+                    else:
+                        print(f"❌ {symbol} : Erreur SL → {e_sl}")
+            
+            else:
+                print(f"⚠️ {symbol} : SL invalide (règles Bitget) → SL skippé, mais TP va être tenté")
+        
+        except Exception as e:
+            print(f"❌ {symbol} : Erreur validation SL → {e}")
+            # ✅ IMPORTANT : Ne pas return ici, continuer vers le TP
+    
+    # ========================================================================
+    # ========== PLACEMENT TP ==========
+    # ========================================================================
+    
+    if tp and qty > 0:
+        try:
+            tp_side = 'sell' if is_long else 'buy'
+            
+            # Validation TP
+            try:
+                tp_validated = _prepare_validated_tp(ex, symbol, tp_side, float(tp))
+            except Exception as e_val:
+                print(f"⚠️ {symbol} : Erreur validation TP → {e_val}")
+                tp_validated = float(tp)
+            
+            # Placement TP
+            try:
+                ex.create_order(
+                    symbol, 'market', tp_side, qty, price=None,
+                    params={**params, 'takeProfitPrice': float(tp_validated), 'triggerType': 'mark'}
+                )
+                tp_ok = True
+                print(f"✅ {symbol} : TP placé à {tp_validated:.6f}")
+            
+            except Exception as e_tp:
+                err_msg = str(e_tp)
+                
+                # ✅ CORRECTION : DÉTECTER ERREUR 40836 MAIS NE PAS NOTIFIER
+                # La notification sera gérée par manage_open_positions qui marque le flag
+                if '40836' in err_msg or 'take profit price' in err_msg.lower():
+                    print(f"⚠️ {symbol} : TP invalide (40836)")
+                    print(f"   Prix TP : {tp_validated:.6f}")
+                    print(f"   Prix mark : {mark:.6f}")
+                    print(f"   Quantité : {qty:.6f}")
+                    # ✅ PAS de notification ici pour éviter spam
+                else:
+                    # Log détaillé pour autres erreurs
+                    print(f"❌ {symbol} : Erreur placement TP")
+                    print(f"   Prix TP : {tp_validated:.6f}")
+                    print(f"   Prix mark : {mark:.6f}")
+                    print(f"   Quantité : {qty:.6f}")
+                    print(f"   Erreur : {err_msg}")
+        
+        except Exception as e:
+            print(f"❌ {symbol} : Erreur TP → {e}")
+    
+    # ========================================================================
+    # ========== RÉSUMÉ ==========
+    # ========================================================================
+    
+    if sl and qty > 0 and not sl_ok:
+        print(f"⚠️ {symbol} : SL NON placé")
+    
+    if tp and qty > 0 and not tp_ok:
+        print(f"⚠️ {symbol} : TP NON placé")
+    
+    return sl_ok, tp_ok
+
 def manage_open_positions(ex):
     """
     Gère toutes les positions ouvertes :
@@ -5144,7 +5310,7 @@ def manage_open_positions(ex):
     - Pyramiding
     - Partial exits
     
-    ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
+    ✅ PROTECTION SL : Utilise _validate_be_strict() pour empêcher le SL de reculer
     ✅ CORRECTION BE : Détection IMMÉDIATE si prix traverse BB20_mid (sans attendre bougie close)
     ✅ PROTECTION : Toutes les divisions sont protégées contre division par zéro
     ✅ CORRECTION BB : Utilise bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
@@ -5273,7 +5439,6 @@ def manage_open_positions(ex):
             
             if not tp_placement_failed:
                 try:
-                    # ✅ CORRECTION : Utiliser bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
                     bb20_upper = float(df['bb20_up'].iloc[-1])
                     bb20_lower = float(df['bb20_lo'].iloc[-1])
                     bb80_upper = float(df['bb80_up'].iloc[-1])
@@ -5324,7 +5489,7 @@ def manage_open_positions(ex):
 
             # ========================================================================
             # 4. BREAKEVEN DYNAMIQUE (contact BB20_mid IMMÉDIAT)
-            # ✅ CORRECTION FINALE : Détection via prix actuel (sans attendre bougie close)
+            # ✅ CORRECTION : Utilise _validate_be_strict() + _place_sl_tp_safe()
             # ========================================================================
             if breakeven_status == 'PENDING':
                 should_activate_be = False
@@ -5427,10 +5592,18 @@ def manage_open_positions(ex):
                     traceback.print_exc()
 
                 if should_activate_be:
-                    # ✅ PROTECTION SL : Vérifier que le BE ne recule pas
-                    if not _validate_sl_never_backward(trade_id, be_sl, side):
-                        print(f"   🛡️ Breakeven refusé (protection anti-recul) - Trade #{trade_id}")
-                        continue
+                    # ✅ VALIDATION STRICTE BE (Règles 1 & 2)
+                    is_valid, reason = _validate_be_strict(
+                        symbol=symbol,
+                        side=side,
+                        new_sl=be_sl,
+                        entry_price=entry_price,
+                        current_sl=sl_price
+                    )
+                    
+                    if not is_valid:
+                        print(f"   🛡️ Breakeven refusé : {reason}")
+                        continue  # Passer à la position suivante
 
                     remaining_qty = quantity
 
@@ -5461,8 +5634,31 @@ def manage_open_positions(ex):
 
                     print(f"   🛡️ Breakeven activé pour {symbol} (PnL sécurisé: {pnl_secured:.2f} USDT)")
 
+                    # ✅ PLACEMENT BE SUR EXCHANGE avec _place_sl_tp_safe()
                     try:
-                        _update_exchange_sl(ex, symbol, side, be_sl)
+                        market = ex.market(symbol) or {}
+                        tick_size = _bitget_tick_size(market)
+                        
+                        close_side = 'sell' if is_long else 'buy'
+                        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+                        
+                        sl_ok, _ = _place_sl_tp_safe(
+                            ex=ex,
+                            symbol=symbol,
+                            side=side,
+                            qty=remaining_qty,
+                            sl=be_sl,
+                            tp=None,  # Ne touche pas au TP
+                            params=common_params,
+                            is_long=is_long,
+                            tick_size=tick_size
+                        )
+                        
+                        if sl_ok:
+                            print(f"   ✅ BE placé sur exchange : {be_sl:.6f}")
+                        else:
+                            print(f"   ⚠️ BE non placé sur exchange (mais enregistré en DB)")
+
                     except Exception as e:
                         print(f"   ⚠️ Erreur placement SL BE sur exchange : {e}")
 
