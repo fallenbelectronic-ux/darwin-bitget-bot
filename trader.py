@@ -424,16 +424,39 @@ def detect_market_regime(ex) -> str:
             enable_regime = True
         
         if not enable_regime:
+            print("📊 Régime marché DÉSACTIVÉ → Mode NEUTRAL")
             return 'NEUTRAL'
         
-        # Analyser BTC sur 1d
-        try:
-            btc_df = utils.fetch_and_prepare_df(ex, 'BTC/USDT:USDT', '1d')
-        except Exception:
-            btc_df = None
+        # ====== ESSAIS MULTIPLES SYMBOLES BTC ======
+        btc_symbols = [
+            'BTC/USDT:USDT',  # Futures linéaires (standard)
+            'BTCUSDT',        # Spot
+            'BTC/USDT',       # Alternative futures
+            'BTCUSD'          # Perpetual inverse
+        ]
         
-        if btc_df is None or len(btc_df) < 50:
-            print("⚠️ Impossible analyser BTC pour régime marché")
+        btc_df = None
+        btc_symbol_used = None
+        
+        for symbol in btc_symbols:
+            try:
+                print(f"📊 Tentative analyse régime avec {symbol}...")
+                btc_df = utils.fetch_and_prepare_df(ex, symbol, '1d')
+                
+                if btc_df is not None and len(btc_df) >= 30:
+                    btc_symbol_used = symbol
+                    print(f"✅ Données BTC récupérées : {symbol} ({len(btc_df)} bougies)")
+                    break
+                else:
+                    print(f"⚠️ {symbol} : Données insuffisantes ({len(btc_df) if btc_df is not None else 0} bougies)")
+            except Exception as e:
+                print(f"⚠️ {symbol} : Erreur → {e}")
+                continue
+        
+        # Aucun symbole n'a fonctionné
+        if btc_df is None or len(btc_df) < 30:
+            print("❌ Impossible analyser BTC pour régime marché (tous symboles échoués)")
+            print("   → Mode NEUTRAL : Paramètres standards")
             return 'NEUTRAL'
         
         last = btc_df.iloc[-1]
@@ -442,8 +465,9 @@ def detect_market_regime(ex) -> str:
         # Calculer SMA20 et SMA50
         try:
             sma20 = float(btc_df['close'].rolling(20).mean().iloc[-1])
-            sma50 = float(btc_df['close'].rolling(50).mean().iloc[-1])
-        except Exception:
+            sma50 = float(btc_df['close'].rolling(50).mean().iloc[-1]) if len(btc_df) >= 50 else float(btc_df['close'].rolling(30).mean().iloc[-1])
+        except Exception as e:
+            print(f"❌ Erreur calcul SMA : {e}")
             return 'NEUTRAL'
         
         # ====== DÉTERMINER TENDANCE BTC ======
@@ -484,13 +508,21 @@ def detect_market_regime(ex) -> str:
         except Exception:
             pass
         
-        print(f"📊 Régime marché détecté : {regime} (BTC: {btc_trend}, Vol: {volatility})")
+        print(f"📊 Régime marché détecté : {regime}")
+        print(f"   Symbole utilisé : {btc_symbol_used}")
+        print(f"   BTC Tendance : {btc_trend}")
+        print(f"   Volatilité : {volatility}")
+        print(f"   Close : {close:.2f} | SMA20 : {sma20:.2f} | SMA50 : {sma50:.2f}")
         
         return regime
     
     except Exception as e:
-        print(f"Erreur detect_market_regime: {e}")
+        print(f"❌ Erreur detect_market_regime: {e}")
+        import traceback
+        traceback.print_exc()
         return 'NEUTRAL'
+
+
 def validate_rr_realistic(signal: Dict[str, Any], max_rr: float = 20.0) -> bool:
     """
     Valide que le RR est dans une plage réaliste.
@@ -544,66 +576,74 @@ def validate_rr_realistic(signal: Dict[str, Any], max_rr: float = 20.0) -> bool:
 
 def adapt_strategy_to_regime(regime: str) -> dict:
     """
-    Adapte les paramètres de trading selon le régime de marché.
+    Adapte UNIQUEMENT les paramètres non-critiques selon le régime de marché.
+    
+    ✅ PARAMÈTRES FIXES (JAMAIS MODIFIÉS) :
+    - risk_pct : TOUJOURS 2.0%
+    - min_rr : TOUJOURS 2.8
+    
+    ✅ PARAMÈTRES AJUSTABLES :
+    - max_positions : Nombre max de positions ouvertes
+    - enable_ct : Activation/désactivation contre-tendance
     
     Args:
         regime: Régime détecté par detect_market_regime()
     
     Returns:
-        Dict avec paramètres adaptés (max_pos, min_rr, etc.)
+        Dict avec paramètres adaptés
     """
     try:
+        # ====== PARAMÈTRES FIXES (NON NÉGOCIABLES) ======
+        FIXED_RISK_PCT = 2.0   # JAMAIS MODIFIÉ
+        FIXED_MIN_RR = 2.8     # JAMAIS MODIFIÉ
+        
+        # Paramètres de base
         params = {
             'max_positions': 3,
-            'min_rr': 3.0,
-            'risk_pct': 2.0,
+            'min_rr': FIXED_MIN_RR,      # ✅ TOUJOURS 2.8
+            'risk_pct': FIXED_RISK_PCT,  # ✅ TOUJOURS 2.0%
             'enable_ct': True,
         }
         
+        # ====== AJUSTEMENTS SELON RÉGIME (UNIQUEMENT max_positions et enable_ct) ======
+        
         if regime == 'BEAR':
-            # Mode défensif
+            # Mode défensif : moins de positions, CT désactivé
             params['max_positions'] = 2
-            params['min_rr'] = 4.0
-            params['risk_pct'] = 1.5
             params['enable_ct'] = False  # Pas de contre-tendance en bear
-            print("🛡️ Mode BEAR : Paramètres défensifs activés")
+            print(f"🛡️ Mode BEAR : max_positions=2, CT désactivé (risk={FIXED_RISK_PCT}%, RR={FIXED_MIN_RR})")
         
         elif regime == 'BULL_STABLE':
-            # Mode agressif
+            # Mode agressif : plus de positions
             params['max_positions'] = 5
-            params['min_rr'] = 2.5
-            params['risk_pct'] = 2.0
             params['enable_ct'] = True
-            print("🚀 Mode BULL_STABLE : Paramètres agressifs activés")
+            print(f"🚀 Mode BULL_STABLE : max_positions=5 (risk={FIXED_RISK_PCT}%, RR={FIXED_MIN_RR})")
         
         elif regime == 'BULL_VOLATILE':
-            # Mode prudent
+            # Mode prudent : positions limitées
             params['max_positions'] = 3
-            params['min_rr'] = 3.5
-            params['risk_pct'] = 1.5
             params['enable_ct'] = True
-            print("⚠️ Mode BULL_VOLATILE : Paramètres prudents activés")
+            print(f"⚠️ Mode BULL_VOLATILE : max_positions=3 (risk={FIXED_RISK_PCT}%, RR={FIXED_MIN_RR})")
         
         elif regime == 'RANGE':
-            # Mode scalp
+            # Mode scalp : positions limitées, CT actif
             params['max_positions'] = 2
-            params['min_rr'] = 3.0
-            params['risk_pct'] = 1.0
-            params['enable_ct'] = True  # CT meilleur en range
-            print("📊 Mode RANGE : Paramètres scalp activés")
+            params['enable_ct'] = True
+            print(f"📊 Mode RANGE : max_positions=2 (risk={FIXED_RISK_PCT}%, RR={FIXED_MIN_RR})")
         
         else:  # NEUTRAL
-            # Paramètres standards (défaut)
-            print("🔄 Mode NEUTRAL : Paramètres standards")
+            # Paramètres standards
+            print(f"🔄 Mode NEUTRAL : max_positions=3 (risk={FIXED_RISK_PCT}%, RR={FIXED_MIN_RR})")
         
         return params
     
     except Exception as e:
         print(f"Erreur adapt_strategy_to_regime: {e}")
+        # Fallback safe
         return {
             'max_positions': 3,
-            'min_rr': 3.0,
-            'risk_pct': 2.0,
+            'min_rr': 2.8,   # ✅ TOUJOURS 2.8
+            'risk_pct': 2.0,  # ✅ TOUJOURS 2.0%
             'enable_ct': True,
         }
 
@@ -3101,11 +3141,14 @@ def execute_signal_with_gates(
     """
     Exécute un signal après validation des gates et attente bougie suivante.
     
-    ✅ CORRECTIONS :
-    - Attend l'ouverture de la bougie suivante avant entry
-    - Enregistre raison si signal skipped
-    - Calcul RR correct
-    - GATE 3 : Excès volatilité BB80 (toujours actif)
+    ✅ GATES ACTIFS (bloquent UNIQUEMENT ouverture auto) :
+    - GATE 0 : Session trading (weekend + asie)
+    - GATE 1 : Corrélation/secteur
+    - GATE 2 : Réaction obligatoire
+    - GATE 3 : Excès volatilité BB80
+    - GATE 4 : RR minimum
+    
+    ✅ Trades manuels : Aucun blocage, gestion normale
     
     Returns:
         (bool, str): (True si trade exécuté, message)
@@ -3117,7 +3160,7 @@ def execute_signal_with_gates(
     entry_px = float(entry_price)
     
     # ========================================================================
-    # ✅ VÉRIFICATION SKIP_REASON (SI SIGNAL DÉJÀ INVALIDE)
+    # VÉRIFICATION SKIP_REASON (SI SIGNAL DÉJÀ INVALIDE)
     # ========================================================================
     
     skip_reason = signal.get('skip_reason')
@@ -3125,7 +3168,6 @@ def execute_signal_with_gates(
     if skip_reason:
         print(f"⏭️ {symbol} {side.upper()} — {skip_reason}")
         
-        # Enregistrer en DB comme SKIPPED avec raison
         _update_signal_state(
             symbol=symbol,
             timeframe=timeframe,
@@ -3137,7 +3179,6 @@ def execute_signal_with_gates(
             sl=signal.get('sl')
         )
         
-        # Notification Telegram
         try:
             notifier.tg_notify_signal_skipped(
                 symbol, side, entry_px,
@@ -3148,6 +3189,28 @@ def execute_signal_with_gates(
             )
         except Exception:
             pass
+        
+        return False, skip_reason
+    
+    # ========================================================================
+    # ✅ GATE 0 : FILTRE SESSION (WEEKEND + ASIE 2h-8h UTC)
+    # ========================================================================
+    
+    if not is_good_trading_session():
+        skip_reason = "Session invalide (weekend ou asie 2h-8h UTC)"
+        
+        print(f"⏸️ {symbol} {side.upper()} — {skip_reason}")
+        
+        _update_signal_state(
+            symbol=symbol,
+            timeframe=timeframe,
+            signal=signal,
+            entry_price=entry_px,
+            state="VALID_SKIPPED",
+            reason="bad_trading_session",
+            tp=signal.get('tp'),
+            sl=signal.get('sl')
+        )
         
         return False, skip_reason
     
@@ -3181,7 +3244,7 @@ def execute_signal_with_gates(
         return False, "Rejeté: données insuffisantes pour valider l'entrée."
     
     # ========================================================================
-    # GATE CORRELATION/SECTEUR
+    # ✅ GATE 1 : CORRELATION/SECTEUR
     # ========================================================================
     
     if not check_correlation_risk(ex, symbol, side):
@@ -3189,7 +3252,7 @@ def execute_signal_with_gates(
         return False, "Rejeté: risque correlation/secteur trop élevé."
     
     # ========================================================================
-    # GATE RÉACTION OBLIGATOIRE (TENDANCE + CT)
+    # ✅ GATE 2 : RÉACTION OBLIGATOIRE (TENDANCE + CT)
     # ========================================================================
     
     passed_reaction = _check_reaction_before_entry(df, signal, is_long)
@@ -3245,7 +3308,7 @@ def execute_signal_with_gates(
         return False, err
     
     # ========================================================================
-    # GATE RR MINIMUM
+    # ✅ GATE 4 : RR MINIMUM
     # ========================================================================
     
     rr_calc = calculate_rr(entry_px, sl, tp, side)
