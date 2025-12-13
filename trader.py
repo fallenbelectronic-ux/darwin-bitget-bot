@@ -5023,6 +5023,7 @@ def manage_open_positions(ex):
     ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
     ✅ CORRECTION BE : Utilise BB20_mid au moment du contact pour calculer le PnL sécurisé
     ✅ PROTECTION : Toutes les divisions sont protégées contre division par zéro
+    ✅ CORRECTION BB : Utilise bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
     """
     try:
         sync_positions_with_exchange(ex)
@@ -5148,10 +5149,11 @@ def manage_open_positions(ex):
             
             if not tp_placement_failed:
                 try:
-                    bb20_upper = float(df['bb20_upper'].iloc[-1])
-                    bb20_lower = float(df['bb20_lower'].iloc[-1])
-                    bb80_upper = float(df['bb80_upper'].iloc[-1])
-                    bb80_lower = float(df['bb80_lower'].iloc[-1])
+                    # ✅ CORRECTION : Utiliser bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
+                    bb20_upper = float(df['bb20_up'].iloc[-1])
+                    bb20_lower = float(df['bb20_lo'].iloc[-1])
+                    bb80_upper = float(df['bb80_up'].iloc[-1])
+                    bb80_lower = float(df['bb80_lo'].iloc[-1])
 
                     # Offset TP (Bollinger)
                     try:
