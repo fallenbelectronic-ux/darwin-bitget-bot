@@ -665,6 +665,7 @@ def get_config_menu_keyboard() -> Dict:
             [{"text": "🗓️ Changer Stratégie", "callback_data": "manage_strategy"}],
             [{"text": "🔄 Réinitialiser Stats", "callback_data": "reset_stats"}],
             [{"text": "🛑 Redémarrer le bot", "callback_data": "restart_bot"}],
+            [{"text": "📦 Backup Dropbox", "callback_data": "backup_dropbox"}],
             [{"text": "↩️ Retour au Menu Principal", "callback_data": "main_menu"}]
         ]
     }
@@ -852,11 +853,78 @@ def handle_restart_cancel(callback_query: Dict[str, Any]) -> None:
     except Exception as e:
         tg_send_error("Redémarrage (annulation)", e)
 
+def handle_backup_dropbox_callback(callback_query: Dict[str, Any]):
+    """
+    Handler pour le bouton "Backup Dropbox".
+    
+    ACTIONS :
+    1. Acknowledge le callback
+    2. Lance run_backup() en thread
+    3. Notifie résultat (succès/échec)
+    """
+    try:
+        # 1. Acknowledge
+        tg_answer_callback_query(callback_query.get('id'), "")
+    except Exception:
+        pass
+    
+    # 2. Notification lancement
+    tg_send("🔄 <b>Backup Dropbox en cours...</b>")
+    
+    # 3. Lancer backup en thread
+    import threading
+    
+    def _run_backup_thread():
+        """Thread worker pour exécuter le backup."""
+        try:
+            # Import dynamique pour éviter dépendance circulaire
+            import dropbox_backup
+            
+            # Exécuter le backup
+            success = dropbox_backup.run_backup()
+            
+            # Notification résultat
+            if success:
+                tg_send(
+                    "✅ <b>Backup Dropbox réussi !</b>\n\n"
+                    "📁 Fichiers sauvegardés :\n"
+                    "  • Base de données complète\n"
+                    "  • Export CSV trades\n"
+                    "  • Résumé statistiques\n\n"
+                    "☁️ Fichiers disponibles sur Dropbox"
+                )
+            else:
+                tg_send(
+                    "❌ <b>Backup Dropbox échoué</b>\n\n"
+                    "Vérifiez :\n"
+                    "  • Token Dropbox valide\n"
+                    "  • Connexion internet\n"
+                    "  • Logs pour détails"
+                )
+        
+        except Exception as e:
+            # Erreur critique
+            import traceback
+            error_details = str(e)[:200]
+            
+            tg_send(
+                f"❌ <b>Erreur Backup Dropbox</b>\n\n"
+                f"<code>{error_details}</code>\n\n"
+                f"Consultez les logs pour plus de détails"
+            )
+            
+            print(f"❌ Erreur backup thread: {e}")
+            traceback.print_exc()
+    
+    # Lancer le thread
+    backup_thread = threading.Thread(target=_run_backup_thread, daemon=True)
+    backup_thread.start()
 def try_handle_inline_callback(event: Any) -> bool:
     """
-    Route Offset/Signaux/Restart/Stats + PAGINATION.
+    Route Offset/Signaux/Restart/Stats/Backup + PAGINATION.
     
     ⚡ OPTIMISATION : answerCallbackQuery IMMÉDIAT pour tous les callbacks.
+    ✅ AJOUT : Handler backup_dropbox
     """
     if isinstance(event, list):
         handled = False
@@ -970,6 +1038,11 @@ def try_handle_inline_callback(event: Any) -> bool:
         # ----- RESET STATS -----
         if cmd == "reset_stats":
             tg_reset_stats(callback_query=data)
+            return True
+
+        # ----- ✅ BACKUP DROPBOX (NOUVEAU) -----
+        if cmd == "backup_dropbox":
+            handle_backup_dropbox_callback(data)
             return True
 
         return False
