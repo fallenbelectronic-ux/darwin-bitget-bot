@@ -476,7 +476,6 @@ def _telegram_command_handlers() -> Dict[str, Any]:
         "help":       notifier.send_commands_help,      
     }
 
-
 def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     """
     Sélectionne le meilleur signal en attente, marque en DB (pris / non pris) et exécute le meilleur.
@@ -484,45 +483,56 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
     ✅ MODIFICATIONS :
     - Tri par (heure de détection, puis RR) au lieu de RR seul
     - Filtrage RR absurdes avec validate_rr_realistic()
+    - Gestion robuste des signaux sans 'rr'
     """
     from state import get_pending_signals, clear_pending_signals
+    
     pendings = list(get_pending_signals().values())
     if not pendings:
         return
+    
     print(f"-> Analyse de {len(pendings)} signaux en attente...")
-
+    
+    # ========================================================================
+    # 1. RE-VALIDATION DES SIGNAUX (bougie suivante close)
+    # ========================================================================
     validated = []
     for pending in pendings:
         try:
             symbol = pending['symbol']
             df = utils.fetch_and_prepare_df(ex, symbol, TIMEFRAME)
+            
             # Re-valide si on a une bougie close postérieure à la bougie du signal
             if df is None or df.index[-1] <= pending.get('candle_timestamp'):
                 continue
+            
             validated.append({**pending, 'df': df})
         except Exception:
             continue
-
+    
     clear_pending_signals()
-
+    
     if not validated:
         print("   -> Aucun signal n'a été re-validé.")
         return
-
-    # Tri par (candle_timestamp, puis RR décroissant)
+    
+    # ========================================================================
+    # 2. TRI PAR (TIMESTAMP, RR DÉCROISSANT)
+    # ========================================================================
     # Priorité 1 : Signal détecté plus tôt (timestamp)
     # Priorité 2 : Meilleur RR si même timestamp
     validated = sorted(
         validated,
-        key=lambda x: (x.get('candle_timestamp', pd.Timestamp(0)), -x['signal']['rr'])
+        key=lambda x: (
+            x.get('candle_timestamp', pd.Timestamp(0)), 
+            -x.get('signal', {}).get('rr', 0)
+        )
     )
     
     # ========================================================================
-    # ✅ NOUVEAU : FILTRAGE RR ABSURDES
+    # 3. FILTRAGE RR ABSURDES
     # ========================================================================
-    
     valid_signals = []
-    
     for v in validated:
         if trader.validate_rr_realistic(v['signal'], max_rr=20.0):
             valid_signals.append(v)
@@ -542,46 +552,100 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         return
     
     # ========================================================================
-    # FIN FILTRAGE RR
+    # 4. SÉLECTION DU MEILLEUR SIGNAL (premier après tri)
     # ========================================================================
-    
     best = validated[0]
-    print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f}, Heure: {best.get('candle_timestamp')})")
-
-    # Marquage DB pour TOUS les validés (non pris)
+    
+    print(f"✅ Meilleur signal sélectionné : {best['symbol']} "
+          f"(RR={best['signal'].get('rr', 0):.2f}, "
+          f"timestamp={best.get('candle_timestamp')})")
+    
+    # ========================================================================
+    # 5. MARQUAGE EN DB (PRIS vs NON PRIS)
+    # ========================================================================
     for v in validated:
         try:
-            ts = int(pd.Timestamp(v.get('candle_timestamp')).value // 10**6)
-        except Exception:
-            ts = int(time.time() * 1000)
-        database.mark_signal_validated(v['symbol'], ts, {**v['signal'], "timeframe": TIMEFRAME}, taken=False)
-
-    # Exécute le meilleur
-    try:
-        symbol = best['symbol']
-        sig    = best['signal']
-        
-        # Calcul du timestamp
-        try:
-            ts = int(pd.Timestamp(best.get('candle_timestamp')).value // 10**6)
-        except Exception:
-            ts = int(time.time() * 1000)
-        
-        # Exécute d'abord
-        ok, msg = trader.execute_trade(ex, symbol, TIMEFRAME, sig)
-        
-        # Marque "pris" SEULEMENT si succès
-        if ok:
-            database.mark_signal_validated(symbol, ts, {**sig, "timeframe": TIMEFRAME}, taken=True)
-            print(f"   ✅ Trade exécuté et marqué comme PRIS: {symbol}")
-        else:
-            # Reste marqué comme VALID_SKIPPED (déjà fait dans la boucle précédente)
-            notifier.tg_send(f"⚠️ Exécution du meilleur signal non aboutie: {msg}")
-            print(f"   ❌ Trade NON exécuté, reste SKIPPED: {symbol}")
+            symbol = v['symbol']
+            signal = v['signal']
+            ts_sig = int(signal.get('ts', 0) or 0)
             
+            if ts_sig <= 0:
+                continue
+            
+            # Préparer payload commun
+            payload = {
+                'side': signal.get('side', '-'),
+                'regime': str(signal.get('regime', '-')),
+                'rr': float(signal.get('rr', 0.0)),
+                'entry': float(signal.get('entry', 0.0)),
+                'sl': float(signal.get('sl', 0.0)),
+                'tp': float(signal.get('tp', 0.0)),
+                'timeframe': TIMEFRAME,
+                'signal': dict(signal or {})
+            }
+            
+            # Marquer PRIS si c'est le meilleur, sinon NON PRIS
+            if v is best:
+                database.mark_signal_validated(
+                    symbol=symbol,
+                    ts=ts_sig,
+                    payload=payload,
+                    taken=True  # ✅ PRIS
+                )
+            else:
+                # Ajouter raison du rejet
+                skip_reason = "Autre signal prioritaire (timestamp ou RR)"
+                payload['reason'] = skip_reason
+                
+                database.mark_signal_validated(
+                    symbol=symbol,
+                    ts=ts_sig,
+                    payload=payload,
+                    taken=False  # ❌ NON PRIS
+                )
+                
+                # Notification Telegram pour signaux non pris
+                try:
+                    notifier.tg_notify_signal_skipped(
+                        symbol, 
+                        signal.get('side', 'N/A'),
+                        signal.get('entry', 0),
+                        signal.get('sl', 0),
+                        signal.get('tp', 0),
+                        signal.get('rr', 0),
+                        skip_reason
+                    )
+                except Exception:
+                    pass
+        
+        except Exception as e:
+            print(f"❌ Erreur marquage signal {v.get('symbol', 'N/A')}: {e}")
+    
+    # ========================================================================
+    # 6. EXÉCUTION DU MEILLEUR SIGNAL
+    # ========================================================================
+    try:
+        success, msg = trader.execute_trade(
+            ex=ex,
+            symbol=best['symbol'],
+            timeframe=TIMEFRAME,
+            signal=best['signal']
+        )
+        
+        if success:
+            print(f"✅ Trade exécuté avec succès : {best['symbol']}")
+        else:
+            print(f"⚠️ Échec exécution trade {best['symbol']}: {msg}")
+    
     except Exception as e:
-        notifier.tg_send_error("Exécution du meilleur signal", e)
-        print(f"   ❌ Exception lors de l'exécution: {e}")
+        print(f"❌ Erreur exécution trade {best['symbol']}: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        try:
+            notifier.tg_send(f"❌ Erreur exécution trade {best['symbol']}: {e}")
+        except Exception:
+            pass
 
 
 def process_callback_query(callback_query: Dict):
