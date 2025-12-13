@@ -478,7 +478,12 @@ def _telegram_command_handlers() -> Dict[str, Any]:
 
 
 def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
-    """Sélectionne le meilleur signal en attente (RR max), marque en DB (pris / non pris) et exécute le meilleur."""
+    """
+    Sélectionne le meilleur signal en attente, marque en DB (pris / non pris) et exécute le meilleur.
+    
+    ✅ MODIFICATION : Tri par (heure de détection, puis RR) au lieu de RR seul.
+    Cela permet de prioriser les signaux détectés plus tôt dans l'heure.
+    """
     from state import get_pending_signals, clear_pending_signals
     pendings = list(get_pending_signals().values())
     if not pendings:
@@ -503,9 +508,15 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         print("   -> Aucun signal n'a été re-validé.")
         return
 
-    # Choix du meilleur par RR
-    best = sorted(validated, key=lambda x: x['signal']['rr'], reverse=True)[0]
-    print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f})")
+    # ✅ MODIFICATION : Tri par (candle_timestamp, puis RR décroissant)
+    # Priorité 1 : Signal détecté plus tôt (timestamp)
+    # Priorité 2 : Meilleur RR si même timestamp
+    validated = sorted(
+        validated,
+        key=lambda x: (x.get('candle_timestamp', pd.Timestamp(0)), -x['signal']['rr'])
+    )
+    best = validated[0]
+    print(f"   -> MEILLEUR SIGNAL: {best['symbol']} (RR: {best['signal']['rr']:.2f}, Heure: {best.get('candle_timestamp')})")
 
     # Marquage DB pour TOUS les validés (non pris)
     for v in validated:
@@ -526,10 +537,10 @@ def select_and_execute_best_pending_signal(ex: ccxt.Exchange):
         except Exception:
             ts = int(time.time() * 1000)
         
-        # ✅ CORRECTION : Exécute d'abord
+        # Exécute d'abord
         ok, msg = trader.execute_trade(ex, symbol, TIMEFRAME, sig)
         
-        # ✅ CORRECTION : Marque "pris" SEULEMENT si succès
+        # Marque "pris" SEULEMENT si succès
         if ok:
             database.mark_signal_validated(symbol, ts, {**sig, "timeframe": TIMEFRAME}, taken=True)
             print(f"   ✅ Trade exécuté et marqué comme PRIS: {symbol}")
@@ -1163,6 +1174,15 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
             now_utc = datetime.now(timezone.utc)
             curr_hour = now_utc.hour
             curr_day = now_utc.day
+            
+            # ✅ MODIFICATION 1 : Market Regime Detection (1x par heure)
+            if curr_hour != last_hour:
+                try:
+                    regime = trader.detect_market_regime(ex)
+                    trader.adapt_strategy_to_regime(regime)
+                    print(f"🌐 Market Regime détecté : {regime}")
+                except Exception as e:
+                    print(f"⚠️ Erreur Market Regime : {e}")
 
             try:
                 desired_size = int(database.get_setting('UNIVERSE_SIZE', UNIVERSE_SIZE))
@@ -1199,7 +1219,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
 
             from state import set_pending_signal, get_pending_signals
             
-            # ✅ CORRECTION : Compteur de signaux détectés
             print(f"--- Scan de {len(universe)} paires ---")
             signals_found_this_scan = 0
             
@@ -1209,7 +1228,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
 
                 signal = trader.detect_signal(symbol, df)
                 if signal:
-                    # ✅ CORRECTION : Incrémenter le compteur
                     signals_found_this_scan += 1
                     
                     try:
@@ -1243,7 +1261,6 @@ def trading_engine_loop(ex: ccxt.Exchange, universe: List[str]):
                     if not any(s['symbol'] == symbol and s['timestamp'] > time.time() - 3600 for s in _recent_signals):
                         _recent_signals.append({'timestamp': time.time(), 'symbol': symbol, 'signal': signal})
 
-            # ✅ CORRECTION : Afficher le résultat du scan
             print(f"--- Scan terminé : {signals_found_this_scan} signal(s) détecté(s) ---\n")
             
             time.sleep(LOOP_DELAY)
