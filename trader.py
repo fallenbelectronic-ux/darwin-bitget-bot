@@ -4766,1018 +4766,601 @@ def execute_partial_exit(ex, exit_info: Dict[str, Any]) -> bool:
         print(f"Erreur execute_partial_exit: {e}")
         return False
 
-def update_dynamic_tp_and_trailing_be(ex, pos: dict) -> bool:
+def update_dynamic_tp_and_trailing_be(
+    ex, trade_id: int, symbol: str, side: str, df,
+    entry_price: float, current_price: float, tp_price: float, sl_price: float,
+    regime: str, breakeven_status: str
+):
     """
-    TP Mobile + BE Suiveur en phase finale (>80% vers TP).
+    Mise à jour dynamique du TP et du SL suiveur (BE mobile) quand >80% TP atteint.
     
-    MÉCANIQUE AVANCÉE :
-    1. Quand >80% du chemin vers TP initial
-    2. TP AVANCE progressivement (s'éloigne du prix)
-    3. BE SUIT le prix avec offset serré
-    4. Plus on progresse, plus l'offset BE se resserre
+    ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour le BE suiveur
     
-    EXEMPLE LONG :
-    - Entry : 100
-    - TP initial : 130 (RR x3)
-    - Prix actuel : 124 (80% du chemin)
-    - TP mobile : 135 (+5 par rapport à initial)
-    - BE suiveur : 122 (prix - 1.6%)
+    Logique :
+    - TP suit BB80 (trend) ou BB20 (counter-trend) avec offset
+    - BE suit BB20_mid pour sécuriser progressivement
     
     Args:
-        ex: Exchange
-        pos: Position DB
-    
-    Returns:
-        True si TP/BE ajustés
+        ex: Exchange CCXT
+        trade_id: ID du trade
+        symbol: Symbole (ex: BTC/USDT:USDT)
+        side: 'buy' ou 'sell'
+        df: DataFrame avec indicateurs
+        entry_price: Prix d'entrée
+        current_price: Prix actuel
+        tp_price: TP actuel
+        sl_price: SL actuel
+        regime: TREND ou COUNTER_TREND
+        breakeven_status: PENDING ou ACTIVE
     """
     try:
-        # ====== FEATURE ACTIVÉE ? ======
-        
-        try:
-            enable_dynamic_tp = str(database.get_setting('ENABLE_DYNAMIC_TP_FINAL', 'true')).lower() == 'true'
-        except Exception:
-            enable_dynamic_tp = True
-        
-        if not enable_dynamic_tp:
-            return False
-        
-        # ====== RÉCUPÉRER INFOS POSITION ======
-        
-        symbol = pos.get('symbol')
-        side = pos.get('side', '').lower()
         is_long = (side == 'buy')
         
-        entry_price = float(pos.get('entry_price', 0))
-        tp_initial = float(pos.get('tp_price', 0))
-        sl_current = float(pos.get('sl_price', 0))
-        qty = float(pos.get('quantity', 0))
+        # Récupérer Bollinger Bands
+        bb20_upper = float(df['bb20_upper'].iloc[-1])
+        bb20_lower = float(df['bb20_lower'].iloc[-1])
+        bb20_mid = float(df['bb20_mid'].iloc[-1]) if 'bb20_mid' in df.columns else float(df['sma20'].iloc[-1])
+        bb80_upper = float(df['bb80_upper'].iloc[-1])
+        bb80_lower = float(df['bb80_lower'].iloc[-1])
         
-        if entry_price <= 0 or tp_initial <= 0 or sl_current <= 0 or qty <= 0:
-            return False
-        
-        # ====== VÉRIFIER SI BE ACTIF ======
-        
-        be_status = str(pos.get('breakeven_status', '')).upper()
-        
-        if be_status != 'ACTIVE':
-            # TP mobile ne s'active QUE si BE déjà actif
-            return False
-        
-        # ====== RÉCUPÉRER PRIX ACTUEL ======
-        
+        # Offsets
         try:
-            ticker = ex.fetch_ticker(symbol)
-            current_price = float(ticker.get('last') or ticker.get('close') or 0)
+            tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0100'))
         except Exception:
-            return False
+            tp_offset_pct = 0.01
         
-        if current_price <= 0:
-            return False
-        
-        # ====== CALCULER PROGRESSION VERS TP ======
+        # ========================================================================
+        # 1. TP MOBILE (suit les Bollinger Bands)
+        # ========================================================================
+        new_tp = None
         
         if is_long:
-            if tp_initial <= entry_price:
-                return False
-            progress = (current_price - entry_price) / (tp_initial - entry_price)
+            if regime == 'COUNTER_TREND':
+                new_tp = bb20_lower * (1 - tp_offset_pct)
+            else:
+                new_tp = bb80_upper * (1 + tp_offset_pct)
         else:
-            if tp_initial >= entry_price:
-                return False
-            progress = (entry_price - current_price) / (entry_price - tp_initial)
+            if regime == 'COUNTER_TREND':
+                new_tp = bb20_upper * (1 + tp_offset_pct)
+            else:
+                new_tp = bb80_lower * (1 - tp_offset_pct)
         
-        progress = max(0.0, min(1.0, progress))
-        
-        # ====== SEUIL D'ACTIVATION (>80% DU TP) ======
-        
-        try:
-            activation_threshold = float(database.get_setting('DYNAMIC_TP_ACTIVATION_PCT', '80'))
-        except Exception:
-            activation_threshold = 80.0
-        
-        if progress < (activation_threshold / 100.0):
-            # Pas encore en phase finale
-            return False
-        
-        # ====== CALCULER NOUVEAU TP (AVANCE) ======
-        
-        try:
-            tp_extension_pct = float(database.get_setting('DYNAMIC_TP_EXTENSION_PCT', '3.0'))
-        except Exception:
-            tp_extension_pct = 3.0
-        
-        # Plus on progresse, plus le TP s'éloigne
-        # Exemple : progress=0.9 → extension x1.8 de tp_extension_pct
-        extension_multiplier = 1.0 + (progress - (activation_threshold / 100.0)) * 2.0
-        
-        if is_long:
-            new_tp = tp_initial * (1.0 + (tp_extension_pct / 100.0) * extension_multiplier)
-        else:
-            new_tp = tp_initial * (1.0 - (tp_extension_pct / 100.0) * extension_multiplier)
-        
-        # ====== CALCULER NOUVEAU BE (SUIT LE PRIX) ======
-        
-        try:
-            # Offset BE de base (ex: 2%)
-            base_offset = float(database.get_setting('DYNAMIC_BE_BASE_OFFSET_PCT', '2.0'))
-        except Exception:
-            base_offset = 2.0
-        
-        # Plus on progresse, plus l'offset se resserre
-        # Exemple : progress=0.95 → offset x0.5 (1% au lieu de 2%)
-        tightening_factor = 1.0 - ((progress - (activation_threshold / 100.0)) * 2.5)
-        tightening_factor = max(0.3, min(1.0, tightening_factor))
-        
-        effective_offset = (base_offset / 100.0) * tightening_factor
-        
-        if is_long:
-            new_be = current_price * (1.0 - effective_offset)
-        else:
-            new_be = current_price * (1.0 + effective_offset)
-        
-        # ====== VÉRIFICATIONS ANTI-RECUL ======
-        
-        # 1. BE ne doit JAMAIS reculer
-        if is_long:
-            if new_be < sl_current:
-                new_be = sl_current
-        else:
-            if new_be > sl_current:
-                new_be = sl_current
-        
-        # 2. TP ne doit JAMAIS reculer
-        if is_long:
-            if new_tp < tp_initial:
-                new_tp = tp_initial
-        else:
-            if new_tp > tp_initial:
-                new_tp = tp_initial
-        
-        # ====== VÉRIFIER SI CHANGEMENT SIGNIFICATIF ======
-        
-        try:
-            min_tp_move = float(database.get_setting('DYNAMIC_TP_MIN_MOVE_PCT', '0.3'))
-        except Exception:
-            min_tp_move = 0.3
-        
-        try:
-            min_be_move = float(database.get_setting('DYNAMIC_BE_MIN_MOVE_PCT', '0.2'))
-        except Exception:
-            min_be_move = 0.2
-        
-        tp_changed = abs((new_tp - tp_initial) / tp_initial) >= (min_tp_move / 100.0)
-        be_changed = abs((new_be - sl_current) / sl_current) >= (min_be_move / 100.0)
-        
-        if not tp_changed and not be_changed:
-            # Changements trop faibles
-            return False
-        
-        # ====== PLACER ORDRES SUR EXCHANGE ======
-        
-        close_side = 'sell' if is_long else 'buy'
-        
-        try:
-            market = ex.market(symbol) or {}
-            tick_size = _bitget_tick_size(market)
-        except Exception:
-            tick_size = 0.0001
-        
-        try:
-            mark_now = _current_mark_price(ex, symbol)
-            new_be = _validate_sl_for_side(side, float(new_be), mark_now, tick_size)
-        except Exception:
-            pass
-        
-        try:
-            new_tp = _prepare_validated_tp(ex, symbol, close_side, float(new_tp))
-        except Exception:
-            pass
-        
-        try:
-            new_be = float(ex.price_to_precision(symbol, new_be))
-            new_tp = float(ex.price_to_precision(symbol, new_tp))
-            qty_prec = float(ex.amount_to_precision(symbol, qty))
-        except Exception:
-            qty_prec = qty
-        
-        common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-        
-        sl_ok, tp_ok = _place_sl_tp_safe(
-            ex, symbol, close_side, qty_prec,
-            sl=float(new_be),
-            tp=float(new_tp),
-            params=common_params,
-            is_long=is_long,
-            tick_size=tick_size
-        )
-        
-        # ====== METTRE À JOUR DB ======
-        
-        if sl_ok and be_changed:
-            try:
-                database.update_trade_sl(pos['id'], float(new_be))
-                print(f"✅ {symbol} BE suiveur : {sl_current:.6f} → {new_be:.6f}")
-            except Exception as e:
-                print(f"❌ Erreur update BE: {e}")
-        
-        if tp_ok and tp_changed:
-            try:
-                database.update_trade_tp(pos['id'], float(new_tp))
-                print(f"✅ {symbol} TP mobile : {tp_initial:.6f} → {new_tp:.6f}")
-            except Exception as e:
-                print(f"❌ Erreur update TP: {e}")
-        
-        # ====== NOTIFICATION (1X SEULEMENT) ======
-        
-        if (sl_ok and be_changed) or (tp_ok and tp_changed):
-            try:
-                meta = pos.get('meta', {})
-                if isinstance(meta, str):
-                    import json
-                    meta = json.loads(meta)
-                
-                if not isinstance(meta, dict):
-                    meta = {}
-                
-                # Éviter spam : notifier seulement 1x quand feature s'active
-                already_notified = meta.get('dynamic_tp_notified', False)
-                
-                if not already_notified:
-                    # Calculer distance au TP mobile
-                    if is_long:
-                        distance_to_tp = ((new_tp - current_price) / current_price) * 100
-                        profit_secured_pct = ((new_be - entry_price) / entry_price) * 100
-                    else:
-                        distance_to_tp = ((current_price - new_tp) / current_price) * 100
-                        profit_secured_pct = ((entry_price - new_be) / entry_price) * 100
-                    
-                    notifier.tg_send(
-                        f"🚀 **TP MOBILE ACTIVÉ**\n\n"
-                        f"📊 {symbol} {side.upper()}\n"
-                        f"📈 Progression : {progress*100:.1f}%\n\n"
-                        f"🎯 **TP avancé** :\n"
-                        f"  • Initial : {tp_initial:.6f}\n"
-                        f"  • Mobile : {new_tp:.6f}\n"
-                        f"  • Distance : {distance_to_tp:+.2f}%\n\n"
-                        f"🛡️ **BE suiveur** :\n"
-                        f"  • Ancien : {sl_current:.6f}\n"
-                        f"  • Nouveau : {new_be:.6f}\n"
-                        f"  • Profit sécurisé : +{profit_secured_pct:.2f}%\n\n"
-                        f"💡 Plus tu avances, plus le TP s'éloigne\n"
-                        f"et plus le BE se resserre !"
-                    )
-                    
-                    meta['dynamic_tp_notified'] = True
-                    database.update_trade_meta(pos['id'], meta)
+        # Vérifier que le TP s'améliore (écart >0.1%)
+        if new_tp is not None and abs(new_tp - tp_price) / tp_price > 0.001:
+            # Pour LONG : nouveau TP doit être plus haut
+            # Pour SHORT : nouveau TP doit être plus bas
+            should_update_tp = False
             
-            except Exception as e:
-                print(f"❌ Erreur notification TP mobile: {e}")
+            if is_long and new_tp > tp_price:
+                should_update_tp = True
+            elif not is_long and new_tp < tp_price:
+                should_update_tp = True
+            
+            if should_update_tp:
+                try:
+                    database.update_trade_tp(trade_id, new_tp)
+                    
+                    # Tenter mise à jour exchange
+                    try:
+                        _update_exchange_tp(ex, symbol, side, new_tp)
+                    except Exception as e:
+                        err_msg = str(e)
+                        if '40836' not in err_msg:  # Ignore erreur 40836 (TP trop proche)
+                            raise
+                    
+                    print(f"   📊 TP mobile mis à jour : {tp_price:.6f} → {new_tp:.6f}")
+                
+                except Exception as e:
+                    print(f"   ⚠️ Erreur MAJ TP mobile : {e}")
         
-        return True
+        # ========================================================================
+        # 2. BE SUIVEUR (suit BB20_mid pour sécuriser progressivement)
+        # ========================================================================
+        if breakeven_status == 'ACTIVE':
+            new_sl_be = None
+            
+            # Le BE suiveur suit BB20_mid
+            if is_long:
+                # LONG : Le nouveau SL doit être >= BB20_mid et > entry_price
+                if bb20_mid > entry_price:
+                    new_sl_be = bb20_mid
+            else:
+                # SHORT : Le nouveau SL doit être <= BB20_mid et < entry_price
+                if bb20_mid < entry_price:
+                    new_sl_be = bb20_mid
+            
+            # Appliquer seulement si amélioration significative (>0.1%)
+            if new_sl_be is not None and abs(new_sl_be - sl_price) / sl_price > 0.001:
+                # Vérifier que le nouveau SL améliore l'actuel
+                should_update_sl = False
+                
+                if is_long and new_sl_be > sl_price:
+                    should_update_sl = True
+                elif not is_long and new_sl_be < sl_price:
+                    should_update_sl = True
+                
+                if should_update_sl:
+                    # ✅ PROTECTION SL : Vérifier que le BE suiveur ne recule pas
+                    if not _validate_sl_never_backward(trade_id, new_sl_be, side):
+                        print(f"   🛡️ BE suiveur refusé (protection anti-recul) - Trade #{trade_id}")
+                        return
+                    
+                    try:
+                        database.update_trade_sl(trade_id, new_sl_be)
+                        
+                        # Tenter mise à jour exchange
+                        try:
+                            _update_exchange_sl(ex, symbol, side, new_sl_be)
+                        except Exception as e:
+                            print(f"   ⚠️ Erreur MAJ BE suiveur exchange : {e}")
+                        
+                        print(f"   🛡️ BE suiveur mis à jour : {sl_price:.6f} → {new_sl_be:.6f}")
+                    
+                    except Exception as e:
+                        print(f"   ⚠️ Erreur MAJ BE suiveur : {e}")
     
     except Exception as e:
-        print(f"❌ Erreur update_dynamic_tp_and_trailing_be: {e}")
+        print(f"❌ Erreur update_dynamic_tp_and_trailing_be pour {symbol}: {e}")
         import traceback
         traceback.print_exc()
+
+def _validate_sl_never_backward(trade_id: int, new_sl: float, side: str) -> bool:
+    """
+    Vérifie que le nouveau SL ne recule JAMAIS par rapport à l'actuel.
+    
+    Règles de protection :
+    - LONG (buy) : Le SL ne peut que MONTER (new_sl >= current_sl)
+    - SHORT (sell) : Le SL ne peut que DESCENDRE (new_sl <= current_sl)
+    
+    Args:
+        trade_id: ID du trade en DB
+        new_sl: Nouveau SL proposé
+        side: 'buy' ou 'sell'
+    
+    Returns:
+        True si le SL peut être mis à jour, False sinon
+    """
+    try:
+        # Récupérer le SL actuel depuis la DB
+        trade = database.get_trade_by_id(trade_id)
+        if not trade:
+            print(f"⚠️ Trade #{trade_id} introuvable pour validation SL")
+            return False
+        
+        current_sl = float(trade.get('sl_price', 0.0))
+        if current_sl <= 0:
+            # Pas de SL actuel, on accepte
+            return True
+        
+        is_long = str(side).lower() == 'buy'
+        
+        if is_long:
+            # LONG : Le SL doit monter (ou rester identique)
+            if new_sl < current_sl:
+                print(f"🛡️ Protection SL activée (LONG) - Trade #{trade_id}")
+                print(f"   SL actuel : {current_sl:.6f}")
+                print(f"   SL proposé : {new_sl:.6f}")
+                print(f"   ❌ REFUSÉ : Le SL ne peut pas descendre en LONG")
+                return False
+            else:
+                return True
+        else:
+            # SHORT : Le SL doit descendre (ou rester identique)
+            if new_sl > current_sl:
+                print(f"🛡️ Protection SL activée (SHORT) - Trade #{trade_id}")
+                print(f"   SL actuel : {current_sl:.6f}")
+                print(f"   SL proposé : {new_sl:.6f}")
+                print(f"   ❌ REFUSÉ : Le SL ne peut pas monter en SHORT")
+                return False
+            else:
+                return True
+    
+    except Exception as e:
+        print(f"❌ Erreur _validate_sl_never_backward : {e}")
+        # En cas d'erreur, on refuse par sécurité
         return False
 
 def manage_open_positions(ex):
     """
-    Gestion positions ouvertes : sync, fermeture, TP dynamique, BE, trailing, pyramiding, partial exits, TP mobile.
+    Gère toutes les positions ouvertes :
+    - Sync avec exchange
+    - Détection des clôtures (TP/SL/manual)
+    - TP dynamique (suit BB80/BB20)
+    - Breakeven dynamique (contact BB20_mid APRÈS open_timestamp)
+    - Trailing stop multi-paliers
+    - Pyramiding
+    - Partial exits
     
-    ✅ CORRECTIONS CRITIQUES APPLIQUÉES :
-    1. BE : Filtre temporel (contact BB20_mid APRÈS open_timestamp)
-    2. BE : PNL réel (prix actuel - entry, pas be_price - entry)
-    3. Anti-spam TP (flag tp_placement_failed)
-    4. Anti-spam BE (flag be_notified)
-    5. Protection anti-recul BE renforcée
-    6. TP Mobile + BE Suiveur en phase finale (>80% TP)
-    7. FIX TIMESTAMP : Gestion robuste colonne timestamp manquante
+    ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
     """
-    
-    def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
-        """
-        Vérifie que nouveau SL est amélioration (ou égal).
-        
-        RÈGLE ABSOLUE : BE ne recule JAMAIS
-        - LONG : new_sl >= old_sl (monte ou stable)
-        - SHORT : new_sl <= old_sl (descend ou stable)
-        """
-        try:
-            new_sl = float(new_sl)
-            old_sl = float(old_sl)
-            
-            if is_long:
-                return new_sl >= old_sl
-            else:
-                return new_sl <= old_sl
-        except Exception:
-            return False
-    
-    # ========== SYNC POSITIONS EXCHANGE ==========
     try:
-        exch_pos = ex.fetch_positions()
+        sync_positions_with_exchange(ex)
     except Exception as e:
-        print(f"❌ Erreur fetch_positions: {e}")
-        exch_pos = []
-    
-    pos_map = {}
-    for p in exch_pos:
+        print(f"⚠️ Erreur sync positions dans manage_open_positions: {e}")
+
+    open_positions = database.get_open_positions()
+    if not open_positions:
+        return
+
+    print(f"\n🔄 Gestion de {len(open_positions)} position(s) ouverte(s)...")
+
+    for pos in open_positions:
         try:
-            sym = str(p.get('symbol', ''))
-            contracts = float(p.get('contracts') or 0.0)
-            if contracts != 0.0:
-                pos_map[sym] = p
-        except Exception:
-            continue
-    
-    # ========== FILTRAGE DOUBLONS (1 TRADE ACTIF PAR SYMBOLE) ==========
-    db_trades = database.get_open_positions()
-    active_per_symbol = {}
-    for pos in db_trades:
-        sym = pos.get('symbol', '')
-        if sym not in active_per_symbol:
-            active_per_symbol[sym] = []
-        active_per_symbol[sym].append(pos)
-    
-    unique_trades = []
-    for sym, trades_list in active_per_symbol.items():
-        if len(trades_list) == 1:
-            unique_trades.append(trades_list[0])
-        else:
-            trades_sorted = sorted(trades_list, key=lambda t: t.get('id', 0), reverse=True)
-            unique_trades.append(trades_sorted[0])
-            for dup in trades_sorted[1:]:
-                try:
-                    print(f"⚠️ Doublon détecté {sym} trade #{dup['id']} → Fermé")
-                    database.close_trade(dup['id'], 'CLOSED_BY_EXCHANGE')
-                except Exception:
-                    pass
-    
-    for pos in unique_trades:
-        try:
-            symbol = pos.get('symbol', '')
-            side = pos.get('side', 'BUY').upper()
-            is_long = (side == 'BUY')
-            qty = float(pos.get('quantity') or 0.0)
-            
-            if qty <= 0:
-                continue
-            
-            # ========== DÉTECTION FERMETURE + NOTIFICATION PNL ==========
-            if symbol not in pos_map:
-                try:
-                    entry = float(pos.get('entry_price') or 0.0)
-                    sl_price = float(pos.get('sl_price') or 0.0)
-                    tp_price = float(pos.get('tp_price') or 0.0)
-                    
-                    recent_trades = ex.fetch_my_trades(symbol, limit=50)
-                    close_price = None
-                    for t in reversed(recent_trades):
-                        t_side = str(t.get('side', '')).upper()
-                        close_side = 'SELL' if is_long else 'BUY'
-                        if t_side == close_side:
-                            close_price = float(t.get('price') or 0.0)
-                            break
-                    
-                    if close_price is None:
-                        try:
-                            ticker = ex.fetch_ticker(symbol)
-                            close_price = float(ticker.get('last') or 0.0)
-                        except Exception:
-                            close_price = entry
-                    
-                    if is_long:
-                        pnl = (close_price - entry) * qty
-                    else:
-                        pnl = (entry - close_price) * qty
-                    
-                    hit_tp = False
-                    hit_sl = False
-                    
-                    if tp_price > 0:
-                        if is_long and close_price >= tp_price * 0.999:
-                            hit_tp = True
-                        elif not is_long and close_price <= tp_price * 1.001:
-                            hit_tp = True
-                    
-                    if sl_price > 0 and not hit_tp:
-                        if is_long and close_price <= sl_price * 1.001:
-                            hit_sl = True
-                        elif not is_long and close_price >= sl_price * 0.999:
-                            hit_sl = True
-                    
-                    if hit_tp:
-                        status = 'CLOSED_TP'
-                        emoji = '🎯'
-                        result = 'Take Profit atteint'
-                        color = '💚'
-                    elif hit_sl:
-                        status = 'CLOSED_SL'
-                        emoji = '🛡️'
-                        result = 'Stop Loss touché'
-                        color = '🔴' if pnl < 0 else '🟡'
-                    else:
-                        status = 'CLOSED_BY_EXCHANGE'
-                        emoji = '✅'
-                        result = 'Fermé par exchange'
-                        color = '🔵'
-                    
-                    database.close_trade(pos['id'], status)
-                    
-                    try:
-                        pnl_pct = (pnl / (entry * qty)) * 100 if (entry * qty) > 0 else 0
-                        
-                        msg = (
-                            f"{emoji} **{result}**\n\n"
-                            f"📊 {symbol} {side}\n"
-                            f"{'🟢' if is_long else '🔴'} {'LONG' if is_long else 'SHORT'}\n\n"
-                            f"💵 Prix d'entrée : {entry:.4f}\n"
-                            f"💵 Prix de sortie : {close_price:.4f}\n"
-                            f"📦 Quantité : {qty:.6f}\n\n"
-                            f"{color} **PnL : {pnl:+.2f} USDT ({pnl_pct:+.2f}%)**\n\n"
-                            f"🔢 Trade #{pos['id']}"
-                        )
-                        
-                        notifier.tg_send(msg)
-                    except Exception as e:
-                        print(f"❌ Erreur notification fermeture: {e}")
-                    
-                    print(f"✅ {symbol} fermé → {status} (PnL: {pnl:+.2f} USDT)")
-                except Exception as e:
-                    print(f"❌ Erreur détection fermeture {symbol}: {e}")
-                continue
-            
-            # ========== GESTION TRADES MANUELS (IMPORTÉS) ==========
+            trade_id = pos['id']
+            symbol = pos['symbol']
+            side = pos['side']
+            entry_price = float(pos['entry_price'])
+            sl_price = float(pos['sl_price'])
+            tp_price = float(pos['tp_price'])
+            quantity = float(pos['quantity'])
+            breakeven_status = pos.get('breakeven_status', 'PENDING')
+            regime = pos.get('regime', 'NORMAL')
+            open_timestamp = int(pos.get('open_timestamp', 0))
+
+            is_long = (side == 'buy')
+
+            # Métadonnées
             try:
-                meta = pos.get('meta', {})
-                if isinstance(meta, str):
-                    import json
-                    meta = json.loads(meta)
-                is_manual_trade = meta.get('manual_import', False)
+                import json
+                meta_raw = pos.get('meta', '{}')
+                meta = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
             except Exception:
-                is_manual_trade = False
-            
-            if is_manual_trade:
+                meta = {}
+
+            # ========================================================================
+            # 1. VÉRIFICATION FERMETURE (TP/SL/manual)
+            # ========================================================================
+            try:
+                exchange_positions = ex.fetch_positions([symbol])
+            except Exception as e:
+                print(f"⚠️ Erreur fetch positions pour {symbol}: {e}")
+                exchange_positions = []
+
+            found_open = False
+            for ep in exchange_positions:
                 try:
-                    exch_pos_data = pos_map.get(symbol)
-                    if not exch_pos_data:
-                        continue
-                    
-                    exch_qty = abs(float(exch_pos_data.get('contracts') or 0.0))
-                    db_qty = float(pos.get('quantity') or 0.0)
-                    
-                    if abs(exch_qty - db_qty) > 0.001:
-                        try:
-                            database.update_trade_core(
-                                trade_id=pos['id'],
-                                side=side.lower(),
-                                entry_price=float(pos.get('entry_price') or 0.0),
-                                quantity=float(exch_qty),
-                                regime=pos.get('regime', 'Importé')
-                            )
-                            print(f"🔄 {symbol} Manuel : Qty sync {db_qty:.6f} → {exch_qty:.6f}")
-                        except Exception as e:
-                            print(f"❌ Erreur update qty manuel: {e}")
-                except Exception as e:
-                    print(f"❌ Erreur sync qty manuel {symbol}: {e}")
-                continue
-            
-            # ========== TP DYNAMIQUE (SUIT BB80/BB20) - ANTI-SPAM ==========
-            try:
-                regime = pos.get('regime', 'Tendance')
-                tp_price = float(pos.get('tp_price') or 0.0)
-                sl_price = float(pos.get('sl_price') or 0.0)
-                
-                if tp_price > 0:
-                    try:
-                        meta = pos.get('meta', {})
-                        if isinstance(meta, str):
-                            import json
-                            meta = json.loads(meta)
-                        
-                        tp_manual = meta.get('tp_manual', False)
-                        
-                        if tp_manual:
-                            print(f"✋ {symbol} : TP manuel détecté, skip TP dynamique")
-                            raise Exception("TP_MANUAL_SKIP")
-                    except Exception as e:
-                        if "TP_MANUAL_SKIP" in str(e):
-                            pass
-                        else:
-                            pass
-                    
-                    try:
-                        meta = pos.get('meta', {})
-                        if isinstance(meta, str):
-                            import json
-                            meta = json.loads(meta)
-                        
-                        tp_placement_failed = meta.get('tp_placement_failed', False)
-                        
-                        if tp_placement_failed:
-                            print(f"⚠️ {symbol} : TP placement déjà échoué (40836), skip réessai")
-                            continue
-                    except Exception:
-                        pass
-                    
-                    try:
-                        df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
-                        
-                        if df is None or len(df) < 80:
-                            raise Exception("DataFrame insuffisant pour TP dynamique")
-                        
-                        last_row = df.iloc[-1]
-                        
-                        bb80_up_val = float(last_row.get('bb80_up', 0.0))
-                        bb80_lo_val = float(last_row.get('bb80_lo', 0.0))
-                        bb20_up_val = float(last_row.get('bb20_up', 0.0))
-                        bb20_lo_val = float(last_row.get('bb20_lo', 0.0))
-                        last_atr = float(last_row.get('atr', 0.0))
-                        
-                        if bb80_up_val <= 0 or bb80_lo_val <= 0 or bb20_up_val <= 0 or bb20_lo_val <= 0:
-                            raise Exception("Colonnes BB manquantes ou invalides")
-                        
-                        if regime == 'Tendance':
-                            tp_raw = bb80_up_val if is_long else bb80_lo_val
-                        else:
-                            tp_raw = bb20_up_val if is_long else bb20_lo_val
-                        
-                        if tp_raw > 0:
-                            target_tp = adjust_tp_for_bb_offset(
-                                raw_tp=float(tp_raw),
-                                side=('buy' if is_long else 'sell'),
-                                atr=float(last_atr),
-                                ref_price=float(tp_raw)
-                            )
-                            
-                            current_tp = tp_price
-                            
-                            try:
-                                tp_update_eps = float(database.get_setting('TP_UPDATE_EPS', '0.0005'))
-                            except Exception:
-                                tp_update_eps = 0.0005
-                            
-                            if is_long:
-                                improve = (target_tp < current_tp * (1.0 - tp_update_eps))
-                            else:
-                                improve = (target_tp > current_tp * (1.0 + tp_update_eps))
-                            
-                            if improve:
-                                close_side = 'sell' if is_long else 'buy'
-                                
-                                try:
-                                    market = ex.market(symbol) or {}
-                                    tick_size = _bitget_tick_size(market)
-                                except Exception:
-                                    tick_size = 0.0001
-                                
-                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-                                
-                                sl_ok, tp_ok = _place_sl_tp_safe(
-                                    ex, symbol, close_side, qty,
-                                    sl=sl_price if sl_price > 0 else None,
-                                    tp=target_tp,
-                                    params=common_params,
-                                    is_long=is_long,
-                                    tick_size=tick_size
-                                )
-                                
-                                if tp_ok:
-                                    database.update_trade_tp(pos['id'], float(target_tp))
-                                    print(f"✅ {symbol} TP dynamique : {current_tp:.4f} → {target_tp:.4f}")
-                                
-                                if not tp_ok:
-                                    try:
-                                        meta = pos.get('meta', {})
-                                        if isinstance(meta, str):
-                                            import json
-                                            meta = json.loads(meta)
-                                        
-                                        if not isinstance(meta, dict):
-                                            meta = {}
-                                        
-                                        meta['tp_placement_failed'] = True
-                                        
-                                        database.update_trade_meta(pos['id'], meta)
-                                        
-                                        print(f"⚠️ {symbol} : TP placement échoué, flag activé pour éviter spam")
-                                    except Exception as e:
-                                        print(f"❌ Erreur update meta tp_placement_failed: {e}")
-                    
-                    except Exception as e:
-                        if "TP_MANUAL_SKIP" not in str(e):
-                            print(f"❌ Erreur TP dynamique {symbol}: {e}")
-            
-            except Exception as e:
-                print(f"❌ Erreur TP dynamique {symbol}: {e}")
-            
-            # ========== PYRAMIDING (AJOUT POSITION GAGNANTE) ==========
-            try:
-                pyramid_info = should_pyramid_position(ex, pos, utils.fetch_and_prepare_df(ex, symbol, '1h'))
-                
-                if pyramid_info:
-                    execute_pyramid_add(ex, pyramid_info)
-            
-            except Exception as e:
-                print(f"❌ Erreur pyramiding {symbol}: {e}")
-            
-            # ========== PARTIAL EXITS (SORTIES PARTIELLES) ==========
-            try:
+                    contracts = float(ep.get('contracts', 0) or 0)
+                except Exception:
+                    contracts = 0.0
+                if contracts > 0:
+                    found_open = True
+                    break
+
+            if not found_open:
+                # Position fermée sur l'exchange
                 try:
                     ticker = ex.fetch_ticker(symbol)
-                    current_price = float(ticker.get('last') or ticker.get('close') or 0.0)
+                    close_price = float(ticker.get('last', entry_price))
                 except Exception:
-                    current_price = 0.0
+                    close_price = entry_price
+
+                if is_long:
+                    pnl = (close_price - entry_price) * quantity
+                else:
+                    pnl = (entry_price - close_price) * quantity
+
+                # Déterminer le type de fermeture
+                if close_price >= tp_price and is_long:
+                    status = 'CLOSED'
+                    reason = "TP atteint"
+                elif close_price <= tp_price and not is_long:
+                    status = 'CLOSED'
+                    reason = "TP atteint"
+                elif close_price <= sl_price and is_long:
+                    status = 'CLOSED'
+                    reason = "SL touché"
+                elif close_price >= sl_price and not is_long:
+                    status = 'CLOSED'
+                    reason = "SL touché"
+                else:
+                    status = 'CLOSED_MANUAL'
+                    reason = "Fermeture manuelle"
+
+                database.close_trade(trade_id, status, pnl)
                 
-                if current_price > 0:
-                    exit_info = should_take_partial_profit(pos, current_price)
-                    
-                    if exit_info:
-                        execute_partial_exit(ex, exit_info)
-            
-            except Exception as e:
-                print(f"❌ Erreur partial exit {symbol}: {e}")
-            
+                # Notification
+                side_icon = "📈" if is_long else "📉"
+                pnl_icon = "💰" if pnl >= 0 else "💸"
+                msg = (
+                    f"{pnl_icon} <b>Position Fermée</b>\n\n"
+                    f"{side_icon} <b>{symbol}</b>\n"
+                    f"Raison: <i>{reason}</i>\n"
+                    f"PnL: <code>{pnl:.2f} USDT</code>"
+                )
+                notifier.tg_send(msg)
+                print(f"✅ Trade #{trade_id} fermé : {reason} (PnL={pnl:.2f} USDT)")
+                continue
+
             # ========================================================================
-            # ========== BE DYNAMIQUE (CONTACT BB20_MID) - ✅ FIX TIMESTAMP ==========
+            # 2. RÉCUPÉRATION DONNÉES MARCHÉ
             # ========================================================================
             try:
+                df = utils.fetch_and_prepare_df(ex, symbol, os.getenv('TIMEFRAME', '1h'))
+                if df is None or len(df) < 100:
+                    print(f"⚠️ Pas assez de données pour {symbol}")
+                    continue
+            except Exception as e:
+                print(f"⚠️ Erreur fetch data pour {symbol}: {e}")
+                continue
+
+            try:
+                ticker = ex.fetch_ticker(symbol)
+                current_price = float(ticker.get('last', entry_price))
+            except Exception as e:
+                print(f"⚠️ Erreur fetch ticker pour {symbol}: {e}")
+                continue
+
+            # ========================================================================
+            # 3. TP DYNAMIQUE (suit BB80/BB20 avec anti-spam)
+            # ========================================================================
+            tp_placement_failed = meta.get('tp_placement_failed', False)
+            
+            if not tp_placement_failed:
                 try:
-                    be_enabled = str(database.get_setting('DYNAMIC_BE_ENABLED', 'true')).lower() == 'true'
-                except Exception:
-                    be_enabled = True
-                
-                if be_enabled:
-                    entry = float(pos.get('entry_price') or 0.0)
-                    sl_current = float(pos.get('sl_price') or 0.0)
-                    
-                    if entry > 0 and sl_current > 0:
-                        be_status = pos.get('be_status', 'INACTIVE')
-                        prev_be_status = be_status
-                        
-                        try:
-                            meta = pos.get('meta', {})
-                            if isinstance(meta, str):
-                                import json
-                                meta = json.loads(meta)
-                            be_already_notified = meta.get('be_notified', False)
-                        except Exception:
-                            be_already_notified = False
-                        
-                        if be_status == 'ACTIVE' and be_already_notified:
-                            pass  # BE déjà actif et notifié, on passe au trailing
+                    bb20_upper = float(df['bb20_upper'].iloc[-1])
+                    bb20_lower = float(df['bb20_lower'].iloc[-1])
+                    bb80_upper = float(df['bb80_upper'].iloc[-1])
+                    bb80_lower = float(df['bb80_lower'].iloc[-1])
+
+                    # Offset TP (Bollinger)
+                    try:
+                        tp_offset_pct = float(database.get_setting('TP_BB_OFFSET_PCT', '0.0100'))
+                    except Exception:
+                        tp_offset_pct = 0.01
+
+                    if is_long:
+                        if regime == 'COUNTER_TREND':
+                            new_tp = bb20_lower * (1 - tp_offset_pct)
                         else:
-                            try:
-                                df = utils.fetch_and_prepare_df(ex, symbol, timeframe='1h')
-                                
-                                if df is None or len(df) < 25:
-                                    raise Exception("DataFrame insuffisant pour BE dynamique")
-                                
-                                # ✅ CORRECTION CRITIQUE : GESTION ROBUSTE TIMESTAMP
-                                open_timestamp = int(pos.get('open_timestamp', 0))
-                                
-                                if open_timestamp > 0:
-                                    # Vérifier si colonne timestamp existe
-                                    try:
-                                        if 'timestamp' in df.columns:
-                                            df_after_entry = df[df['timestamp'] >= open_timestamp]
-                                        elif hasattr(df.index, 'to_series'):
-                                            # Si timestamp est dans l'index (format DatetimeIndex)
-                                            df_after_entry = df[df.index.astype(int) // 1000 >= open_timestamp // 1000]
-                                        else:
-                                            # Fallback : utiliser tout le DataFrame
-                                            print(f"⚠️ {symbol} : Impossible filtrer par timestamp, utilisation complète DF")
-                                            df_after_entry = df
-                                    except Exception as e:
-                                        print(f"⚠️ {symbol} : Erreur filtre timestamp → {e}")
-                                        df_after_entry = df
-                                    
-                                    if len(df_after_entry) < 1:
-                                        raise Exception("Aucune bougie après ouverture trade")
-                                else:
-                                    df_after_entry = df
-                                
-                                bb20_mid_val = float(df_after_entry.iloc[-1].get('bb20_mid', 0.0))
-                                
-                                if bb20_mid_val <= 0:
-                                    raise Exception("Colonne bb20_mid manquante ou invalide")
-                                
-                                try:
-                                    be_lookback = int(database.get_setting('BE_TOUCH_LOOKBACK', '2'))
-                                except Exception:
-                                    be_lookback = 2
-                                
-                                last_n_close = df_after_entry['close'].iloc[-be_lookback:].values
-                                last_n_high = df_after_entry['high'].iloc[-be_lookback:].values
-                                last_n_low = df_after_entry['low'].iloc[-be_lookback:].values
-                                
-                                touched_bb20_mid = False
-                                for i in range(len(last_n_close)):
-                                    c_val = float(last_n_close[i])
-                                    h_val = float(last_n_high[i])
-                                    l_val = float(last_n_low[i])
-                                    
-                                    if is_long:
-                                        if c_val >= bb20_mid_val * 0.9995 or h_val >= bb20_mid_val * 0.9995:
-                                            touched_bb20_mid = True
-                                            break
-                                    else:
-                                        if c_val <= bb20_mid_val * 1.0005 or l_val <= bb20_mid_val * 1.0005:
-                                            touched_bb20_mid = True
-                                            break
-                                
-                                improve_sl = False
-                                want_sl = sl_current
-                                
-                                if touched_bb20_mid and be_status != 'ACTIVE':
-                                    try:
-                                        be_offset_pct = float(database.get_setting('BE_OFFSET_PCT', '0.005'))
-                                    except Exception:
-                                        be_offset_pct = 0.005
-                                    
-                                    if is_long:
-                                        want_sl = entry * (1.0 + be_offset_pct)
-                                    else:
-                                        want_sl = entry * (1.0 - be_offset_pct)
-                                    
-                                    improve_sl = True
-                                
-                                if improve_sl and _sl_improves_or_equal(want_sl, sl_current, is_long):
-                                    close_side = 'sell' if is_long else 'buy'
-                                    
-                                    try:
-                                        market = ex.market(symbol) or {}
-                                        tick_size = _bitget_tick_size(market)
-                                    except Exception:
-                                        tick_size = 0.0001
-                                    
-                                    common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-                                    
-                                    sl_ok, tp_ok = _place_sl_tp_safe(
-                                        ex, symbol, close_side, qty,
-                                        sl=want_sl,
-                                        tp=float(pos.get('tp_price') or 0.0) if pos.get('tp_price') else None,
-                                        params=common_params,
-                                        is_long=is_long,
-                                        tick_size=tick_size
-                                    )
-                                    
-                                    if sl_ok:
-                                        database.update_trade_sl(pos['id'], float(want_sl))
-                                        
-                                        try:
-                                            database.update_trade_to_breakeven(
-                                                pos['id'],
-                                                float(qty),
-                                                float(want_sl)
-                                            )
-                                        except Exception:
-                                            pass
-                                        
-                                        if prev_be_status != 'ACTIVE' and not be_already_notified:
-                                            try:
-                                                remaining_qty = float(qty)
-                                                entry_price_be = float(pos.get('entry_price') or 0.0)
-                                                
-                                                # ✅ CORRECTION CRITIQUE 2 : PNL RÉEL (prix actuel - entry)
-                                                try:
-                                                    ticker = ex.fetch_ticker(symbol)
-                                                    current_price_now = float(ticker.get('last') or ticker.get('close') or entry_price_be)
-                                                except Exception:
-                                                    current_price_now = entry_price_be
-                                                
-                                                if entry_price_be <= 0 or remaining_qty <= 0:
-                                                    pnl_secured = 0.0
-                                                else:
-                                                    if is_long:
-                                                        pnl_secured = max(0.0, (current_price_now - entry_price_be) * remaining_qty)
-                                                    else:
-                                                        pnl_secured = max(0.0, (entry_price_be - current_price_now) * remaining_qty)
-                                                
-                                                if is_manual_trade:
-                                                    notifier.tg_send(
-                                                        f"🔵 **Trade Manuel → BE Activé**\n\n"
-                                                        f"📊 {symbol} {side}\n"
-                                                        f"💚 PnL actuel : {pnl_secured:.2f} USDT\n"
-                                                        f"🛡️ SL déplacé au Break-Even"
-                                                    )
-                                                else:
-                                                    notifier.send_breakeven_notification(
-                                                        symbol=symbol,
-                                                        pnl_realised=float(pnl_secured),
-                                                        remaining_qty=float(remaining_qty)
-                                                    )
-                                                
-                                                try:
-                                                    if not isinstance(meta, dict):
-                                                        meta = {}
-                                                    meta['be_notified'] = True
-                                                    database.update_trade_meta(pos['id'], meta)
-                                                except Exception as e:
-                                                    print(f"⚠️ Erreur update meta be_notified: {e}")
-                                            
-                                            except Exception as e:
-                                                print(f"❌ Erreur notification BE {symbol}: {e}")
-                                        
-                                        print(f"✅ {symbol} BE activé : SL {sl_current:.4f} → {want_sl:.4f} (PnL actuel: {pnl_secured:.2f} USDT)")
-                                elif improve_sl:
-                                    print(f"⚠️ {symbol} BE rejeté (recul interdit : {want_sl:.4f} vs {sl_current:.4f})")
+                            new_tp = bb80_upper * (1 + tp_offset_pct)
+                    else:
+                        if regime == 'COUNTER_TREND':
+                            new_tp = bb20_upper * (1 + tp_offset_pct)
+                        else:
+                            new_tp = bb80_lower * (1 - tp_offset_pct)
+
+                    # Mettre à jour si écart significatif (>0.1%)
+                    if abs(new_tp - tp_price) / tp_price > 0.001:
+                        try:
+                            database.update_trade_tp(trade_id, new_tp)
                             
+                            # Tenter de mettre à jour sur l'exchange
+                            try:
+                                _update_exchange_tp(ex, symbol, side, new_tp)
                             except Exception as e:
-                                print(f"❌ Erreur BE dynamique {symbol}: {e}")
-            
-            except Exception as e:
-                print(f"❌ Erreur BE dynamique {symbol}: {e}")
-            
-            # ========== TRAILING PAR PALIERS (25%, 50%, 75%) ==========
-            try:
+                                err_msg = str(e)
+                                # Détection erreur Bitget 40836 (TP trop proche)
+                                if '40836' in err_msg:
+                                    print(f"⚠️ TP dynamique refusé (40836) - {symbol}")
+                                    # Marquer pour éviter réessais
+                                    meta['tp_placement_failed'] = True
+                                    database.update_trade_meta(trade_id, meta)
+                                else:
+                                    raise
+
+                            print(f"   ✅ TP dynamique mis à jour : {new_tp:.6f}")
+                        except Exception as e:
+                            print(f"   ⚠️ Erreur MAJ TP dynamique : {e}")
+
+                except Exception as e:
+                    print(f"⚠️ Erreur calcul TP dynamique pour {symbol}: {e}")
+
+            # ========================================================================
+            # 4. BREAKEVEN DYNAMIQUE (contact BB20_mid APRÈS open_timestamp)
+            # ========================================================================
+            if breakeven_status == 'PENDING':
+                should_activate_be = False
+                be_sl = entry_price
+
                 try:
-                    trail_stepped = str(database.get_setting('TRAIL_USE_STEPPED', 'true')).lower() == 'true'
-                except Exception:
-                    trail_stepped = True
-                
-                if trail_stepped:
-                    entry = float(pos.get('entry_price') or 0.0)
-                    tp_price = float(pos.get('tp_price') or 0.0)
-                    sl_current = float(pos.get('sl_price') or 0.0)
-                    
-                    if entry > 0 and tp_price > 0 and sl_current > 0:
-                        data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                        
-                        if len(data_bars) >= 20:
-                            import pandas as pd
-                            df_trail = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                            current_price = float(df_trail['close'].iloc[-1])
-                            
-                            if is_long:
-                                distance = tp_price - entry
-                                progress = (current_price - entry) / distance if distance > 0 else 0
-                            else:
-                                distance = entry - tp_price
-                                progress = (entry - current_price) / distance if distance > 0 else 0
-                            
-                            progress = max(0.0, min(1.0, progress))
-                            
-                            meta = pos.get('meta', {})
-                            if isinstance(meta, str):
-                                import json
-                                meta = json.loads(meta)
-                            
-                            last_step = meta.get('trail_step', 0)
-                            
-                            try:
-                                step_50_pct = float(database.get_setting('TRAIL_STEP_50_PCT', '0.01'))
-                            except Exception:
-                                step_50_pct = 0.01
-                            
-                            try:
-                                step_75_pct = float(database.get_setting('TRAIL_STEP_75_PCT', '0.015'))
-                            except Exception:
-                                step_75_pct = 0.015
-                            
-                            new_step = 0
-                            target_sl = None
-                            
-                            if progress >= 0.75 and last_step < 75:
-                                if is_long:
-                                    target_sl = entry + (distance * (0.5 + step_75_pct))
-                                else:
-                                    target_sl = entry - (distance * (0.5 + step_75_pct))
-                                new_step = 75
-                            
-                            elif progress >= 0.50 and last_step < 50:
-                                if is_long:
-                                    target_sl = entry + (distance * (0.25 + step_50_pct))
-                                else:
-                                    target_sl = entry - (distance * (0.25 + step_50_pct))
-                                new_step = 50
-                            
-                            elif progress >= 0.25 and last_step < 25:
-                                if is_long:
-                                    target_sl = entry + (distance * step_50_pct)
-                                else:
-                                    target_sl = entry - (distance * step_50_pct)
-                                new_step = 25
-                            
-                            if target_sl and _sl_improves_or_equal(target_sl, sl_current, is_long):
-                                close_side = 'sell' if is_long else 'buy'
-                                
-                                try:
-                                    market = ex.market(symbol) or {}
-                                    tick_size = _bitget_tick_size(market)
-                                except Exception:
-                                    tick_size = 0.0001
-                                
-                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-                                
-                                sl_ok, tp_ok = _place_sl_tp_safe(
-                                    ex, symbol, close_side, qty,
-                                    sl=target_sl,
-                                    tp=tp_price,
-                                    params=common_params,
-                                    is_long=is_long,
-                                    tick_size=tick_size
-                                )
-                                
-                                if sl_ok:
-                                    database.update_trade_sl(pos['id'], float(target_sl))
-                                    
-                                    # Mettre à jour meta avec nouveau palier
-                                    try:
-                                        if not isinstance(meta, dict):
-                                            meta = {}
-                                        meta['trail_step'] = new_step
-                                        database.update_trade_meta(pos['id'], meta)
-                                    except Exception:
-                                        pass
-                                    
-                                    print(f"✅ {symbol} Trailing palier {new_step}% : SL {sl_current:.4f} → {target_sl:.4f}")
-                            elif target_sl:
-                                print(f"⚠️ {symbol} Trailing palier {new_step}% rejeté (recul interdit)")
-            except Exception as e:
-                print(f"❌ Erreur trailing paliers {symbol}: {e}")
-            
-            # ========== TRAILING FINAL SERRÉ (>90% TP) ==========
-            try:
-                entry = float(pos.get('entry_price') or 0.0)
-                tp_price = float(pos.get('tp_price') or 0.0)
-                sl_current = float(pos.get('sl_price') or 0.0)
-                
-                if entry > 0 and tp_price > 0 and sl_current > 0:
-                    data_bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                    
-                    if len(data_bars) >= 20:
-                        import pandas as pd
-                        df_final = pd.DataFrame(data_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                        current_price = float(df_final['close'].iloc[-1])
+                    # Gestion robuste colonne timestamp manquante
+                    if 'timestamp' in df.columns:
+                        df_after_entry = df[df['timestamp'] >= open_timestamp]
+                    elif hasattr(df.index, 'to_series'):
+                        df_after_entry = df[df.index.astype(int) // 1000 >= open_timestamp // 1000]
+                    else:
+                        df_after_entry = df  # Fallback sécurisé
+
+                    if len(df_after_entry) > 0:
+                        bb20_mid_col = 'bb20_mid' if 'bb20_mid' in df.columns else 'sma20'
                         
                         if is_long:
-                            distance = tp_price - entry
-                            progress = (current_price - entry) / distance if distance > 0 else 0
+                            be_touches = df_after_entry[df_after_entry['low'] <= df_after_entry[bb20_mid_col]]
                         else:
-                            distance = entry - tp_price
-                            progress = (entry - current_price) / distance if distance > 0 else 0
-                        
-                        progress = max(0.0, min(1.0, progress))
-                        
-                        if progress >= 0.90:
-                            try:
-                                trail_min_move = float(database.get_setting('TRAIL_MIN_MOVE_PCT', '0.001'))
-                            except Exception:
-                                trail_min_move = 0.001
-                            
-                            try:
-                                trail_offset = float(database.get_setting('TRAIL_FINAL_OFFSET_PCT', '0.002'))
-                            except Exception:
-                                trail_offset = 0.002
-                            
-                            if is_long:
-                                want_sl = current_price * (1.0 - trail_offset)
-                                move = (want_sl - sl_current) / sl_current if sl_current > 0 else 0
-                            else:
-                                want_sl = current_price * (1.0 + trail_offset)
-                                move = (sl_current - want_sl) / sl_current if sl_current > 0 else 0
-                            
-                            if move >= trail_min_move and _sl_improves_or_equal(want_sl, sl_current, is_long):
-                                close_side = 'sell' if is_long else 'buy'
-                                
-                                try:
-                                    market = ex.market(symbol) or {}
-                                    tick_size = _bitget_tick_size(market)
-                                except Exception:
-                                    tick_size = 0.0001
-                                
-                                common_params = {'tdMode': 'cross', 'posMode': 'oneway'}
-                                
-                                sl_ok, tp_ok = _place_sl_tp_safe(
-                                    ex, symbol, close_side, qty,
-                                    sl=want_sl,
-                                    tp=tp_price,
-                                    params=common_params,
-                                    is_long=is_long,
-                                    tick_size=tick_size
-                                )
-                                
-                                if sl_ok:
-                                    database.update_trade_sl(pos['id'], float(want_sl))
-                                    print(f"✅ {symbol} Trailing final : SL {sl_current:.4f} → {want_sl:.4f}")
-                            elif move >= trail_min_move:
-                                print(f"⚠️ {symbol} Trailing final rejeté (recul interdit)")
-            except Exception as e:
-                print(f"❌ Erreur trailing final {symbol}: {e}")
-            
+                            be_touches = df_after_entry[df_after_entry['high'] >= df_after_entry[bb20_mid_col]]
+
+                        if len(be_touches) > 0:
+                            should_activate_be = True
+
+                except Exception as e:
+                    print(f"⚠️ Erreur détection BE pour {symbol}: {e}")
+
+                if should_activate_be:
+                    # ✅ PROTECTION SL : Vérifier que le BE ne recule pas
+                    if not _validate_sl_never_backward(trade_id, be_sl, side):
+                        print(f"   🛡️ Breakeven refusé (protection anti-recul) - Trade #{trade_id}")
+                        continue  # Passer au trade suivant
+
+                    # Calcul PnL sécurisé (prix actuel - entry, PAS be_price - entry)
+                    try:
+                        ticker_now = ex.fetch_ticker(symbol)
+                        current_price_now = float(ticker_now.get('last') or entry_price)
+                    except Exception:
+                        current_price_now = entry_price
+
+                    remaining_qty = quantity
+
+                    if is_long:
+                        pnl_secured = max(0.0, (current_price_now - entry_price) * remaining_qty)
+                    else:
+                        pnl_secured = max(0.0, (entry_price - current_price_now) * remaining_qty)
+
+                    # Appliquer le breakeven
+                    database.update_trade_to_breakeven(trade_id, remaining_qty, be_sl)
+
+                    # Notification anti-spam (1 seule fois)
+                    be_already_notified = meta.get('be_notified', False)
+                    if not be_already_notified:
+                        notifier.send_breakeven_notification(symbol, pnl_secured, remaining_qty)
+                        meta['be_notified'] = True
+                        database.update_trade_meta(trade_id, meta)
+
+                    print(f"   🛡️ Breakeven activé pour {symbol} (PnL sécurisé: {pnl_secured:.2f} USDT)")
+
+                    # Tenter de placer le SL BE sur l'exchange
+                    try:
+                        _update_exchange_sl(ex, symbol, side, be_sl)
+                    except Exception as e:
+                        print(f"   ⚠️ Erreur placement SL BE sur exchange : {e}")
+
             # ========================================================================
-            # ========== TP MOBILE + BE SUIVEUR (PHASE FINALE >80% TP) ==========
+            # 5. TRAILING STOP (multi-paliers : 25%, 50%, 75%, >90%)
+            # ========================================================================
+            if breakeven_status == 'ACTIVE':
+                try:
+                    if is_long:
+                        pnl_pct = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                    else:
+                        pnl_pct = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+
+                    new_trailing_sl = None
+
+                    if pnl_pct >= 90.0:
+                        # Trailing serré (95% du chemin vers TP)
+                        if is_long:
+                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.95
+                        else:
+                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.95
+
+                    elif pnl_pct >= 75.0:
+                        if is_long:
+                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.75
+                        else:
+                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.75
+
+                    elif pnl_pct >= 50.0:
+                        if is_long:
+                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.50
+                        else:
+                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.50
+
+                    elif pnl_pct >= 25.0:
+                        if is_long:
+                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.25
+                        else:
+                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.25
+
+                    if new_trailing_sl is not None:
+                        # Vérifier que le trailing améliore le SL actuel
+                        if is_long and new_trailing_sl > sl_price:
+                            # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
+                            if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
+                                print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
+                                continue
+
+                            database.update_trade_sl(trade_id, new_trailing_sl)
+                            try:
+                                _update_exchange_sl(ex, symbol, side, new_trailing_sl)
+                            except Exception as e:
+                                print(f"   ⚠️ Erreur MAJ trailing SL exchange : {e}")
+                            print(f"   ⬆️ Trailing SL (LONG) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
+
+                        elif not is_long and new_trailing_sl < sl_price:
+                            # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
+                            if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
+                                print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
+                                continue
+
+                            database.update_trade_sl(trade_id, new_trailing_sl)
+                            try:
+                                _update_exchange_sl(ex, symbol, side, new_trailing_sl)
+                            except Exception as e:
+                                print(f"   ⚠️ Erreur MAJ trailing SL exchange : {e}")
+                            print(f"   ⬇️ Trailing SL (SHORT) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
+
+                except Exception as e:
+                    print(f"⚠️ Erreur trailing stop pour {symbol}: {e}")
+
+            # ========================================================================
+            # 6. PYRAMIDING (conditions : >80% TP, max 2 ajouts)
             # ========================================================================
             try:
-                update_dynamic_tp_and_trailing_be(ex, pos)
+                pyramid_count = meta.get('pyramid_count', 0)
+                if pyramid_count < 2:  # Max 2 ajouts
+                    if is_long:
+                        progress = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                    else:
+                        progress = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+
+                    if progress >= 80.0:
+                        can_pyramid = should_pyramid_position(
+                            current_price, entry_price, tp_price, is_long,
+                            pyramid_count, meta
+                        )
+
+                        if can_pyramid:
+                            success = execute_pyramid_add(
+                                ex, trade_id, symbol, side, current_price,
+                                quantity, entry_price, sl_price, tp_price,
+                                pyramid_count, meta
+                            )
+                            if success:
+                                print(f"   📈 Pyramiding ajouté pour {symbol}")
+
             except Exception as e:
-                print(f"❌ Erreur TP mobile {symbol}: {e}")
-        
+                print(f"⚠️ Erreur pyramiding pour {symbol}: {e}")
+
+            # ========================================================================
+            # 7. PARTIAL EXITS (conditions : 50% TP, max 1 sortie)
+            # ========================================================================
+            try:
+                partial_exits_count = meta.get('partial_exits_count', 0)
+                if partial_exits_count < 1:  # Max 1 sortie partielle
+                    if is_long:
+                        progress = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                    else:
+                        progress = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+
+                    if progress >= 50.0:
+                        can_partial = should_take_partial_profit(
+                            current_price, entry_price, tp_price, is_long,
+                            partial_exits_count, meta
+                        )
+
+                        if can_partial:
+                            success = execute_partial_exit(
+                                ex, trade_id, symbol, side, current_price,
+                                quantity, partial_exits_count, meta
+                            )
+                            if success:
+                                print(f"   💰 Sortie partielle pour {symbol}")
+
+            except Exception as e:
+                print(f"⚠️ Erreur partial exit pour {symbol}: {e}")
+
+            # ========================================================================
+            # 8. TP MOBILE + BE SUIVEUR (>80% TP uniquement)
+            # ========================================================================
+            try:
+                if is_long:
+                    progress = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                else:
+                    progress = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+
+                if progress >= 80.0:
+                    update_dynamic_tp_and_trailing_be(
+                        ex, trade_id, symbol, side, df,
+                        entry_price, current_price, tp_price, sl_price,
+                        regime, breakeven_status
+                    )
+
+            except Exception as e:
+                print(f"⚠️ Erreur TP mobile + BE suiveur pour {symbol}: {e}")
+
         except Exception as e:
-            print(f"❌ Erreur manage_open_positions trade {pos.get('id')}: {e}")
-            continue
-            
+            print(f"❌ Erreur gestion position {pos.get('symbol', 'N/A')}: {e}")
+            import traceback
+            traceback.print_exc()
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
