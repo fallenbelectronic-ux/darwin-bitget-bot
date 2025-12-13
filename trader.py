@@ -4212,7 +4212,6 @@ def should_pyramid_position(ex, pos: dict, df: pd.DataFrame) -> Optional[Dict[st
         traceback.print_exc()
         return None
 
-
 def execute_pyramid_add(ex, pyramid_info: Dict[str, Any]) -> bool:
     """
     Exécute l'ajout pyramiding sur une position gagnante.
@@ -4603,7 +4602,7 @@ def should_take_partial_profit(pos: dict, current_price: float) -> Optional[Dict
         return exit_info
     
     except Exception as e:
-        print(f"Erreur should_take_partial_profit: {e}")
+        print(f"❌ Erreur should_take_partial_profit: {e}")
         return None
 
 
@@ -4824,33 +4823,17 @@ def update_dynamic_tp_and_trailing_be(
     Mise à jour dynamique du TP et du SL suiveur (BE mobile) quand >80% TP atteint.
     
     ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour le BE suiveur
-    
-    Logique :
-    - TP suit BB80 (trend) ou BB20 (counter-trend) avec offset
-    - BE suit BB20_mid pour sécuriser progressivement
-    
-    Args:
-        ex: Exchange CCXT
-        trade_id: ID du trade
-        symbol: Symbole (ex: BTC/USDT:USDT)
-        side: 'buy' ou 'sell'
-        df: DataFrame avec indicateurs
-        entry_price: Prix d'entrée
-        current_price: Prix actuel
-        tp_price: TP actuel
-        sl_price: SL actuel
-        regime: TREND ou COUNTER_TREND
-        breakeven_status: PENDING ou ACTIVE
+    ✅ CORRECTION : Utilise bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
     """
     try:
         is_long = (side == 'buy')
         
-        # Récupérer Bollinger Bands
-        bb20_upper = float(df['bb20_upper'].iloc[-1])
-        bb20_lower = float(df['bb20_lower'].iloc[-1])
+        # ✅ CORRECTION : Noms de colonnes cohérents
+        bb20_upper = float(df['bb20_up'].iloc[-1])
+        bb20_lower = float(df['bb20_lo'].iloc[-1])
         bb20_mid = float(df['bb20_mid'].iloc[-1]) if 'bb20_mid' in df.columns else float(df['sma20'].iloc[-1])
-        bb80_upper = float(df['bb80_upper'].iloc[-1])
-        bb80_lower = float(df['bb80_lower'].iloc[-1])
+        bb80_upper = float(df['bb80_up'].iloc[-1])
+        bb80_lower = float(df['bb80_lo'].iloc[-1])
         
         # Offsets
         try:
@@ -5008,6 +4991,148 @@ def _validate_sl_never_backward(trade_id: int, new_sl: float, side: str) -> bool
         print(f"❌ Erreur _validate_sl_never_backward : {e}")
         # En cas d'erreur, on refuse par sécurité
         return False
+
+def _update_exchange_tp(ex, symbol: str, side: str, new_tp: float):
+    """
+    Met à jour le TP sur l'exchange en annulant l'ancien et plaçant le nouveau.
+    
+    Args:
+        ex: Exchange
+        symbol: Symbole (ex: BTC/USDT:USDT)
+        side: 'buy' ou 'sell'
+        new_tp: Nouveau prix TP
+    """
+    try:
+        is_long = (side == 'buy')
+        close_side = 'sell' if is_long else 'buy'
+        
+        # Récupérer position réelle pour quantité
+        positions = _fetch_positions_safe(ex, [symbol])
+        qty = 0.0
+        
+        for p in positions:
+            if p.get('symbol') == symbol:
+                qty = abs(float(p.get('size', 0) or 0))
+                break
+        
+        if qty <= 0:
+            print(f"⚠️ Aucune position trouvée pour {symbol}, skip update TP")
+            return
+        
+        # Arrondir
+        try:
+            qty = float(ex.amount_to_precision(symbol, qty))
+            new_tp = float(ex.price_to_precision(symbol, new_tp))
+        except Exception:
+            pass
+        
+        # Annuler anciens ordres TP
+        try:
+            open_orders = ex.fetch_open_orders(symbol)
+            for order in open_orders:
+                order_type = str(order.get('type', '')).lower()
+                order_side = str(order.get('side', '')).lower()
+                
+                # Détecter TP : ordre limit reduce-only du côté opposé
+                if order_side == close_side and 'limit' in order_type:
+                    try:
+                        ex.cancel_order(order['id'], symbol)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # Placer nouveau TP
+        try:
+            new_tp_validated = _prepare_validated_tp(ex, symbol, close_side, new_tp)
+        except Exception:
+            new_tp_validated = new_tp
+        
+        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+        
+        ex.create_order(
+            symbol, 'market', close_side, qty, price=None,
+            params={**common_params, 'takeProfitPrice': float(new_tp_validated), 'triggerType': 'mark'}
+        )
+        
+        print(f"   ✅ TP exchange mis à jour : {new_tp_validated:.6f}")
+    
+    except Exception as e:
+        raise Exception(f"Erreur _update_exchange_tp: {e}")
+
+
+def _update_exchange_sl(ex, symbol: str, side: str, new_sl: float):
+    """
+    Met à jour le SL sur l'exchange en annulant l'ancien et plaçant le nouveau.
+    
+    Args:
+        ex: Exchange
+        symbol: Symbole (ex: BTC/USDT:USDT)
+        side: 'buy' ou 'sell'
+        new_sl: Nouveau prix SL
+    """
+    try:
+        is_long = (side == 'buy')
+        close_side = 'sell' if is_long else 'buy'
+        
+        # Récupérer position réelle pour quantité
+        positions = _fetch_positions_safe(ex, [symbol])
+        qty = 0.0
+        
+        for p in positions:
+            if p.get('symbol') == symbol:
+                qty = abs(float(p.get('size', 0) or 0))
+                break
+        
+        if qty <= 0:
+            print(f"⚠️ Aucune position trouvée pour {symbol}, skip update SL")
+            return
+        
+        # Arrondir
+        try:
+            qty = float(ex.amount_to_precision(symbol, qty))
+            new_sl = float(ex.price_to_precision(symbol, new_sl))
+        except Exception:
+            pass
+        
+        # Validation SL stricte
+        try:
+            market = ex.market(symbol) or {}
+            tick_size = _bitget_tick_size(market)
+            mark_price = _current_mark_price(ex, symbol)
+            new_sl = _validate_sl_for_side(side, new_sl, mark_price, tick_size)
+        except Exception:
+            pass
+        
+        # Annuler anciens ordres SL
+        try:
+            open_orders = ex.fetch_open_orders(symbol)
+            for order in open_orders:
+                order_type = str(order.get('type', '')).lower()
+                order_side = str(order.get('side', '')).lower()
+                
+                # Détecter SL : ordre stop du côté opposé
+                if order_side == close_side and 'stop' in order_type:
+                    try:
+                        ex.cancel_order(order['id'], symbol)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # Placer nouveau SL
+        common_params = {'reduceOnly': True, 'tdMode': 'cross', 'posMode': 'oneway'}
+        
+        ex.create_order(
+            symbol, 'market', close_side, qty, price=None,
+            params={**common_params, 'stopLossPrice': float(new_sl), 'triggerType': 'mark'}
+        )
+        
+        print(f"   ✅ SL exchange mis à jour : {new_sl:.6f}")
+    
+    except Exception as e:
+        raise Exception(f"Erreur _update_exchange_sl: {e}")
+
 
 def manage_open_positions(ex):
     """
@@ -5357,33 +5482,25 @@ def manage_open_positions(ex):
             # 6. PYRAMIDING (conditions : >80% TP, max 2 ajouts)
             # ========================================================================
             try:
-                pyramid_count = meta.get('pyramid_count', 0)
-                if pyramid_count < 2:  # Max 2 ajouts
-                    # ✅ PROTECTION DIVISION PAR ZÉRO
-                    tp_distance = abs(tp_price - entry_price)
-                    
-                    if tp_distance < 0.000001:
-                        print(f"⚠️ Distance TP trop petite pour pyramiding {symbol}")
+                # ✅ PROTECTION DIVISION PAR ZÉRO
+                tp_distance = abs(tp_price - entry_price)
+                
+                if tp_distance < 0.000001:
+                    print(f"⚠️ Distance TP trop petite pour pyramiding {symbol}")
+                else:
+                    if is_long:
+                        progress = ((current_price - entry_price) / tp_distance) * 100.0
                     else:
-                        if is_long:
-                            progress = ((current_price - entry_price) / tp_distance) * 100.0
-                        else:
-                            progress = ((entry_price - current_price) / tp_distance) * 100.0
+                        progress = ((entry_price - current_price) / tp_distance) * 100.0
 
-                        if progress >= 80.0:
-                            can_pyramid = should_pyramid_position(
-                                current_price, entry_price, tp_price, is_long,
-                                pyramid_count, meta
-                            )
-
-                            if can_pyramid:
-                                success = execute_pyramid_add(
-                                    ex, trade_id, symbol, side, current_price,
-                                    quantity, entry_price, sl_price, tp_price,
-                                    pyramid_count, meta
-                                )
-                                if success:
-                                    print(f"   📈 Pyramiding ajouté pour {symbol}")
+                    if progress >= 80.0:
+                        # ✅ Appel version complète avec ex, pos, df
+                        pyramid_info = should_pyramid_position(ex, pos, df)
+                        
+                        if pyramid_info:
+                            success = execute_pyramid_add(ex, pyramid_info)
+                            if success:
+                                print(f"   📈 Pyramiding ajouté pour {symbol}")
 
             except Exception as e:
                 print(f"⚠️ Erreur pyramiding pour {symbol}: {e}")
@@ -5392,32 +5509,19 @@ def manage_open_positions(ex):
             # 7. PARTIAL EXITS (conditions : 50% TP, max 1 sortie)
             # ========================================================================
             try:
-                partial_exits_count = meta.get('partial_exits_count', 0)
-                if partial_exits_count < 1:  # Max 1 sortie partielle
-                    # ✅ PROTECTION DIVISION PAR ZÉRO
-                    tp_distance = abs(tp_price - entry_price)
+                # ✅ PROTECTION DIVISION PAR ZÉRO
+                tp_distance = abs(tp_price - entry_price)
+                
+                if tp_distance < 0.000001:
+                    print(f"⚠️ Distance TP trop petite pour partial exit {symbol}")
+                else:
+                    # ✅ Appel version complète avec pos, current_price
+                    exit_info = should_take_partial_profit(pos, current_price)
                     
-                    if tp_distance < 0.000001:
-                        print(f"⚠️ Distance TP trop petite pour partial exit {symbol}")
-                    else:
-                        if is_long:
-                            progress = ((current_price - entry_price) / tp_distance) * 100.0
-                        else:
-                            progress = ((entry_price - current_price) / tp_distance) * 100.0
-
-                        if progress >= 50.0:
-                            can_partial = should_take_partial_profit(
-                                current_price, entry_price, tp_price, is_long,
-                                partial_exits_count, meta
-                            )
-
-                            if can_partial:
-                                success = execute_partial_exit(
-                                    ex, trade_id, symbol, side, current_price,
-                                    quantity, partial_exits_count, meta
-                                )
-                                if success:
-                                    print(f"   💰 Sortie partielle pour {symbol}")
+                    if exit_info:
+                        success = execute_partial_exit(ex, exit_info)
+                        if success:
+                            print(f"   💰 Sortie partielle pour {symbol}")
 
             except Exception as e:
                 print(f"⚠️ Erreur partial exit pour {symbol}: {e}")
