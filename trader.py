@@ -5133,7 +5133,6 @@ def _update_exchange_sl(ex, symbol: str, side: str, new_sl: float):
     except Exception as e:
         raise Exception(f"Erreur _update_exchange_sl: {e}")
 
-
 def manage_open_positions(ex):
     """
     Gère toutes les positions ouvertes :
@@ -5146,7 +5145,7 @@ def manage_open_positions(ex):
     - Partial exits
     
     ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
-    ✅ CORRECTION BE : Utilise BB20_mid au moment du contact pour calculer le PnL sécurisé
+    ✅ CORRECTION BE : Contact BB20_mid détecté en MONTÉE et DESCENTE (pas seulement retracement)
     ✅ PROTECTION : Toutes les divisions sont protégées contre division par zéro
     ✅ CORRECTION BB : Utilise bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
     """
@@ -5325,11 +5324,12 @@ def manage_open_positions(ex):
 
             # ========================================================================
             # 4. BREAKEVEN DYNAMIQUE (contact BB20_mid APRÈS open_timestamp)
+            # ✅ CORRECTION : Détecte MONTÉE + DESCENTE
             # ========================================================================
             if breakeven_status == 'PENDING':
                 should_activate_be = False
                 be_sl = entry_price
-                be_trigger_price = None  # ✅ NOUVEAU : Prix au moment du contact BB20_mid
+                be_trigger_price = None
 
                 try:
                     # Gestion robuste colonne timestamp manquante
@@ -5343,10 +5343,25 @@ def manage_open_positions(ex):
                     if len(df_after_entry) > 0:
                         bb20_mid_col = 'bb20_mid' if 'bb20_mid' in df.columns else 'sma20'
                         
+                        # ✅ NOUVEAU CODE : Détecte MONTÉE + DESCENTE
                         if is_long:
-                            be_touches = df_after_entry[df_after_entry['low'] <= df_after_entry[bb20_mid_col]]
+                            # LONG : Contact si LOW touche OU si bougie TRAVERSE BB20_mid
+                            be_touches = df_after_entry[
+                                (df_after_entry['low'] <= df_after_entry[bb20_mid_col]) |  # Retracement
+                                (
+                                    (df_after_entry['open'] < df_after_entry[bb20_mid_col]) &  # Démarre en-dessous
+                                    (df_after_entry['high'] >= df_after_entry[bb20_mid_col])   # Traverse vers le haut
+                                )
+                            ]
                         else:
-                            be_touches = df_after_entry[df_after_entry['high'] >= df_after_entry[bb20_mid_col]]
+                            # SHORT : Contact si HIGH touche OU si bougie TRAVERSE BB20_mid
+                            be_touches = df_after_entry[
+                                (df_after_entry['high'] >= df_after_entry[bb20_mid_col]) |  # Retracement
+                                (
+                                    (df_after_entry['open'] > df_after_entry[bb20_mid_col]) &  # Démarre au-dessus
+                                    (df_after_entry['low'] <= df_after_entry[bb20_mid_col])    # Traverse vers le bas
+                                )
+                            ]
 
                         if len(be_touches) > 0:
                             should_activate_be = True
