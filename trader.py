@@ -633,494 +633,6 @@ def is_good_trading_session() -> bool:
 
 def _inside(val: float, lo: float, up: float) -> bool:
     return float(lo) <= float(val) <= float(up)
-    
-def _near_bb80_with_tolerance(extreme: float, bb80_band: float, side: str, tol_pct: float, atr: float, atr_k: float) -> bool:
-    """
-    Tolérance SEULEMENT pour la BOUJIE DE CONTACT (pas SL/TP):
-      - BUY  : low <= bb80_lo  OU low <= bb80_lo*(1+tol_pct)  OU low <= bb80_lo + ATR*atr_k
-      - SELL : high >= bb80_up OU high >= bb80_up*(1-tol_pct) OU high >= bb80_up - ATR*atr_k
-    """
-    extreme = float(extreme); bb80_band = float(bb80_band)
-    tol_pct = float(tol_pct); atr = float(atr); atr_k = float(atr_k)
-    if side == 'buy':
-        return (extreme <= bb80_band) or (extreme <= bb80_band * (1.0 + tol_pct)) or (extreme <= bb80_band + atr * atr_k)
-    else:
-        return (extreme >= bb80_band) or (extreme >= bb80_band * (1.0 - tol_pct)) or (extreme >= bb80_band - atr * atr_k)
-
-def _touched_with_tol(price: float, band: float, side: str, tol_pct: float) -> bool:
-    """
-    Tolérance de contact sur la BB80 (jaune).
-    - Long : on accepte si low <= bb80_lo * (1 + tol_pct)
-    - Short: on accepte si high >= bb80_up * (1 - tol_pct)
-    """
-    band = float(band); price = float(price); tol = float(tol_pct)
-    if side == 'buy':
-        return price <= band * (1.0 + tol)
-    else:
-        return price >= band * (1.0 - tol)
-
-def _maybe_improve_rr_with_cut_wick(prev: pd.Series, entry: float, sl: float, tp: float, side: str) -> Tuple[float, float]:
-    """
-    Si CUT_WICK_FOR_RR est ON (DB) et si RR initial < MIN_RR mais >= 2.8,
-    recalcule un RR en 'coupant la mèche' (SL basé sur le corps de la bougie de déclenchement).
-    Retourne (rr_alternatif, sl_original_ignoré). Le SL réel n’est pas modifié ici.
-    """
-    enabled = str(database.get_setting('CUT_WICK_FOR_RR', 'false')).lower() == 'true'
-    if not enabled:
-        if side == 'buy':
-            return ((tp - entry) / (entry - sl), sl)
-        else:
-            return ((entry - tp) / (sl - entry), sl)
-
-    open_, close_ = float(prev['open']), float(prev['close'])
-    body_high, body_low = (max(open_, close_), min(open_, close_))
-    if side == 'buy':
-        sl_body = body_low  # coupe la mèche basse
-        rr_alt = (tp - entry) / (entry - sl_body) if (entry - sl_body) > 0 else 0.0
-        return rr_alt, sl
-    else:
-        sl_body = body_high # coupe la mèche haute
-        rr_alt = (entry - tp) / (sl_body - entry) if (sl_body - entry) > 0 else 0.0
-        return rr_alt, sl
-
-def is_valid_reaction_candle(candle: pd.Series, side: str, prev: Optional[pd.Series] = None) -> bool:
-    """Validation stricte de la bougie de réaction.
-    Règles DB:
-      - DOJI_BODY_MAX (def 0.10)
-      - PINBAR_MAX_BODY (def 0.30)
-      - SIMPLE_WICK_MIN (def 0.30)   # >= 30% du range pour la grande mèche
-      - PINBAR_OPP_WICK_MAX (def 0.20)
-      - MARUBOZU_MIN_BODY (def 0.30)
-      - WICK_HUGE_MAX (def 0.70)
-    Spécifique:
-      - PINBAR: couleur indifférente ; on exige seulement la bonne mèche (opposée au trade) et les ratios ci-dessus.
-      - Autres patterns (impulsion/marubozu/gap/double): direction dans le sens du trade.
-    """
-    try:
-        doji_max            = float(database.get_setting('DOJI_BODY_MAX', 0.10))
-        pinbar_max_body     = float(database.get_setting('PINBAR_MAX_BODY', 0.30))
-        simple_wick_min     = float(database.get_setting('SIMPLE_WICK_MIN', 0.30))
-        pinbar_opp_wick_max = float(database.get_setting('PINBAR_OPP_WICK_MAX', 0.20))
-        marubozu_min_body   = float(database.get_setting('MARUBOZU_MIN_BODY', 0.30))
-        wick_huge_max       = float(database.get_setting('WICK_HUGE_MAX', 0.70))
-    except Exception:
-        doji_max, pinbar_max_body, simple_wick_min = 0.10, 0.30, 0.30
-        pinbar_opp_wick_max, marubozu_min_body, wick_huge_max = 0.20, 0.30, 0.70
-
-    o, c = float(candle['open']), float(candle['close'])
-    h, l = float(candle['high']), float(candle['low'])
-    rng  = max(1e-12, h - l)
-    body = abs(c - o)
-    w_up = max(0.0, h - max(o, c))
-    w_dn = max(0.0, min(o, c) - l)
-
-    body_r = body / rng
-    w_up_r = w_up / rng
-    w_dn_r = w_dn / rng
-
-    # (A) Rejet sécurité : mèche énorme du côté trade
-    if side == 'buy' and w_dn_r > wick_huge_max:
-        return False
-    if side == 'sell' and w_up_r > wick_huge_max:
-        return False
-
-    # (B) PINBAR (couleur indifférente) — uniquement des conditions de mèches/corps
-    if body_r <= pinbar_max_body:
-        if side == 'buy':
-            # Long ⇒ grande mèche basse (>= 30%), petite mèche haute (<= opp max)
-            if w_dn_r >= simple_wick_min and w_up_r <= pinbar_opp_wick_max:
-                return True
-        else:
-            # Short ⇒ grande mèche haute, petite mèche basse
-            if w_up_r >= simple_wick_min and w_dn_r <= pinbar_opp_wick_max:
-                return True
-        # si pinbar non valide, on continue aux autres patterns
-
-    # (C) Éliminer les dojis trop faibles pour le reste
-    if body_r < doji_max:
-        return False
-
-    # (D) Pour les autres patterns, on exige la direction dans le sens du trade
-    is_bull = c > o
-    if (side == 'buy' and not is_bull) or (side == 'sell' and is_bull):
-        return False
-
-    # (E) Impulsion / marubozu directionnels
-    if body_r >= marubozu_min_body:
-        return True
-
-    # (F) Motifs inter-bougies (avec direction du cur déjà validée ci-dessus)
-    if prev is not None:
-        if _is_gap_impulse(prev, candle, side):
-            return True
-        if _is_double_marubozu(prev, candle, side):
-            return True
-
-    return False
-
-
-
-def _compute_body_wicks(candle: pd.Series) -> Tuple[float, float, float, float]:
-    """
-    Retourne (body_ratio, wick_up_ratio, wick_down_ratio, range) par rapport au range de la bougie.
-    """
-    o, c = float(candle['open']), float(candle['close'])
-    h, l = float(candle['high']), float(candle['low'])
-    rng = max(1e-12, h - l)
-    body = abs(c - o)
-    w_up = max(0.0, h - max(o, c))
-    w_dn = max(0.0, min(o, c) - l)
-    return body / rng, w_up / rng, w_dn / rng, rng
-
-def _body_ratio(candle: pd.Series) -> float:
-    o, c = float(candle['open']), float(candle['close'])
-    h, l = float(candle['high']), float(candle['low'])
-    rng = max(1e-12, h - l)
-    return abs(c - o) / rng
-
-
-def _is_gap_impulse(prev: pd.Series, cur: pd.Series, side: str) -> bool:
-    """
-    Détection 'Gap + Impulsion' entre prev et cur (agnostique à la couleur).
-      - GAP_MIN_PCT (def 0.001 = 0.1%)
-      - IMPULSE_MIN_BODY (def 0.35 = 35% du range)
-    """
-    if prev is None or cur is None:
-        return False
-    try:
-        gap_min_pct      = float(database.get_setting('GAP_MIN_PCT', 0.001))
-        impulse_min_body = float(database.get_setting('IMPULSE_MIN_BODY', 0.35))
-    except Exception:
-        gap_min_pct, impulse_min_body = 0.001, 0.35
-
-    prev_close = float(prev['close'])
-    cur_open   = float(cur['open'])
-    if prev_close <= 0:
-        return False
-
-    gap_ratio = abs(cur_open - prev_close) / prev_close
-    if gap_ratio < gap_min_pct:
-        return False
-
-    body_r, _, _, _ = _compute_body_wicks(cur)
-    if body_r < impulse_min_body:
-        return False
-
-    return True
-
-def _is_double_marubozu(prev: pd.Series, cur: pd.Series, side: str) -> bool:
-    """
-    Détection 'Double marubozu 30%' (agnostique à la couleur) :
-      - body_ratio(prev) ≥ DOUBLE_MARUBOZU_MIN (def 0.30)
-      - body_ratio(cur)  ≥ DOUBLE_MARUBOZU_MIN (def 0.30)
-      - mèches de chaque bougie ≤ DOUBLE_MARUBOZU_WICK_MAX (def 0.10)
-    """
-    if prev is None or cur is None:
-        return False
-    try:
-        min_body_ratio = float(database.get_setting('DOUBLE_MARUBOZU_MIN', 0.30))
-        max_wick_ratio = float(database.get_setting('DOUBLE_MARUBOZU_WICK_MAX', 0.10))
-    except Exception:
-        min_body_ratio, max_wick_ratio = 0.30, 0.10
-
-    b1, u1, d1, _ = _compute_body_wicks(prev)
-    b2, u2, d2, _ = _compute_body_wicks(cur)
-
-    if not (b1 >= min_body_ratio and b2 >= min_body_ratio):
-        return False
-    if any(x > max_wick_ratio for x in (u1, d1, u2, d2)):
-        return False
-
-    return True
-
-def _is_valid_reaction(df: pd.DataFrame, i: int, direction: str) -> bool:
-    """
-    Valide la 'bougie de réaction' selon le preset Balanced, pour LONG et SHORT.
-    Exigences :
-      1) Close À L’INTÉRIEUR de la BB20 (entre bb20_low et bb20_high).
-      2) Structure directionnelle OBLIGATOIRE :
-         - impulse (corps >= IMPULSE_MIN_BODY) dans le sens du trade
-           OU
-         - pin-bar (mèche dominante >= SIMPLE_WICK_MIN, corps <= PINBAR_MAX_BODY)
-           avec la mèche opposée <= PINBAR_OPP_WICK_MAX dans le sens du trade.
-    Args:
-        df: DataFrame avec colonnes ['open','high','low','close','bb20_low','bb20_high'].
-        i: index (int) de la bougie candidate.
-        direction: 'long' ou 'short'.
-    Returns:
-        bool
-    """
-    row = df.iloc[i]
-    o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
-    bb_low = float(row["bb20_low"])
-    bb_high = float(row["bb20_high"])
-
-    # 1) Réintégration BB20 obligatoire
-    if not (bb_low <= c <= bb_high):
-        return False
-
-    # Mesures de bougie
-    rng = max(h - l, 1e-12)
-    body = abs(c - o)
-    body_pct = body / rng
-    up_wick = h - max(o, c)
-    dn_wick = min(o, c) - l
-    up_wick_pct = up_wick / rng
-    dn_wick_pct = dn_wick / rng
-
-    # Tolérances (fallback si non définies plus haut dans le fichier)
-    pinbar_opp_max = globals().get("PINBAR_OPP_WICK_MAX", 0.24)
-
-    # 2) Structure directionnelle
-    if direction == "long":
-        impulse_ok = (c > o) and (body_pct >= IMPULSE_MIN_BODY)
-        pinbar_ok = (dn_wick_pct >= SIMPLE_WICK_MIN) and (body_pct <= PINBAR_MAX_BODY) and (up_wick_pct <= pinbar_opp_max)
-        return bool(impulse_ok or pinbar_ok)
-
-    if direction == "short":
-        impulse_ok = (c < o) and (body_pct >= IMPULSE_MIN_BODY)
-        pinbar_ok = (up_wick_pct >= SIMPLE_WICK_MIN) and (body_pct <= PINBAR_MAX_BODY) and (dn_wick_pct <= pinbar_opp_max)
-        return bool(impulse_ok or pinbar_ok)
-
-    return False
-
-def _reaction_trigger_levels(df: pd.DataFrame, i: int, direction: str) -> Optional[Dict[str, float]]:
-    """
-    Donne les niveaux d'EXÉCUTION issus de la bougie de réaction validée :
-      - entrée uniquement sur CASSURE du high (long) / low (short) de la réaction
-      - SL de référence = low (long) / high (short) de la réaction (les coussins %/ATR sont ajoutés ailleurs)
-    Args:
-        df: DataFrame OHLC avec index i existant.
-        i: index (int) de la bougie de réaction (déjà validée par _is_valid_reaction).
-        direction: 'long' ou 'short'.
-    Returns:
-        dict avec {'entry_trigger','sl_ref'} ou None si direction invalide.
-    """
-    row = df.iloc[i]
-    h, l = float(row["high"]), float(row["low"])
-
-    if direction == "long":
-        return {"entry_trigger": h, "sl_ref": l}
-    if direction == "short":
-        return {"entry_trigger": l, "sl_ref": h}
-    return None
-
-
-def _sl_from_contact_candle(contact: pd.Series, side: str, atr_contact: Optional[float] = None) -> float:
-    """
-    Calcule le SL à partir de la bougie de CONTACT (bougie 1) avec offset hybride.
-      - Long  (buy)  : ancre = low(contact)  → SL = low * (1 - max(pct, ATR*k/low))
-      - Short (sell) : ancre = high(contact) → SL = high * (1 + max(pct, ATR*k/high))
-
-    Args:
-        contact: pd.Series contenant au minimum open/close/high/low (et idéalement 'atr').
-        side: 'buy' | 'sell'
-        atr_contact: ATR de la bougie contact si déjà calculé (optionnel). Sinon on tente contact['atr'].
-
-    Returns:
-        float: prix de stop-loss calculé (>= 0). En cas de données manquantes, renvoie l’ancre brute.
-    """
-    try:
-        s = str(side or "").strip().lower()
-        if s not in ("buy", "sell"):
-            return 0.0
-
-        # Récupération robuste des champs
-        h = float(contact.get("high")) if "high" in contact else float(contact["high"])
-        l = float(contact.get("low"))  if "low"  in contact else float(contact["low"])
-        if not (h > 0 and l > 0):
-            # Données insuffisantes : on renvoie un fallback neutre
-            return max(0.0, l if s == "buy" else h)
-
-        # ATR de référence (si fourni, sinon depuis la bougie)
-        atr_val = None
-        if atr_contact is not None:
-            try:
-                atr_val = float(atr_contact)
-            except Exception:
-                atr_val = None
-        if atr_val is None:
-            try:
-                atr_val = float(contact.get("atr", 0.0))
-            except Exception:
-                atr_val = 0.0
-
-        # Ancre = extrême de la bougie de contact dans le sens opposé à l'entrée
-        anchor = l if s == "buy" else h
-        if anchor <= 0:
-            return max(0.0, anchor)
-
-        # Offset hybride (pourcentage vs ATR*k converti en %) appliqué sur l’ancre
-        sl = adjust_sl_for_offset(
-            raw_sl=float(anchor),
-            side=s,
-            atr=float(atr_val or 0.0),
-            ref_price=float(anchor)  # conversion ATR→% par rapport à l’ancre
-        )
-
-        # Garde-fous numériques
-        if not (sl > 0):
-            return max(0.0, anchor)
-        return float(sl)
-
-    except Exception:
-        # En cas d’imprévu, on renvoie l’ancre (comportement conservateur)
-        try:
-            if str(side).lower() == "buy":
-                return float(contact.get("low", 0.0))
-            else:
-                return float(contact.get("high", 0.0))
-        except Exception:
-            return 0.0
-
-def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
-    """
-    Retourne l'index de la dernière bougie de CONTACT (avant la réaction si base_exclude_last=True),
-    c.-à-d. une bougie qui touche la BB20_lo (pour un long) ou la BB20_up (pour un short).
-    On ne déduit PAS le sens ici : on cherche juste la bougie la plus récente qui touche au moins une borne BB20.
-    """
-    if df is None or len(df) < 3:
-        return None
-
-    start = -2 if base_exclude_last else -1
-    base_idx = len(df) + start
-    lb = max(1, int(max_lookback))
-
-    for back in range(1, lb + 1):
-        idx = base_idx - back
-        if idx < 0:
-            break
-        row = df.iloc[idx]
-        # "touch" générique : low <= bb20_lo OU high >= bb20_up
-        try:
-            touched_lo = float(row['low'])  <= float(row['bb20_lo'])
-            touched_up = float(row['high']) >= float(row['bb20_up'])
-        except Exception:
-            continue
-        if touched_lo or touched_up:
-            return idx
-    return None
-
-def _previous_wave_by_bb80(df: pd.DataFrame, idx: int, dead_zone_pct: float) -> Optional[str]:
-    """
-    Détermine le sens de la VAGUE PRÉCÉDENTE uniquement via CLOSE vs bb80_mid,
-    en sortant de la dead-zone autour de bb80_mid.
-    Retourne 'up' | 'down' | None.
-    """
-    if df is None or len(df) == 0:
-        return None
-    i = max(0, min(idx, len(df) - 1))
-    for k in range(i - 1, -1, -1):
-        try:
-            close_k = float(df.iloc[k]['close'])
-            mid_k   = float(df.iloc[k]['bb80_mid'])
-            dz_k    = mid_k * (dead_zone_pct / 100.0)
-        except Exception:
-            continue
-        if abs(close_k - mid_k) >= dz_k:
-            return 'up' if close_k > mid_k else 'down'
-    return None
-
-def _is_inside_both_bb(row, is_long: bool) -> bool:
-    """
-    Retourne True si la clôture est à l'intérieur des DEUX bandes :
-      - BB20 (bb20_lo / bb20_up)
-      - BB80 (bb80_lo / bb80_up)
-    C'est notre définition de "réintégration claire" pour la CT.
-    """
-    try:
-        c = float(row['close'])
-        bb20_up = float(row['bb20_up'])
-        bb20_lo = float(row['bb20_lo'])
-        bb80_up = float(row['bb80_up'])
-        bb80_lo = float(row['bb80_lo'])
-    except Exception:
-        return False
-
-    return (bb20_lo <= c <= bb20_up) and (bb80_lo <= c <= bb80_up)
-
-
-def _check_ct_reintegration_window(df: pd.DataFrame, is_long: bool, max_window: int = 3) -> bool:
-    """
-    Gate spécifique CONTRE-TENDANCE.
-
-    Vérifie, dans les (max_window+1) dernières bougies clôturées avant l'entrée :
-      1) présence d'un CONTACT BB80 (haut pour un short, bas pour un long),
-      2) une RÉINTÉGRATION en clôture à l'intérieur des DEUX BB (20 et 80),
-      3) aucune "ressortie" en clôture des BB20/BB80 entre cette réintégration
-         et la bougie de réaction.
-
-    Si la séquence n'est pas respectée → False (on rejette le signal CT).
-    """
-    try:
-        if df is None:
-            return False
-        # Besoin d'au moins (max_window + 2) bougies :
-        #  - 1 bougie courante (open d'entrée)
-        #  - 1 bougie de réaction
-        #  - max_window bougies de contexte.
-        if len(df) < max_window + 2:
-            return False
-
-        # On travaille sur les bougies clôturées : on exclut la dernière,
-        # qui sert d'open d'entrée (CT_ENTRY_ON_NEXT_BAR).
-        # Exemple max_window=3 → on regarde les 4 dernières bougies clôturées
-        # (dont la bougie de réaction).
-        window = df.iloc[-(max_window + 1):-1]
-    except Exception:
-        return False
-
-    if window is None or len(window) == 0:
-        return False
-
-    # 1) Recherche du contact BB80 dans la fenêtre (on prend le DERNIER contact trouvé).
-    contact_idx = None
-    for idx, row in window.iterrows():
-        try:
-            if is_long:
-                touched = float(row['low']) <= float(row['bb80_lo'])
-            else:
-                touched = float(row['high']) >= float(row['bb80_up'])
-        except Exception:
-            touched = False
-
-        if touched:
-            contact_idx = idx
-
-    if contact_idx is None:
-        # Pas de contact BB80 → séquence CT invalide
-        return False
-
-    # 2) Recherche de la première bougie de réintégration (clôture dans BB20 ET BB80)
-    reintegration_idx = None
-    idxs = list(window.index)
-    start_found = False
-    for idx in idxs:
-        if idx == contact_idx:
-            start_found = True
-        if not start_found:
-            continue
-
-        row = window.loc[idx]
-        if _is_inside_both_bb(row, is_long):
-            reintegration_idx = idx
-            break
-
-    if reintegration_idx is None:
-        # Pas de réintégration claire après le contact
-        return False
-
-    # 3) Vérifier qu'entre la réintégration et la bougie de réaction
-    #    on ne ressort pas des BB20/BB80 en clôture.
-    start_pos = idxs.index(reintegration_idx)
-    for idx in idxs[start_pos:]:
-        row = window.loc[idx]
-        if not _is_inside_both_bb(row, is_long):
-            # Ressortie → séquence CT invalide
-            return False
-
-    return True
-
 
 # ============================================================================
 # VALIDATION PATTERNS DARWIN (selon slides)
@@ -1402,6 +914,78 @@ def validate_double_extreme_ct(df: pd.DataFrame, contact_idx: int) -> bool:
     
     return bb20_touched and bb80_touched
 
+def _find_contact_index(df: pd.DataFrame, base_exclude_last: bool = True, max_lookback: int = 5) -> Optional[int]:
+    """
+    Trouve l'index de la bougie de contact BB20/BB80 la plus récente.
+    
+    Utilisée pour générer les graphiques de trades.
+    
+    LOGIQUE :
+    - Cherche contact BB20 (tendance) OU BB80 (CT)
+    - Dans les dernières bougies (max_lookback)
+    - Exclut la dernière bougie si base_exclude_last=True
+    
+    Args:
+        df: DataFrame marché
+        base_exclude_last: Si True, exclut la dernière bougie de la recherche
+        max_lookback: Nombre de bougies à analyser (défaut 5)
+    
+    Returns:
+        Index de la bougie de contact, ou None si non trouvé
+    """
+    try:
+        if df is None or len(df) < 3:
+            return None
+        
+        required_cols = ['high', 'low', 'bb20_up', 'bb20_lo', 'bb80_up', 'bb80_lo']
+        if not all(col in df.columns for col in required_cols):
+            return None
+        
+        # Définir la fenêtre de recherche
+        end_idx = len(df) - 1 if base_exclude_last else len(df)
+        start_idx = max(0, end_idx - max_lookback)
+        
+        # Chercher le contact le plus récent (de la fin vers le début)
+        for i in range(end_idx - 1, start_idx - 1, -1):
+            try:
+                bar = df.iloc[i]
+                
+                high = float(bar['high'])
+                low = float(bar['low'])
+                bb20_up = float(bar['bb20_up'])
+                bb20_lo = float(bar['bb20_lo'])
+                bb80_up = float(bar['bb80_up'])
+                bb80_lo = float(bar['bb80_lo'])
+                
+                # Tolérance 0.2% (cohérent avec detect_signal)
+                tolerance = 0.002
+                
+                # Contact BB20 bas (LONG tendance)
+                if low <= bb20_lo * (1.0 + tolerance):
+                    return i
+                
+                # Contact BB20 haut (SHORT tendance)
+                if high >= bb20_up * (1.0 - tolerance):
+                    return i
+                
+                # Contact BB80 bas (LONG CT)
+                if low <= bb80_lo * (1.0 + tolerance):
+                    return i
+                
+                # Contact BB80 haut (SHORT CT)
+                if high >= bb80_up * (1.0 - tolerance):
+                    return i
+            
+            except Exception:
+                continue
+        
+        # Aucun contact trouvé
+        return None
+    
+    except Exception as e:
+        print(f"Erreur _find_contact_index: {e}")
+        return None
+        
 def _is_first_after_prolonged_bb80_exit(df: pd.DataFrame, is_long: bool, min_streak: int = 5, lookback: int = 50) -> bool:
     """
     Détecte si on est juste après une sortie PROLONGÉE de la BB80 (GATE 3).
@@ -1625,305 +1209,321 @@ def wait_for_next_candle_open(symbol: str, timeframe: str = '1h', max_wait: int 
 
 def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
-    Détecte un signal Darwin (Tendance ou CT) avec validation stricte.
+    Détecte un signal Darwin (Tendance ou CT) avec validation stricte PATTERNS.
     
-    ✅ CORRECTIONS CRITIQUES :
-    - SL basé sur LOW (BUY) ou HIGH (SELL) du contact
-    - Calcul RR correct via calculate_rr()
-    - Retourne raison si signal skipped
-    - Détection sur bougie fermée (df[-2])
-    
-    LOOKBACK FIXE : 3 bougies max (non modifiable)
-    
-    RÈGLES DARWIN :
-    - TENDANCE : Contact BB20 + Réintégration BB20
-    - CT : Double extrême BB20+BB80 + Réintégration BB20+BB80
+    ✅ TOLÉRANCE BB : Configurable (DB + ATR)
+    ✅ PATTERNS DARWIN : Intégrés via find_reaction_pattern()
+    ✅ RÉINTÉGRATION : Obligatoire (validate_reintegration_bb20)
     
     Returns:
-        Dict avec signal complet OU avec 'skip_reason' si invalide
+        Dict avec signal complet OU None si invalide
     """
-    
-    # ✅ MODE DEBUG DÉSACTIVÉ (production)
-    DEBUG = False
-    
-    if DEBUG:
-        print(f"\n{'='*60}")
-        print(f"[DETECT] 🔍 Analyse {symbol}")
-        print(f"{'='*60}")
     
     # Validation DataFrame
     if df is None or len(df) < 85:
-        if DEBUG:
-            print(f"[DETECT] ❌ REJETÉ: DF trop court ({len(df) if df is not None else 0} < 85)")
         return None
     
-    if DEBUG:
-        print(f"[DETECT] ✅ DF length: {len(df)}")
-    
-    # Validation colonnes requises
-    required_cols = ['close', 'high', 'low', 'mm80', 'bb20_mid', 'bb20_up', 'bb20_lo', 'bb80_up', 'bb80_lo']
-    missing = [col for col in required_cols if col not in df.columns]
-    
-    if missing:
-        if DEBUG:
-            print(f"[DETECT] ❌ REJETÉ: Colonnes manquantes: {missing}")
+    required_cols = ['close', 'high', 'low', 'mm80', 'bb20_mid', 'bb20_up', 'bb20_lo', 'bb80_up', 'bb80_lo', 'atr']
+    if not all(col in df.columns for col in required_cols):
         return None
     
-    # ✅ DÉTECTION SUR BOUGIE FERMÉE (df[-2] au lieu de df[-1])
     if len(df) < 2:
         return None
     
-    current = df.iloc[-2]  # ✅ Bougie fermée
+    current = df.iloc[-2]  # Bougie fermée
     
     close_now = float(current['close'])
     mm80 = float(current['mm80'])
-    bb20_mid = float(current['bb20_mid'])
     bb20_up = float(current['bb20_up'])
     bb20_lo = float(current['bb20_lo'])
     bb80_up = float(current['bb80_up'])
     bb80_lo = float(current['bb80_lo'])
+    atr = float(current.get('atr', 0.0))
     
-    if DEBUG:
-        print(f"\n[DETECT] 📊 Prix actuel: {close_now:.4f}")
-        print(f"[DETECT] MM80: {mm80:.4f}")
+    # ✅ PARAMÈTRES TOLÉRANCE BB (depuis DB)
+    try:
+        bb_contact_tol_pct = float(database.get_setting('BB_CONTACT_TOLERANCE_PCT', '0.2'))
+    except:
+        bb_contact_tol_pct = 0.2
     
-    # Position par rapport à MM80
+    try:
+        bb_contact_use_atr = str(database.get_setting('BB_CONTACT_USE_ATR', 'true')).lower() == 'true'
+    except:
+        bb_contact_use_atr = True
+    
+    try:
+        bb_contact_atr_k = float(database.get_setting('BB_CONTACT_ATR_K', '0.3'))
+    except:
+        bb_contact_atr_k = 0.3
+    
+    # ✅ FONCTION HELPER TOLÉRANCE
+    def _check_bb_contact(price: float, bb_level: float, is_long: bool) -> bool:
+        """
+        Vérifie contact BB avec tolérance hybride (% OU ATR).
+        
+        LONG  : price <= bb_level * (1 + tol%) OU price <= bb_level + ATR*k
+        SHORT : price >= bb_level * (1 - tol%) OU price >= bb_level - ATR*k
+        """
+        # Tolérance %
+        tol_pct = bb_contact_tol_pct / 100.0
+        
+        if is_long:
+            # Contact vers le BAS (low <= bb)
+            if price <= bb_level:
+                return True
+            if price <= bb_level * (1.0 + tol_pct):
+                return True
+            if bb_contact_use_atr and atr > 0:
+                if price <= bb_level + (atr * bb_contact_atr_k):
+                    return True
+        else:
+            # Contact vers le HAUT (high >= bb)
+            if price >= bb_level:
+                return True
+            if price >= bb_level * (1.0 - tol_pct):
+                return True
+            if bb_contact_use_atr and atr > 0:
+                if price >= bb_level - (atr * bb_contact_atr_k):
+                    return True
+        
+        return False
+    
     is_above_mm80 = close_now > mm80
     is_below_mm80 = close_now < mm80
     
-    # ============================================================================
+    # ========================================================================
     # TENDANCE LONG (prix > MM80, contact BB20_lo)
-    # ============================================================================
+    # ========================================================================
     
     if is_above_mm80:
-        if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche TENDANCE LONG...")
-        
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
             bar = df.iloc[i]
             
-            if float(bar['low']) <= float(bar['bb20_lo']) * 1.002:
+            # ✅ TOLÉRANCE CONFIGURABLE
+            if _check_bb_contact(float(bar['low']), float(bar['bb20_lo']), is_long=True):
                 contact_idx = i
-                if DEBUG:
-                    print(f"[DETECT] ✅ Contact BB20_lo trouvé à index {i}")
                 break
         
-        if contact_idx is None:
-            if DEBUG:
-                print(f"[DETECT] ❌ Aucun contact BB20_lo")
-        else:
-            # Réintégration BB20
-            reintegrated = False
-            for j in range(contact_idx + 1, len(df)):
-                if float(df.iloc[j]['close']) > float(df.iloc[j]['bb20_lo']):
-                    reintegrated = True
-                    if DEBUG:
-                        print(f"[DETECT] ✅ Réintégration BB20 confirmée")
-                    break
+        if contact_idx is not None:
+            reaction_result = find_reaction_pattern(df, contact_idx, 'long')
             
-            if not reintegrated:
-                if DEBUG:
-                    print(f"[DETECT] ❌ Pas de réintégration BB20")
-            else:
-                contact_bar = df.iloc[contact_idx]
-                
-                # ✅ CORRECTION : SL sur le LOW (pour BUY)
-                try:
-                    sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
-                except Exception:
-                    sl_offset_pct = 0.3
-                
-                sl = float(contact_bar['low']) * (1 - sl_offset_pct / 100)
-                
-                # TP sur BB80_up
-                try:
-                    tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
-                except Exception:
-                    tp_offset_pct = 0.3
-                
-                tp = bb80_up * (1 + tp_offset_pct / 100)
-                entry = close_now
-                
-                # ✅ CALCUL RR CORRECT
-                rr = calculate_rr(entry, sl, tp, 'buy')
-                
-                if DEBUG:
-                    print(f"\n[DETECT] 💰 Calcul RR:")
-                    print(f"[DETECT] Entry: {entry:.4f}")
-                    print(f"[DETECT] SL: {sl:.4f} (LOW du contact)")
-                    print(f"[DETECT] TP: {tp:.4f}")
-                    print(f"[DETECT] RR: {rr:.2f}")
-                
-                # Vérifier RR minimum
-                try:
-                    min_rr = float(database.get_setting('MIN_RR', '2.8'))
-                except Exception:
-                    min_rr = 2.8
-                
-                if rr < min_rr:
-                    skip_reason = f"RR insuffisant (x{rr:.2f} < x{min_rr})"
-                    
-                    if DEBUG:
-                        print(f"[DETECT] ❌ {skip_reason}")
-                    
-                    # ✅ RETOURNER SIGNAL AVEC RAISON
-                    return {
-                        'side': 'buy',
-                        'regime': 'Tendance',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'trend_long',
-                        'skip_reason': skip_reason  # ✅ CRITIQUE
-                    }
-                else:
-                    if DEBUG:
-                        print(f"[DETECT] ✅✅✅ SIGNAL TENDANCE LONG VALIDE!")
-                    
-                    return {
-                        'side': 'buy',
-                        'regime': 'Tendance',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'trend_long'
-                    }
+            if not reaction_result['valid']:
+                return {
+                    'skip_reason': f"Pas de pattern Darwin : {reaction_result['reason']}",
+                    'side': 'buy',
+                    'regime': 'Tendance'
+                }
+            
+            reaction_idx = reaction_result['reaction_idx']
+            
+            reint_result = validate_reintegration_bb20(df, reaction_idx, 'long')
+            
+            if not reint_result['valid']:
+                return {
+                    'skip_reason': f"Réintégration manquante : {reint_result['reason']}",
+                    'side': 'buy',
+                    'regime': 'Tendance'
+                }
+            
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            contact_low = float(contact_bar['low'])
+            reaction_low = float(reaction_bar['low'])
+            sl_anchor = min(contact_low, reaction_low)
+            
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
+            except:
+                sl_offset_pct = 0.3
+            
+            sl = sl_anchor * (1 - sl_offset_pct / 100)
+            
+            try:
+                tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
+            except:
+                tp_offset_pct = 0.3
+            
+            tp = bb80_up * (1 + tp_offset_pct / 100)
+            entry = close_now
+            
+            rr = calculate_rr(entry, sl, tp, 'buy')
+            
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '2.8'))
+            except:
+                min_rr = 2.8
+            
+            if rr < min_rr:
+                return {
+                    'side': 'buy',
+                    'regime': 'Tendance',
+                    'entry': entry,
+                    'sl': sl,
+                    'tp': tp,
+                    'rr': rr,
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'pattern': reaction_result['pattern'],
+                    'skip_reason': f"RR insuffisant (x{rr:.2f} < x{min_rr})",
+                    'contact_high': float(contact_bar['high']),
+                    'contact_low': contact_low,
+                    'reaction_high': float(reaction_bar['high']),
+                    'reaction_low': reaction_low
+                }
+            
+            return {
+                'side': 'buy',
+                'regime': 'Tendance',
+                'entry': entry,
+                'sl': sl,
+                'tp': tp,
+                'rr': rr,
+                'contact_idx': contact_idx,
+                'contact_index': contact_idx,
+                'reaction_idx': reaction_idx,
+                'reaction_index': reaction_idx,
+                'entry_index': len(df) - 1,
+                'pattern': reaction_result['pattern'],
+                'contact_high': float(contact_bar['high']),
+                'contact_low': contact_low,
+                'reaction_high': float(reaction_bar['high']),
+                'reaction_low': reaction_low
+            }
     
-    # ============================================================================
+    # ========================================================================
     # TENDANCE SHORT (prix < MM80, contact BB20_up)
-    # ============================================================================
+    # ========================================================================
     
     if is_below_mm80:
-        if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche TENDANCE SHORT...")
-        
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
             bar = df.iloc[i]
             
-            if float(bar['high']) >= float(bar['bb20_up']) * 0.998:
+            if _check_bb_contact(float(bar['high']), float(bar['bb20_up']), is_long=False):
                 contact_idx = i
-                if DEBUG:
-                    print(f"[DETECT] ✅ Contact BB20_up trouvé")
                 break
         
-        if contact_idx is None:
-            if DEBUG:
-                print(f"[DETECT] ❌ Aucun contact BB20_up")
-        else:
-            reintegrated = False
-            for j in range(contact_idx + 1, len(df)):
-                if float(df.iloc[j]['close']) < float(df.iloc[j]['bb20_up']):
-                    reintegrated = True
-                    if DEBUG:
-                        print(f"[DETECT] ✅ Réintégration BB20 confirmée")
-                    break
+        if contact_idx is not None:
+            reaction_result = find_reaction_pattern(df, contact_idx, 'short')
             
-            if not reintegrated:
-                if DEBUG:
-                    print(f"[DETECT] ❌ Pas de réintégration BB20")
-            else:
-                contact_bar = df.iloc[contact_idx]
-                
-                # ✅ CORRECTION : SL sur le HIGH (pour SELL)
-                try:
-                    sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
-                except Exception:
-                    sl_offset_pct = 0.3
-                
-                sl = float(contact_bar['high']) * (1 + sl_offset_pct / 100)
-                
-                # TP sur BB80_lo
-                try:
-                    tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
-                except Exception:
-                    tp_offset_pct = 0.3
-                
-                tp = bb80_lo * (1 - tp_offset_pct / 100)
-                entry = close_now
-                
-                # ✅ CALCUL RR CORRECT
-                rr = calculate_rr(entry, sl, tp, 'sell')
-                
-                if DEBUG:
-                    print(f"\n[DETECT] 💰 Calcul RR:")
-                    print(f"[DETECT] Entry: {entry:.4f}")
-                    print(f"[DETECT] SL: {sl:.4f} (HIGH du contact)")
-                    print(f"[DETECT] TP: {tp:.4f}")
-                    print(f"[DETECT] RR: {rr:.2f}")
-                
-                try:
-                    min_rr = float(database.get_setting('MIN_RR', '2.8'))
-                except Exception:
-                    min_rr = 2.8
-                
-                if rr < min_rr:
-                    skip_reason = f"RR insuffisant (x{rr:.2f} < x{min_rr})"
-                    
-                    if DEBUG:
-                        print(f"[DETECT] ❌ {skip_reason}")
-                    
-                    # ✅ RETOURNER SIGNAL AVEC RAISON
-                    return {
-                        'side': 'sell',
-                        'regime': 'Tendance',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'trend_short',
-                        'skip_reason': skip_reason  # ✅ CRITIQUE
-                    }
-                else:
-                    if DEBUG:
-                        print(f"[DETECT] ✅✅✅ SIGNAL TENDANCE SHORT VALIDE!")
-                    
-                    return {
-                        'side': 'sell',
-                        'regime': 'Tendance',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'trend_short'
-                    }
+            if not reaction_result['valid']:
+                return {
+                    'skip_reason': f"Pas de pattern Darwin : {reaction_result['reason']}",
+                    'side': 'sell',
+                    'regime': 'Tendance'
+                }
+            
+            reaction_idx = reaction_result['reaction_idx']
+            
+            reint_result = validate_reintegration_bb20(df, reaction_idx, 'short')
+            
+            if not reint_result['valid']:
+                return {
+                    'skip_reason': f"Réintégration manquante : {reint_result['reason']}",
+                    'side': 'sell',
+                    'regime': 'Tendance'
+                }
+            
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            contact_high = float(contact_bar['high'])
+            reaction_high = float(reaction_bar['high'])
+            sl_anchor = max(contact_high, reaction_high)
+            
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
+            except:
+                sl_offset_pct = 0.3
+            
+            sl = sl_anchor * (1 + sl_offset_pct / 100)
+            
+            try:
+                tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
+            except:
+                tp_offset_pct = 0.3
+            
+            tp = bb80_lo * (1 - tp_offset_pct / 100)
+            entry = close_now
+            
+            rr = calculate_rr(entry, sl, tp, 'sell')
+            
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '2.8'))
+            except:
+                min_rr = 2.8
+            
+            if rr < min_rr:
+                return {
+                    'side': 'sell',
+                    'regime': 'Tendance',
+                    'entry': entry,
+                    'sl': sl,
+                    'tp': tp,
+                    'rr': rr,
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'pattern': reaction_result['pattern'],
+                    'skip_reason': f"RR insuffisant (x{rr:.2f} < x{min_rr})",
+                    'contact_high': contact_high,
+                    'contact_low': float(contact_bar['low']),
+                    'reaction_high': reaction_high,
+                    'reaction_low': float(reaction_bar['low'])
+                }
+            
+            return {
+                'side': 'sell',
+                'regime': 'Tendance',
+                'entry': entry,
+                'sl': sl,
+                'tp': tp,
+                'rr': rr,
+                'contact_idx': contact_idx,
+                'contact_index': contact_idx,
+                'reaction_idx': reaction_idx,
+                'reaction_index': reaction_idx,
+                'entry_index': len(df) - 1,
+                'pattern': reaction_result['pattern'],
+                'contact_high': contact_high,
+                'contact_low': float(contact_bar['low']),
+                'reaction_high': reaction_high,
+                'reaction_low': float(reaction_bar['low'])
+            }
     
-    # ============================================================================
+    # ========================================================================
     # CONTRE-TENDANCE LONG (prix < MM80, double extrême bas)
-    # ============================================================================
+    # ========================================================================
     
     if is_below_mm80:
-        if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche CT LONG...")
-        
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
             bar = df.iloc[i]
             
-            touch_bb20 = float(bar['low']) <= float(bar['bb20_lo']) * 1.002
-            touch_bb80 = float(bar['low']) <= float(bar['bb80_lo']) * 1.002
+            touch_bb20 = _check_bb_contact(float(bar['low']), float(bar['bb20_lo']), is_long=True)
+            touch_bb80 = _check_bb_contact(float(bar['low']), float(bar['bb80_lo']), is_long=True)
             
             if touch_bb20 and touch_bb80:
                 contact_idx = i
-                if DEBUG:
-                    print(f"[DETECT] ✅ Double extrême BAS trouvé")
                 break
         
-        if contact_idx is None:
-            if DEBUG:
-                print(f"[DETECT] ❌ Aucun double extrême")
-        else:
+        if contact_idx is not None:
+            reaction_result = find_reaction_pattern(df, contact_idx, 'long')
+            
+            if not reaction_result['valid']:
+                return {
+                    'skip_reason': f"Pas de pattern Darwin : {reaction_result['reason']}",
+                    'side': 'buy',
+                    'regime': 'CT'
+                }
+            
+            reaction_idx = reaction_result['reaction_idx']
+            
             reint_bb20 = False
             reint_bb80 = False
             
-            for j in range(contact_idx + 1, len(df)):
+            for j in range(reaction_idx + 1, len(df)):
                 bar_j = df.iloc[j]
                 if float(bar_j['close']) > float(bar_j['bb20_lo']):
                     reint_bb20 = True
@@ -1933,103 +1533,110 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     break
             
             if not (reint_bb20 and reint_bb80):
-                if DEBUG:
-                    print(f"[DETECT] ❌ Réintégration incomplète")
-            else:
-                if DEBUG:
-                    print(f"[DETECT] ✅ Réintégration BB20 + BB80 confirmée")
-                
-                contact_bar = df.iloc[contact_idx]
-                
-                # ✅ CORRECTION : SL sur le LOW (pour CT BUY)
-                try:
-                    sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
-                except Exception:
-                    sl_offset_pct = 0.3
-                
-                sl = float(contact_bar['low']) * (1 - sl_offset_pct / 100)
-                
-                # TP sur BB20_up
-                try:
-                    tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
-                except Exception:
-                    tp_offset_pct = 0.3
-                
-                tp = bb20_up * (1 + tp_offset_pct / 100)
-                entry = close_now
-                
-                # ✅ CALCUL RR CORRECT
-                rr = calculate_rr(entry, sl, tp, 'buy')
-                
-                if DEBUG:
-                    print(f"\n[DETECT] 💰 RR: {rr:.2f}")
-                
-                try:
-                    min_rr = float(database.get_setting('MIN_RR', '2.8'))
-                except Exception:
-                    min_rr = 2.8
-                
-                if rr < min_rr:
-                    skip_reason = f"RR insuffisant (x{rr:.2f} < x{min_rr})"
-                    
-                    if DEBUG:
-                        print(f"[DETECT] ❌ {skip_reason}")
-                    
-                    return {
-                        'side': 'buy',
-                        'regime': 'CT',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'ct_long',
-                        'skip_reason': skip_reason
-                    }
-                else:
-                    if DEBUG:
-                        print(f"[DETECT] ✅✅✅ SIGNAL CT LONG VALIDE!")
-                    
-                    return {
-                        'side': 'buy',
-                        'regime': 'CT',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'ct_long'
-                    }
+                return {
+                    'skip_reason': "Réintégration BB20+BB80 incomplète",
+                    'side': 'buy',
+                    'regime': 'CT'
+                }
+            
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            contact_low = float(contact_bar['low'])
+            reaction_low = float(reaction_bar['low'])
+            sl_anchor = min(contact_low, reaction_low)
+            
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
+            except:
+                sl_offset_pct = 0.3
+            
+            sl = sl_anchor * (1 - sl_offset_pct / 100)
+            
+            try:
+                tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
+            except:
+                tp_offset_pct = 0.3
+            
+            tp = bb20_up * (1 + tp_offset_pct / 100)
+            entry = close_now
+            
+            rr = calculate_rr(entry, sl, tp, 'buy')
+            
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '2.8'))
+            except:
+                min_rr = 2.8
+            
+            if rr < min_rr:
+                return {
+                    'side': 'buy',
+                    'regime': 'CT',
+                    'entry': entry,
+                    'sl': sl,
+                    'tp': tp,
+                    'rr': rr,
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'pattern': reaction_result['pattern'],
+                    'skip_reason': f"RR insuffisant (x{rr:.2f} < x{min_rr})",
+                    'contact_high': float(contact_bar['high']),
+                    'contact_low': contact_low,
+                    'reaction_high': float(reaction_bar['high']),
+                    'reaction_low': reaction_low
+                }
+            
+            return {
+                'side': 'buy',
+                'regime': 'CT',
+                'entry': entry,
+                'sl': sl,
+                'tp': tp,
+                'rr': rr,
+                'contact_idx': contact_idx,
+                'contact_index': contact_idx,
+                'reaction_idx': reaction_idx,
+                'reaction_index': reaction_idx,
+                'entry_index': len(df) - 1,
+                'pattern': reaction_result['pattern'],
+                'contact_high': float(contact_bar['high']),
+                'contact_low': contact_low,
+                'reaction_high': float(reaction_bar['high']),
+                'reaction_low': reaction_low
+            }
     
-    # ============================================================================
+    # ========================================================================
     # CONTRE-TENDANCE SHORT (prix > MM80, double extrême haut)
-    # ============================================================================
+    # ========================================================================
     
     if is_above_mm80:
-        if DEBUG:
-            print(f"\n[DETECT] 🔍 Recherche CT SHORT...")
-        
         contact_idx = None
         for i in range(len(df) - 4, len(df) - 1):
             bar = df.iloc[i]
             
-            touch_bb20 = float(bar['high']) >= float(bar['bb20_up']) * 0.998
-            touch_bb80 = float(bar['high']) >= float(bar['bb80_up']) * 0.998
+            touch_bb20 = _check_bb_contact(float(bar['high']), float(bar['bb20_up']), is_long=False)
+            touch_bb80 = _check_bb_contact(float(bar['high']), float(bar['bb80_up']), is_long=False)
             
             if touch_bb20 and touch_bb80:
                 contact_idx = i
-                if DEBUG:
-                    print(f"[DETECT] ✅ Double extrême HAUT trouvé")
                 break
         
-        if contact_idx is None:
-            if DEBUG:
-                print(f"[DETECT] ❌ Aucun double extrême")
-        else:
+        if contact_idx is not None:
+            reaction_result = find_reaction_pattern(df, contact_idx, 'short')
+            
+            if not reaction_result['valid']:
+                return {
+                    'skip_reason': f"Pas de pattern Darwin : {reaction_result['reason']}",
+                    'side': 'sell',
+                    'regime': 'CT'
+                }
+            
+            reaction_idx = reaction_result['reaction_idx']
+            
             reint_bb20 = False
             reint_bb80 = False
             
-            for j in range(contact_idx + 1, len(df)):
+            for j in range(reaction_idx + 1, len(df)):
                 bar_j = df.iloc[j]
                 if float(bar_j['close']) < float(bar_j['bb20_up']):
                     reint_bb20 = True
@@ -2039,135 +1646,79 @@ def detect_signal(symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
                     break
             
             if not (reint_bb20 and reint_bb80):
-                if DEBUG:
-                    print(f"[DETECT] ❌ Réintégration incomplète")
-            else:
-                if DEBUG:
-                    print(f"[DETECT] ✅ Réintégration confirmée")
-                
-                contact_bar = df.iloc[contact_idx]
-                
-                # ✅ CORRECTION : SL sur le HIGH (pour CT SELL)
-                try:
-                    sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
-                except Exception:
-                    sl_offset_pct = 0.3
-                
-                sl = float(contact_bar['high']) * (1 + sl_offset_pct / 100)
-                
-                # TP sur BB20_lo
-                try:
-                    tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
-                except Exception:
-                    tp_offset_pct = 0.3
-                
-                tp = bb20_lo * (1 - tp_offset_pct / 100)
-                entry = close_now
-                
-                # ✅ CALCUL RR CORRECT
-                rr = calculate_rr(entry, sl, tp, 'sell')
-                
-                if DEBUG:
-                    print(f"\n[DETECT] 💰 RR: {rr:.2f}")
-                
-                try:
-                    min_rr = float(database.get_setting('MIN_RR', '2.8'))
-                except Exception:
-                    min_rr = 2.8
-                
-                if rr < min_rr:
-                    skip_reason = f"RR insuffisant (x{rr:.2f} < x{min_rr})"
-                    
-                    if DEBUG:
-                        print(f"[DETECT] ❌ {skip_reason}")
-                    
-                    return {
-                        'side': 'sell',
-                        'regime': 'CT',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'ct_short',
-                        'skip_reason': skip_reason
-                    }
-                else:
-                    if DEBUG:
-                        print(f"[DETECT] ✅✅✅ SIGNAL CT SHORT VALIDE!")
-                    
-                    return {
-                        'side': 'sell',
-                        'regime': 'CT',
-                        'entry': entry,
-                        'sl': sl,
-                        'tp': tp,
-                        'rr': rr,
-                        'contact_idx': contact_idx,
-                        'pattern': 'ct_short'
-                    }
-    
-    # Aucun signal trouvé
-    if DEBUG:
-        print(f"\n[DETECT] ❌ Aucun signal valide pour {symbol}\n")
+                return {
+                    'skip_reason': "Réintégration BB20+BB80 incomplète",
+                    'side': 'sell',
+                    'regime': 'CT'
+                }
+            
+            contact_bar = df.iloc[contact_idx]
+            reaction_bar = df.iloc[reaction_idx]
+            
+            contact_high = float(contact_bar['high'])
+            reaction_high = float(reaction_bar['high'])
+            sl_anchor = max(contact_high, reaction_high)
+            
+            try:
+                sl_offset_pct = float(database.get_setting('SL_OFFSET_PCT', '0.3'))
+            except:
+                sl_offset_pct = 0.3
+            
+            sl = sl_anchor * (1 + sl_offset_pct / 100)
+            
+            try:
+                tp_offset_pct = float(database.get_setting('TP_OFFSET_PCT', '0.3'))
+            except:
+                tp_offset_pct = 0.3
+            
+            tp = bb20_lo * (1 - tp_offset_pct / 100)
+            entry = close_now
+            
+            rr = calculate_rr(entry, sl, tp, 'sell')
+            
+            try:
+                min_rr = float(database.get_setting('MIN_RR', '2.8'))
+            except:
+                min_rr = 2.8
+            
+            if rr < min_rr:
+                return {
+                    'side': 'sell',
+                    'regime': 'CT',
+                    'entry': entry,
+                    'sl': sl,
+                    'tp': tp,
+                    'rr': rr,
+                    'contact_idx': contact_idx,
+                    'reaction_idx': reaction_idx,
+                    'pattern': reaction_result['pattern'],
+                    'skip_reason': f"RR insuffisant (x{rr:.2f} < x{min_rr})",
+                    'contact_high': contact_high,
+                    'contact_low': float(contact_bar['low']),
+                    'reaction_high': reaction_high,
+                    'reaction_low': float(reaction_bar['low'])
+                }
+            
+            return {
+                'side': 'sell',
+                'regime': 'CT',
+                'entry': entry,
+                'sl': sl,
+                'tp': tp,
+                'rr': rr,
+                'contact_idx': contact_idx,
+                'contact_index': contact_idx,
+                'reaction_idx': reaction_idx,
+                'reaction_index': reaction_idx,
+                'entry_index': len(df) - 1,
+                'pattern': reaction_result['pattern'],
+                'contact_high': contact_high,
+                'contact_low': float(contact_bar['low']),
+                'reaction_high': reaction_high,
+                'reaction_low': float(reaction_bar['low'])
+            }
     
     return None
-
-
-def scan_symbol_for_signals(ex: ccxt.Exchange, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
-    """
-    Charge le DF préparé, appelle detect_signal(), enregistre le signal et notifie.
-    Différencie désormais clairement :
-      - PENDING : dès qu’un signal est détecté
-      - VALID / SKIPPED : mis à jour plus tard par execute_trade() selon issue d’exécution
-    Retourne le signal si valide, sinon None.
-    """
-    try:
-        df = utils.fetch_and_prepare_df(ex, symbol, timeframe)
-        if df is None or len(df) < 81:
-            return None
-
-        sig = detect_signal(symbol, df)
-        ts = int(time.time() * 1000)
-
-        if not sig:
-            # Traçage léger optionnel (SKIPPED) — tu peux commenter si tu ne veux pas de logs
-            try:
-                record_signal_from_trader(
-                    symbol=symbol, side="-", timeframe=timeframe, ts=ts,
-                    price=float(df.iloc[-1]["close"]), rr=0.0, regime="-",
-                    pattern="NONE", status="SKIPPED", meta={"reason": "no_pattern"}
-                )
-            except Exception:
-                pass
-            return None
-
-        # ✅ marquer immédiatement le signal comme PENDING (en attente d’exécution)
-        sig["ts"] = ts
-        try:
-            record_signal_from_trader(
-                symbol=symbol,
-                side=sig.get("side", "-"),
-                timeframe=timeframe,
-                ts=ts,
-                price=float(sig.get("entry") or df.iloc[-1]["close"]),
-                rr=float(sig.get("rr", 0.0)),
-                regime=str(sig.get("regime", "-")),
-                pattern="AUTO",
-                status="PENDING",
-                meta={"entry": sig.get("entry"), "tp": sig.get("tp"), "sl": sig.get("sl")}
-            )
-        except Exception:
-            pass
-
-        try:
-            notifier.send_signal_notification(symbol, timeframe, sig)
-        except Exception:
-            pass
-
-        return sig
-    except Exception:
-        return None
 
 
 # ==============================================================================
@@ -2798,7 +2349,6 @@ def _extract_tp_sl_from_orders(orders: list) -> Tuple[Optional[float], Optional[
                 except Exception: pass
     return tp, sl
 
-
 def _fetch_existing_tp_sl(exchange, symbol: str) -> Tuple[Optional[float], Optional[float]]:
     """Lit les ordres ouverts et tente d’en extraire TP/SL courants."""
     try:
@@ -2806,74 +2356,6 @@ def _fetch_existing_tp_sl(exchange, symbol: str) -> Tuple[Optional[float], Optio
     except Exception:
         orders = []
     return _extract_tp_sl_from_orders(orders)
-
-
-def _apply_manual_override_if_needed(ex, pos: Dict[str, Any], tick_size: float) -> Dict[str, bool]:
-    """
-    Si l’utilisateur a déplacé TP/SL à la main, aligne la DB sur l’exchange
-    et renvoie des flags pour la gestion.
-    """
-    symbol = pos['symbol']
-    is_long = (pos['side'] == 'buy')
-    tp_ex, sl_ex = _fetch_existing_tp_sl(ex, symbol)
-
-    changed_tp = False
-    changed_sl = False
-    eps = max(float(tick_size), 1e-12)
-
-    # TP
-    if tp_ex:
-        try:
-            tp_db = float(pos.get('tp_price') or 0.0)
-            if abs(float(tp_ex) - tp_db) > eps / 2:
-                database.update_trade_tp(pos['id'], float(tp_ex))
-                pos['tp_price'] = float(tp_ex)
-                changed_tp = True
-        except Exception:
-            pass
-
-    # SL
-    if sl_ex:
-        try:
-            sl_db = float(pos.get('sl_price') or pos['entry_price'])
-            if abs(float(sl_ex) - sl_db) > eps / 2:
-                try:
-                    database.update_trade_sl(pos['id'], float(sl_ex))
-                except AttributeError:
-                    database.update_trade_to_breakeven(pos['id'], float(pos['quantity']), float(sl_ex))
-                pos['sl_price'] = float(sl_ex)
-                changed_sl = True
-        except Exception:
-            pass
-
-    # Si le SL manuel est déjà >= BE (long) ou <= BE (short), marque BE actif
-    try:
-        be_side = 'long' if is_long else 'short'
-        be_price = compute_fee_safe_be_price(
-            entry=float(pos['entry_price']),
-            side=be_side,
-            qty=float(pos['quantity']),
-            fee_in_pct=FEE_ENTRY_PCT,
-            fee_out_pct=FEE_EXIT_PCT,
-            buffer_pct=BE_BUFFER_PCT,
-            buffer_usdt=BE_BUFFER_USDT
-        )
-        sl_cur = float(pos.get('sl_price') or pos['entry_price'])
-        if (is_long and sl_cur >= be_price - eps) or ((not is_long) and sl_cur <= be_price + eps):
-            # Active le statut BE en DB pour éviter que le bloc BE “re-calcule”
-            try:
-                database.update_trade_to_breakeven(pos['id'], float(pos['quantity']), float(sl_cur))
-                pos['breakeven_status'] = 'ACTIVE'
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return {"tp_changed": changed_tp, "sl_changed": changed_sl}
-
-def _bitget_positions_params() -> Dict[str, str]:
-    return {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
-
 
 def _ensure_bitget_mix_options(ex: ccxt.Exchange) -> None:
     """
@@ -2940,22 +2422,6 @@ def create_market_order_smart(ex: ccxt.Exchange, symbol: str, side: str, amount:
         return ex.create_order(symbol, "market", "buy", float(cost), None, params)
 
     return ex.create_order(symbol, "market", side, float(amount), None, params)
-
-
-def _resolve_bitget_route(exchange):
-    try:
-        if not hasattr(exchange, "options") or not isinstance(exchange.options, dict):
-            exchange.options = {}
-        exchange.options["defaultType"] = "swap"
-        exchange.options["defaultSettle"] = "USDT"
-        exchange.options["productType"] = "USDT-FUTURES"
-    except Exception:
-        pass
-
-    return {
-        "marginCoin": "USDT",
-        "primary": "USDT-FUTURES",
-    }
 
 def _fetch_positions_safe(ex: ccxt.Exchange, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Récupère les positions ouvertes de façon robuste.
@@ -3762,6 +3228,7 @@ def execute_signal_with_gates(
     - Attend l'ouverture de la bougie suivante avant entry
     - Enregistre raison si signal skipped
     - Calcul RR correct
+    - GATE 3 : Excès volatilité BB80 (toujours actif)
     
     Returns:
         (bool, str): (True si trade exécuté, message)
@@ -3853,6 +3320,34 @@ def execute_signal_with_gates(
     if not passed_reaction:
         _update_signal_state(symbol, timeframe, signal, entry_px, "VALID_SKIPPED", reason=msg_react)
         return False, msg_react
+    
+    # ========================================================================
+    # ✅ GATE 3 : EXCÈS VOLATILITÉ BB80 (TOUJOURS ACTIF)
+    # ========================================================================
+    
+    is_after_excess = _is_first_after_prolonged_bb80_exit(df, is_long, min_streak=5, lookback=50)
+    
+    if is_after_excess:
+        skip_reason = "Excès volatilité BB80 détecté (5+ bougies hors BB80 → premier signal rejeté)"
+        
+        _update_signal_state(
+            symbol, timeframe, signal, entry_px,
+            "VALID_SKIPPED", 
+            reason="gate3_volatility_excess"
+        )
+        
+        try:
+            notifier.tg_send(
+                f"⚠️ **Signal {symbol} {side.upper()} rejeté**\n\n"
+                f"🛡️ GATE 3 : Excès volatilité\n"
+                f"(5+ bougies consécutives hors BB80)\n\n"
+                f"➡️ Premier signal après excès = souvent faux signal\n"
+                f"Winrate -20% mesuré sur ce type de setup"
+            )
+        except:
+            pass
+        
+        return False, skip_reason
     
     # ========================================================================
     # RECALCUL SL/TP LIVE
@@ -4316,34 +3811,6 @@ def compute_fee_safe_be_price(
     else:
         return E  # si side inconnu, ne bouge pas
 
-def _compute_trailing_sl(mark_price: float, side: str, atr: float) -> float:
-    """
-    Trailing pro (mix) : distance = max(d%, k*ATR).
-      - d%   = TRAIL_PCT (def 0.0035 = 0.35%)
-      - kATR = TRAIL_ATR_K (def 1.0)
-    Retourne le prix de SL cible par rapport au prix 'mark'.
-    """
-    try:
-        d_pct = float(database.get_setting('TRAIL_PCT', 0.0035))     # 0.35%
-    except Exception:
-        d_pct = 0.0035
-    try:
-        k_atr = float(database.get_setting('TRAIL_ATR_K', 1.0))      # 1×ATR
-    except Exception:
-        k_atr = 1.0
-
-    mark = float(mark_price)
-    atr  = max(0.0, float(atr))
-
-    # distance en prix
-    dist_pct = abs(d_pct) * mark
-    dist_atr = abs(k_atr) * atr
-    dist = max(dist_pct, dist_atr)
-
-    if (side or "").lower() in ("buy", "long"):
-        return max(0.0, mark - dist)
-    else:
-        return max(0.0, mark + dist)
 
 def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[str, Any]) -> Tuple[bool, str]:
     """
@@ -4469,88 +3936,6 @@ def execute_trade(ex: ccxt.Exchange, symbol: str, timeframe: str, signal: Dict[s
         except Exception:
             pass
         return False, f"Erreur interne execute_trade: {e}"
-
-
-def _progress_to_tp(entry: float, tp: float, mark: float, is_long: bool) -> float:
-    """
-    Retourne la progression normalisée du prix entre l'entrée et le TP:
-      - 0.0  : encore loin de l'objectif
-      - 1.0+ : TP atteint ou dépassé
-    Utilisé pour activer / resserrer le trailing uniquement quand on 'accroche' le TP.
-    """
-    try:
-        entry = float(entry)
-        tp = float(tp)
-        mark = float(mark)
-    except Exception:
-        return 0.0
-
-    if entry <= 0 or tp <= 0:
-        return 0.0
-
-    if is_long:
-        # Long : progression (entry → tp)
-        if tp <= entry or mark <= entry:
-            return 0.0
-        if mark >= tp:
-            return 1.0
-        return max(0.0, min(1.0, (mark - entry) / (tp - entry)))
-    else:
-        # Short : progression (entry → tp) mais dans l'autre sens
-        if tp >= entry or mark >= entry:
-            return 0.0
-        if mark <= tp:
-            return 1.0
-        return max(0.0, min(1.0, (entry - mark) / (entry - tp)))
-
-
-def _find_last_swing_anchor(df: pd.DataFrame, is_long: bool, max_lookback: int = 15) -> Optional[float]:
-    """
-    Cherche le DERNIER swing confirmé dans les dernières bougies :
-      - SHORT : swing high (top local)
-      - LONG  : swing low  (bottom local)
-    Utilisé comme ancre de SL pour le passage à BE (avec offset hybride).
-    """
-    try:
-        if df is None:
-            return None
-        n = len(df)
-        if n < 3:
-            return None
-
-        lb = max(3, int(max_lookback))
-        start = max(1, n - lb - 1)
-        end = n - 2  # on évite la dernière bougie (encore en formation)
-
-        if end <= 0 or start > end:
-            return None
-
-        if is_long:
-            # Swing LOW (bottom) pour les longs
-            for i in range(end, start - 1, -1):
-                cur = df.iloc[i]
-                prev = df.iloc[i - 1]
-                nxt = df.iloc[i + 1]
-                l = float(cur["low"])
-                l_prev = float(prev["low"])
-                l_next = float(nxt["low"])
-                if l < l_prev and l < l_next:
-                    return l
-        else:
-            # Swing HIGH (top) pour les shorts
-            for i in range(end, start - 1, -1):
-                cur = df.iloc[i]
-                prev = df.iloc[i - 1]
-                nxt = df.iloc[i + 1]
-                h = float(cur["high"])
-                h_prev = float(prev["high"])
-                h_next = float(nxt["high"])
-                if h > h_prev and h > h_next:
-                    return h
-    except Exception:
-        return None
-
-    return None
 
 def should_pyramid_position(ex, pos: dict, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """
@@ -5666,6 +5051,7 @@ def manage_open_positions(ex):
     4. Anti-spam BE (flag be_notified)
     5. Protection anti-recul BE renforcée
     6. TP Mobile + BE Suiveur en phase finale (>80% TP)
+    7. FIX TIMESTAMP : Gestion robuste colonne timestamp manquante
     """
     
     def _sl_improves_or_equal(new_sl: float, old_sl: float, is_long: bool) -> bool:
@@ -6013,7 +5399,7 @@ def manage_open_positions(ex):
                 print(f"❌ Erreur partial exit {symbol}: {e}")
             
             # ========================================================================
-            # ========== BE DYNAMIQUE (CONTACT BB20_MID) - FILTRE TEMPOREL + PNL RÉEL ==========
+            # ========== BE DYNAMIQUE (CONTACT BB20_MID) - ✅ FIX TIMESTAMP ==========
             # ========================================================================
             try:
                 try:
@@ -6047,11 +5433,24 @@ def manage_open_positions(ex):
                                 if df is None or len(df) < 25:
                                     raise Exception("DataFrame insuffisant pour BE dynamique")
                                 
-                                # ✅ CORRECTION CRITIQUE 1 : FILTRER BOUGIES APRÈS OUVERTURE DU TRADE
+                                # ✅ CORRECTION CRITIQUE : GESTION ROBUSTE TIMESTAMP
                                 open_timestamp = int(pos.get('open_timestamp', 0))
                                 
                                 if open_timestamp > 0:
-                                    df_after_entry = df[df['timestamp'] >= open_timestamp]
+                                    # Vérifier si colonne timestamp existe
+                                    try:
+                                        if 'timestamp' in df.columns:
+                                            df_after_entry = df[df['timestamp'] >= open_timestamp]
+                                        elif hasattr(df.index, 'to_series'):
+                                            # Si timestamp est dans l'index (format DatetimeIndex)
+                                            df_after_entry = df[df.index.astype(int) // 1000 >= open_timestamp // 1000]
+                                        else:
+                                            # Fallback : utiliser tout le DataFrame
+                                            print(f"⚠️ {symbol} : Impossible filtrer par timestamp, utilisation complète DF")
+                                            df_after_entry = df
+                                    except Exception as e:
+                                        print(f"⚠️ {symbol} : Erreur filtre timestamp → {e}")
+                                        df_after_entry = df
                                     
                                     if len(df_after_entry) < 1:
                                         raise Exception("Aucune bougie après ouverture trade")
@@ -6378,7 +5777,7 @@ def manage_open_positions(ex):
         except Exception as e:
             print(f"❌ Erreur manage_open_positions trade {pos.get('id')}: {e}")
             continue
-
+            
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
