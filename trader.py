@@ -5022,6 +5022,7 @@ def manage_open_positions(ex):
     
     ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
     ✅ CORRECTION BE : Utilise BB20_mid au moment du contact pour calculer le PnL sécurisé
+    ✅ PROTECTION : Toutes les divisions sont protégées contre division par zéro
     """
     try:
         sync_positions_with_exchange(ex)
@@ -5281,65 +5282,71 @@ def manage_open_positions(ex):
             # ========================================================================
             if breakeven_status == 'ACTIVE':
                 try:
-                    if is_long:
-                        pnl_pct = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                    # ✅ PROTECTION DIVISION PAR ZÉRO
+                    tp_distance = abs(tp_price - entry_price)
+                    
+                    if tp_distance < 0.000001:  # Éviter division par zéro
+                        print(f"⚠️ Distance TP trop petite pour {symbol}, skip trailing")
                     else:
-                        pnl_pct = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
-
-                    new_trailing_sl = None
-
-                    if pnl_pct >= 90.0:
-                        # Trailing serré (95% du chemin vers TP)
                         if is_long:
-                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.95
+                            pnl_pct = ((current_price - entry_price) / tp_distance) * 100.0
                         else:
-                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.95
+                            pnl_pct = ((entry_price - current_price) / tp_distance) * 100.0
 
-                    elif pnl_pct >= 75.0:
-                        if is_long:
-                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.75
-                        else:
-                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.75
+                        new_trailing_sl = None
 
-                    elif pnl_pct >= 50.0:
-                        if is_long:
-                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.50
-                        else:
-                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.50
+                        if pnl_pct >= 90.0:
+                            # Trailing serré (95% du chemin vers TP)
+                            if is_long:
+                                new_trailing_sl = entry_price + tp_distance * 0.95
+                            else:
+                                new_trailing_sl = entry_price - tp_distance * 0.95
 
-                    elif pnl_pct >= 25.0:
-                        if is_long:
-                            new_trailing_sl = entry_price + (tp_price - entry_price) * 0.25
-                        else:
-                            new_trailing_sl = entry_price - (entry_price - tp_price) * 0.25
+                        elif pnl_pct >= 75.0:
+                            if is_long:
+                                new_trailing_sl = entry_price + tp_distance * 0.75
+                            else:
+                                new_trailing_sl = entry_price - tp_distance * 0.75
 
-                    if new_trailing_sl is not None:
-                        # Vérifier que le trailing améliore le SL actuel
-                        if is_long and new_trailing_sl > sl_price:
-                            # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
-                            if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
-                                print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
-                                continue
+                        elif pnl_pct >= 50.0:
+                            if is_long:
+                                new_trailing_sl = entry_price + tp_distance * 0.50
+                            else:
+                                new_trailing_sl = entry_price - tp_distance * 0.50
 
-                            database.update_trade_sl(trade_id, new_trailing_sl)
-                            try:
-                                _update_exchange_sl(ex, symbol, side, new_trailing_sl)
-                            except Exception as e:
-                                print(f"   ⚠️ Erreur MAJ trailing SL exchange : {e}")
-                            print(f"   ⬆️ Trailing SL (LONG) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
+                        elif pnl_pct >= 25.0:
+                            if is_long:
+                                new_trailing_sl = entry_price + tp_distance * 0.25
+                            else:
+                                new_trailing_sl = entry_price - tp_distance * 0.25
 
-                        elif not is_long and new_trailing_sl < sl_price:
-                            # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
-                            if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
-                                print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
-                                continue
+                        if new_trailing_sl is not None:
+                            # Vérifier que le trailing améliore le SL actuel
+                            if is_long and new_trailing_sl > sl_price:
+                                # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
+                                if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
+                                    print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
+                                    continue
 
-                            database.update_trade_sl(trade_id, new_trailing_sl)
-                            try:
-                                _update_exchange_sl(ex, symbol, side, new_trailing_sl)
-                            except Exception as e:
-                                print(f"   ⚠️ Erreur MAJ trailing SL exchange : {e}")
-                            print(f"   ⬇️ Trailing SL (SHORT) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
+                                database.update_trade_sl(trade_id, new_trailing_sl)
+                                try:
+                                    _update_exchange_sl(ex, symbol, side, new_trailing_sl)
+                                except Exception as e:
+                                    print(f"   ⚠️ Erreur MAJ trailing SL exchange : {e}")
+                                print(f"   ⬆️ Trailing SL (LONG) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
+
+                            elif not is_long and new_trailing_sl < sl_price:
+                                # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
+                                if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
+                                    print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
+                                    continue
+
+                                database.update_trade_sl(trade_id, new_trailing_sl)
+                                try:
+                                    _update_exchange_sl(ex, symbol, side, new_trailing_sl)
+                                except Exception as e:
+                                    print(f"   ⚠️ Erreur MAJ trailing SL exchange : {e}")
+                                print(f"   ⬇️ Trailing SL (SHORT) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
 
                 except Exception as e:
                     print(f"⚠️ Erreur trailing stop pour {symbol}: {e}")
@@ -5350,25 +5357,31 @@ def manage_open_positions(ex):
             try:
                 pyramid_count = meta.get('pyramid_count', 0)
                 if pyramid_count < 2:  # Max 2 ajouts
-                    if is_long:
-                        progress = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                    # ✅ PROTECTION DIVISION PAR ZÉRO
+                    tp_distance = abs(tp_price - entry_price)
+                    
+                    if tp_distance < 0.000001:
+                        print(f"⚠️ Distance TP trop petite pour pyramiding {symbol}")
                     else:
-                        progress = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+                        if is_long:
+                            progress = ((current_price - entry_price) / tp_distance) * 100.0
+                        else:
+                            progress = ((entry_price - current_price) / tp_distance) * 100.0
 
-                    if progress >= 80.0:
-                        can_pyramid = should_pyramid_position(
-                            current_price, entry_price, tp_price, is_long,
-                            pyramid_count, meta
-                        )
-
-                        if can_pyramid:
-                            success = execute_pyramid_add(
-                                ex, trade_id, symbol, side, current_price,
-                                quantity, entry_price, sl_price, tp_price,
+                        if progress >= 80.0:
+                            can_pyramid = should_pyramid_position(
+                                current_price, entry_price, tp_price, is_long,
                                 pyramid_count, meta
                             )
-                            if success:
-                                print(f"   📈 Pyramiding ajouté pour {symbol}")
+
+                            if can_pyramid:
+                                success = execute_pyramid_add(
+                                    ex, trade_id, symbol, side, current_price,
+                                    quantity, entry_price, sl_price, tp_price,
+                                    pyramid_count, meta
+                                )
+                                if success:
+                                    print(f"   📈 Pyramiding ajouté pour {symbol}")
 
             except Exception as e:
                 print(f"⚠️ Erreur pyramiding pour {symbol}: {e}")
@@ -5379,24 +5392,30 @@ def manage_open_positions(ex):
             try:
                 partial_exits_count = meta.get('partial_exits_count', 0)
                 if partial_exits_count < 1:  # Max 1 sortie partielle
-                    if is_long:
-                        progress = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                    # ✅ PROTECTION DIVISION PAR ZÉRO
+                    tp_distance = abs(tp_price - entry_price)
+                    
+                    if tp_distance < 0.000001:
+                        print(f"⚠️ Distance TP trop petite pour partial exit {symbol}")
                     else:
-                        progress = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+                        if is_long:
+                            progress = ((current_price - entry_price) / tp_distance) * 100.0
+                        else:
+                            progress = ((entry_price - current_price) / tp_distance) * 100.0
 
-                    if progress >= 50.0:
-                        can_partial = should_take_partial_profit(
-                            current_price, entry_price, tp_price, is_long,
-                            partial_exits_count, meta
-                        )
-
-                        if can_partial:
-                            success = execute_partial_exit(
-                                ex, trade_id, symbol, side, current_price,
-                                quantity, partial_exits_count, meta
+                        if progress >= 50.0:
+                            can_partial = should_take_partial_profit(
+                                current_price, entry_price, tp_price, is_long,
+                                partial_exits_count, meta
                             )
-                            if success:
-                                print(f"   💰 Sortie partielle pour {symbol}")
+
+                            if can_partial:
+                                success = execute_partial_exit(
+                                    ex, trade_id, symbol, side, current_price,
+                                    quantity, partial_exits_count, meta
+                                )
+                                if success:
+                                    print(f"   💰 Sortie partielle pour {symbol}")
 
             except Exception as e:
                 print(f"⚠️ Erreur partial exit pour {symbol}: {e}")
@@ -5405,17 +5424,23 @@ def manage_open_positions(ex):
             # 8. TP MOBILE + BE SUIVEUR (>80% TP uniquement)
             # ========================================================================
             try:
-                if is_long:
-                    progress = ((current_price - entry_price) / (tp_price - entry_price)) * 100.0
+                # ✅ PROTECTION DIVISION PAR ZÉRO
+                tp_distance = abs(tp_price - entry_price)
+                
+                if tp_distance < 0.000001:
+                    print(f"⚠️ Distance TP trop petite pour TP mobile {symbol}")
                 else:
-                    progress = ((entry_price - current_price) / (entry_price - tp_price)) * 100.0
+                    if is_long:
+                        progress = ((current_price - entry_price) / tp_distance) * 100.0
+                    else:
+                        progress = ((entry_price - current_price) / tp_distance) * 100.0
 
-                if progress >= 80.0:
-                    update_dynamic_tp_and_trailing_be(
-                        ex, trade_id, symbol, side, df,
-                        entry_price, current_price, tp_price, sl_price,
-                        regime, breakeven_status
-                    )
+                    if progress >= 80.0:
+                        update_dynamic_tp_and_trailing_be(
+                            ex, trade_id, symbol, side, df,
+                            entry_price, current_price, tp_price, sl_price,
+                            regime, breakeven_status
+                        )
 
             except Exception as e:
                 print(f"⚠️ Erreur TP mobile + BE suiveur pour {symbol}: {e}")
