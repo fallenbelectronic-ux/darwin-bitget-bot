@@ -5021,6 +5021,7 @@ def manage_open_positions(ex):
     - Partial exits
     
     ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
+    ✅ CORRECTION BE : Utilise BB20_mid au moment du contact pour calculer le PnL sécurisé
     """
     try:
         sync_positions_with_exchange(ex)
@@ -5200,6 +5201,7 @@ def manage_open_positions(ex):
             if breakeven_status == 'PENDING':
                 should_activate_be = False
                 be_sl = entry_price
+                be_trigger_price = None  # ✅ NOUVEAU : Prix au moment du contact BB20_mid
 
                 try:
                     # Gestion robuste colonne timestamp manquante
@@ -5220,6 +5222,10 @@ def manage_open_positions(ex):
 
                         if len(be_touches) > 0:
                             should_activate_be = True
+                            
+                            # ✅ NOUVEAU : Capturer le prix BB20_mid au moment du contact
+                            first_touch = be_touches.iloc[0]
+                            be_trigger_price = float(first_touch[bb20_mid_col])
 
                 except Exception as e:
                     print(f"⚠️ Erreur détection BE pour {symbol}: {e}")
@@ -5230,19 +5236,27 @@ def manage_open_positions(ex):
                         print(f"   🛡️ Breakeven refusé (protection anti-recul) - Trade #{trade_id}")
                         continue  # Passer au trade suivant
 
-                    # Calcul PnL sécurisé (prix actuel - entry, PAS be_price - entry)
-                    try:
-                        ticker_now = ex.fetch_ticker(symbol)
-                        current_price_now = float(ticker_now.get('last') or entry_price)
-                    except Exception:
-                        current_price_now = entry_price
-
+                    # ✅ CORRECTION : Utiliser be_trigger_price (BB20_mid) au lieu de current_price
                     remaining_qty = quantity
 
-                    if is_long:
-                        pnl_secured = max(0.0, (current_price_now - entry_price) * remaining_qty)
+                    if be_trigger_price is not None:
+                        # Utiliser le prix au moment du contact BB20_mid
+                        if is_long:
+                            pnl_secured = max(0.0, (be_trigger_price - entry_price) * remaining_qty)
+                        else:
+                            pnl_secured = max(0.0, (entry_price - be_trigger_price) * remaining_qty)
                     else:
-                        pnl_secured = max(0.0, (entry_price - current_price_now) * remaining_qty)
+                        # Fallback : Prix actuel (ancien comportement)
+                        try:
+                            ticker_now = ex.fetch_ticker(symbol)
+                            current_price_now = float(ticker_now.get('last') or entry_price)
+                        except Exception:
+                            current_price_now = entry_price
+                        
+                        if is_long:
+                            pnl_secured = max(0.0, (current_price_now - entry_price) * remaining_qty)
+                        else:
+                            pnl_secured = max(0.0, (entry_price - current_price_now) * remaining_qty)
 
                     # Appliquer le breakeven
                     database.update_trade_to_breakeven(trade_id, remaining_qty, be_sl)
