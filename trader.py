@@ -5139,13 +5139,13 @@ def manage_open_positions(ex):
     - Sync avec exchange
     - Détection des clôtures (TP/SL/manual)
     - TP dynamique (suit BB80/BB20)
-    - Breakeven dynamique (contact BB20_mid APRÈS open_timestamp)
+    - Breakeven dynamique (contact BB20_mid IMMÉDIAT via ticker)
     - Trailing stop multi-paliers
     - Pyramiding
     - Partial exits
     
     ✅ PROTECTION SL : Utilise _validate_sl_never_backward() pour empêcher le SL de reculer
-    ✅ CORRECTION BE : Contact BB20_mid détecté en MONTÉE et DESCENTE (pas seulement retracement)
+    ✅ CORRECTION BE : Détection IMMÉDIATE si prix traverse BB20_mid (sans attendre bougie close)
     ✅ PROTECTION : Toutes les divisions sont protégées contre division par zéro
     ✅ CORRECTION BB : Utilise bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
     """
@@ -5323,8 +5323,8 @@ def manage_open_positions(ex):
                     print(f"⚠️ Erreur calcul TP dynamique pour {symbol}: {e}")
 
             # ========================================================================
-            # 4. BREAKEVEN DYNAMIQUE (contact BB20_mid APRÈS open_timestamp)
-            # ✅ CORRECTION : Détecte MONTÉE + DESCENTE
+            # 4. BREAKEVEN DYNAMIQUE (contact BB20_mid IMMÉDIAT)
+            # ✅ CORRECTION FINALE : Détection via prix actuel (sans attendre bougie close)
             # ========================================================================
             if breakeven_status == 'PENDING':
                 should_activate_be = False
@@ -5332,64 +5332,114 @@ def manage_open_positions(ex):
                 be_trigger_price = None
 
                 try:
-                    # Gestion robuste colonne timestamp manquante
-                    if 'timestamp' in df.columns:
-                        df_after_entry = df[df['timestamp'] >= open_timestamp]
-                    elif hasattr(df.index, 'to_series'):
-                        df_after_entry = df[df.index.astype(int) // 1000 >= open_timestamp // 1000]
-                    else:
-                        df_after_entry = df  # Fallback sécurisé
-
-                    if len(df_after_entry) > 0:
-                        bb20_mid_col = 'bb20_mid' if 'bb20_mid' in df.columns else 'sma20'
-                        
-                        # ✅ NOUVEAU CODE : Détecte MONTÉE + DESCENTE
+                    bb20_mid_col = 'bb20_mid' if 'bb20_mid' in df.columns else 'sma20'
+                    
+                    # Récupérer BB20_mid actuel (dernière bougie fermée)
+                    try:
+                        bb20_mid_latest = float(df.iloc[-1][bb20_mid_col])
+                    except Exception:
+                        bb20_mid_latest = None
+                    
+                    # ====================================================================
+                    # CAS 1 : DÉTECTION IMMÉDIATE VIA PRIX ACTUEL (TICKER)
+                    # ====================================================================
+                    
+                    if bb20_mid_latest is not None:
+                        # LONG : Si entry < BB20_mid ET prix actuel > BB20_mid → TRAVERSÉ !
                         if is_long:
-                            # LONG : Contact si LOW touche OU si bougie TRAVERSE BB20_mid
-                            be_touches = df_after_entry[
-                                (df_after_entry['low'] <= df_after_entry[bb20_mid_col]) |  # Retracement
-                                (
-                                    (df_after_entry['open'] < df_after_entry[bb20_mid_col]) &  # Démarre en-dessous
-                                    (df_after_entry['high'] >= df_after_entry[bb20_mid_col])   # Traverse vers le haut
-                                )
-                            ]
+                            if entry_price < bb20_mid_latest and current_price > bb20_mid_latest:
+                                should_activate_be = True
+                                be_trigger_price = bb20_mid_latest
+                                print(f"   ✅ BE activé (IMMÉDIAT) - Prix a traversé BB20_mid !")
+                                print(f"      Entry: {entry_price:.6f} < BB20: {bb20_mid_latest:.6f} < Current: {current_price:.6f}")
+                        
+                        # SHORT : Si entry > BB20_mid ET prix actuel < BB20_mid → TRAVERSÉ !
                         else:
-                            # SHORT : Contact si HIGH touche OU si bougie TRAVERSE BB20_mid
-                            be_touches = df_after_entry[
-                                (df_after_entry['high'] >= df_after_entry[bb20_mid_col]) |  # Retracement
-                                (
-                                    (df_after_entry['open'] > df_after_entry[bb20_mid_col]) &  # Démarre au-dessus
-                                    (df_after_entry['low'] <= df_after_entry[bb20_mid_col])    # Traverse vers le bas
-                                )
-                            ]
-
-                        if len(be_touches) > 0:
-                            should_activate_be = True
-                            
-                            # ✅ NOUVEAU : Capturer le prix BB20_mid au moment du contact
-                            first_touch = be_touches.iloc[0]
-                            be_trigger_price = float(first_touch[bb20_mid_col])
+                            if entry_price > bb20_mid_latest and current_price < bb20_mid_latest:
+                                should_activate_be = True
+                                be_trigger_price = bb20_mid_latest
+                                print(f"   ✅ BE activé (IMMÉDIAT) - Prix a traversé BB20_mid !")
+                                print(f"      Entry: {entry_price:.6f} > BB20: {bb20_mid_latest:.6f} > Current: {current_price:.6f}")
+                    
+                    # ====================================================================
+                    # CAS 2 : DÉTECTION VIA BOUGIES FERMÉES (FALLBACK)
+                    # ====================================================================
+                    
+                    if not should_activate_be:
+                        # Trouver l'index de la bougie d'ouverture
+                        entry_idx = None
+                        
+                        if 'timestamp' in df.columns:
+                            try:
+                                mask = df['timestamp'] >= open_timestamp
+                                if mask.any():
+                                    entry_idx = df[mask].index[0]
+                            except Exception:
+                                pass
+                        
+                        if entry_idx is None:
+                            entry_idx = max(0, len(df) - 20)
+                        
+                        df_after_entry = df.loc[entry_idx:]
+                        
+                        if len(df_after_entry) >= 1:
+                            for idx in df_after_entry.index:
+                                try:
+                                    bar = df_after_entry.loc[idx]
+                                    bb20_mid_val = float(bar[bb20_mid_col])
+                                    
+                                    bar_high = float(bar['high'])
+                                    bar_low = float(bar['low'])
+                                    bar_open = float(bar['open'])
+                                    bar_close = float(bar['close'])
+                                    
+                                    contact_detected = False
+                                    
+                                    if is_long:
+                                        # Traverse de bas en haut
+                                        traverse_up = (bar_open < bb20_mid_val) and (bar_close > bb20_mid_val)
+                                        # Mèche touche
+                                        wick_touches = (bar_low <= bb20_mid_val <= bar_high)
+                                        
+                                        contact_detected = traverse_up or wick_touches
+                                    
+                                    else:
+                                        # Traverse de haut en bas
+                                        traverse_down = (bar_open > bb20_mid_val) and (bar_close < bb20_mid_val)
+                                        # Mèche touche
+                                        wick_touches = (bar_low <= bb20_mid_val <= bar_high)
+                                        
+                                        contact_detected = traverse_down or wick_touches
+                                    
+                                    if contact_detected:
+                                        should_activate_be = True
+                                        be_trigger_price = bb20_mid_val
+                                        print(f"   ✅ BE activé (BOUGIE FERMÉE) - Contact BB20_mid détecté !")
+                                        print(f"      Bar index: {idx}, BB20_mid: {bb20_mid_val:.6f}")
+                                        break
+                                
+                                except Exception:
+                                    continue
 
                 except Exception as e:
                     print(f"⚠️ Erreur détection BE pour {symbol}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
                 if should_activate_be:
                     # ✅ PROTECTION SL : Vérifier que le BE ne recule pas
                     if not _validate_sl_never_backward(trade_id, be_sl, side):
                         print(f"   🛡️ Breakeven refusé (protection anti-recul) - Trade #{trade_id}")
-                        continue  # Passer au trade suivant
+                        continue
 
-                    # ✅ CORRECTION : Utiliser be_trigger_price (BB20_mid) au lieu de current_price
                     remaining_qty = quantity
 
                     if be_trigger_price is not None:
-                        # Utiliser le prix au moment du contact BB20_mid
                         if is_long:
                             pnl_secured = max(0.0, (be_trigger_price - entry_price) * remaining_qty)
                         else:
                             pnl_secured = max(0.0, (entry_price - be_trigger_price) * remaining_qty)
                     else:
-                        # Fallback : Prix actuel (ancien comportement)
                         try:
                             ticker_now = ex.fetch_ticker(symbol)
                             current_price_now = float(ticker_now.get('last') or entry_price)
@@ -5401,10 +5451,8 @@ def manage_open_positions(ex):
                         else:
                             pnl_secured = max(0.0, (entry_price - current_price_now) * remaining_qty)
 
-                    # Appliquer le breakeven
                     database.update_trade_to_breakeven(trade_id, remaining_qty, be_sl)
 
-                    # Notification anti-spam (1 seule fois)
                     be_already_notified = meta.get('be_notified', False)
                     if not be_already_notified:
                         notifier.send_breakeven_notification(symbol, pnl_secured, remaining_qty)
@@ -5413,7 +5461,6 @@ def manage_open_positions(ex):
 
                     print(f"   🛡️ Breakeven activé pour {symbol} (PnL sécurisé: {pnl_secured:.2f} USDT)")
 
-                    # Tenter de placer le SL BE sur l'exchange
                     try:
                         _update_exchange_sl(ex, symbol, side, be_sl)
                     except Exception as e:
@@ -5427,7 +5474,7 @@ def manage_open_positions(ex):
                     # ✅ PROTECTION DIVISION PAR ZÉRO
                     tp_distance = abs(tp_price - entry_price)
                     
-                    if tp_distance < 0.000001:  # Éviter division par zéro
+                    if tp_distance < 0.000001:
                         print(f"⚠️ Distance TP trop petite pour {symbol}, skip trailing")
                     else:
                         if is_long:
@@ -5438,7 +5485,6 @@ def manage_open_positions(ex):
                         new_trailing_sl = None
 
                         if pnl_pct >= 90.0:
-                            # Trailing serré (95% du chemin vers TP)
                             if is_long:
                                 new_trailing_sl = entry_price + tp_distance * 0.95
                             else:
@@ -5463,9 +5509,7 @@ def manage_open_positions(ex):
                                 new_trailing_sl = entry_price - tp_distance * 0.25
 
                         if new_trailing_sl is not None:
-                            # Vérifier que le trailing améliore le SL actuel
                             if is_long and new_trailing_sl > sl_price:
-                                # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
                                 if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
                                     print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
                                     continue
@@ -5478,7 +5522,6 @@ def manage_open_positions(ex):
                                 print(f"   ⬆️ Trailing SL (LONG) : {new_trailing_sl:.6f} (niveau {pnl_pct:.1f}%)")
 
                             elif not is_long and new_trailing_sl < sl_price:
-                                # ✅ PROTECTION SL : Vérifier que le trailing ne recule pas
                                 if not _validate_sl_never_backward(trade_id, new_trailing_sl, side):
                                     print(f"   🛡️ Trailing SL refusé (protection anti-recul) - Trade #{trade_id}")
                                     continue
@@ -5497,7 +5540,6 @@ def manage_open_positions(ex):
             # 6. PYRAMIDING (conditions : >80% TP, max 2 ajouts)
             # ========================================================================
             try:
-                # ✅ PROTECTION DIVISION PAR ZÉRO
                 tp_distance = abs(tp_price - entry_price)
                 
                 if tp_distance < 0.000001:
@@ -5509,7 +5551,6 @@ def manage_open_positions(ex):
                         progress = ((entry_price - current_price) / tp_distance) * 100.0
 
                     if progress >= 80.0:
-                        # ✅ Appel version complète avec ex, pos, df
                         pyramid_info = should_pyramid_position(ex, pos, df)
                         
                         if pyramid_info:
@@ -5524,13 +5565,11 @@ def manage_open_positions(ex):
             # 7. PARTIAL EXITS (conditions : 50% TP, max 1 sortie)
             # ========================================================================
             try:
-                # ✅ PROTECTION DIVISION PAR ZÉRO
                 tp_distance = abs(tp_price - entry_price)
                 
                 if tp_distance < 0.000001:
                     print(f"⚠️ Distance TP trop petite pour partial exit {symbol}")
                 else:
-                    # ✅ Appel version complète avec pos, current_price
                     exit_info = should_take_partial_profit(pos, current_price)
                     
                     if exit_info:
@@ -5545,7 +5584,6 @@ def manage_open_positions(ex):
             # 8. TP MOBILE + BE SUIVEUR (>80% TP uniquement)
             # ========================================================================
             try:
-                # ✅ PROTECTION DIVISION PAR ZÉRO
                 tp_distance = abs(tp_price - entry_price)
                 
                 if tp_distance < 0.000001:
