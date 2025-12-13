@@ -2208,143 +2208,6 @@ def _current_mark_price(exchange, symbol: str) -> float:
             except Exception: pass
     return float(t.get("last") or t.get("close") or 0.0)
 
-def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float], tp: Optional[float], 
-                      params: dict, is_long: bool, tick_size: float) -> tuple:
-    """
-    Place SL et TP de manière robuste avec détection des erreurs Bitget.
-    
-    ✅ CORRECTIONS :
-    - Continue à placer le TP même si le SL échoue
-    - Détecte erreur 40836 (TP invalide)
-    - NE notifie PAS en cas d'erreur 40836 (évite spam, gestion par caller)
-    
-    Returns:
-        (sl_success: bool, tp_success: bool)
-    """
-    sl_ok = False
-    tp_ok = False
-    
-    # Récupérer mark price pour validation
-    try:
-        mark = _current_mark_price(ex, symbol)
-    except Exception:
-        mark = 0.0
-    
-    # ========================================================================
-    # ========== PLACEMENT SL ==========
-    # ========================================================================
-    
-    if sl and qty > 0:
-        try:
-            # Validation STRICTE avant envoi
-            if mark > 0:
-                sl_validated = _validate_sl_for_side(
-                    side,
-                    float(sl),
-                    mark,
-                    tick_size
-                )
-            else:
-                sl_validated = float(sl)
-            
-            # Vérification finale des règles Bitget
-            sl_invalid = False
-            
-            if is_long:
-                # LONG : SL < mark
-                if sl_validated >= mark:
-                    print(f"⚠️ {symbol} LONG : SL {sl_validated:.6f} >= mark {mark:.6f} → skip SL")
-                    sl_invalid = True
-            else:
-                # SHORT : SL > mark
-                if sl_validated <= mark:
-                    print(f"⚠️ {symbol} SHORT : SL {sl_validated:.6f} <= mark {mark:.6f} → skip SL")
-                    sl_invalid = True
-            
-            # Ne pas placer le SL si invalide, mais CONTINUER vers le TP
-            if not sl_invalid:
-                # Placement SL
-                sl_side = 'sell' if is_long else 'buy'
-                
-                try:
-                    ex.create_order(
-                        symbol, 'market', sl_side, qty, price=None,
-                        params={**params, 'stopLossPrice': float(sl_validated), 'triggerType': 'mark'}
-                    )
-                    sl_ok = True
-                    print(f"✅ {symbol} : SL placé à {sl_validated:.6f}")
-                
-                except Exception as e_sl:
-                    err_msg = str(e_sl)
-                    # Détection erreur 40836 (SL invalide)
-                    if '40836' in err_msg or 'stop loss price' in err_msg.lower():
-                        print(f"⚠️ {symbol} : SL invalide (40836) → SL skippé, mais TP va être tenté")
-                    else:
-                        print(f"❌ {symbol} : Erreur SL → {e_sl}")
-            
-            else:
-                print(f"⚠️ {symbol} : SL invalide (règles Bitget) → SL skippé, mais TP va être tenté")
-        
-        except Exception as e:
-            print(f"❌ {symbol} : Erreur validation SL → {e}")
-            # ✅ IMPORTANT : Ne pas return ici, continuer vers le TP
-    
-    # ========================================================================
-    # ========== PLACEMENT TP ==========
-    # ========================================================================
-    
-    if tp and qty > 0:
-        try:
-            tp_side = 'sell' if is_long else 'buy'
-            
-            # Validation TP
-            try:
-                tp_validated = _prepare_validated_tp(ex, symbol, tp_side, float(tp))
-            except Exception as e_val:
-                print(f"⚠️ {symbol} : Erreur validation TP → {e_val}")
-                tp_validated = float(tp)
-            
-            # Placement TP
-            try:
-                ex.create_order(
-                    symbol, 'market', tp_side, qty, price=None,
-                    params={**params, 'takeProfitPrice': float(tp_validated), 'triggerType': 'mark'}
-                )
-                tp_ok = True
-                print(f"✅ {symbol} : TP placé à {tp_validated:.6f}")
-            
-            except Exception as e_tp:
-                err_msg = str(e_tp)
-                
-                # ✅ CORRECTION : DÉTECTER ERREUR 40836 MAIS NE PAS NOTIFIER
-                if '40836' in err_msg or 'take profit price' in err_msg.lower():
-                    print(f"⚠️ {symbol} : TP invalide (40836)")
-                    print(f"   Prix TP : {tp_validated:.6f}")
-                    print(f"   Prix mark : {mark:.6f}")
-                    print(f"   Quantité : {qty:.6f}")
-                else:
-                    # Log détaillé pour autres erreurs
-                    print(f"❌ {symbol} : Erreur placement TP")
-                    print(f"   Prix TP : {tp_validated:.6f}")
-                    print(f"   Prix mark : {mark:.6f}")
-                    print(f"   Quantité : {qty:.6f}")
-                    print(f"   Erreur : {err_msg}")
-        
-        except Exception as e:
-            print(f"❌ {symbol} : Erreur TP → {e}")
-    
-    # ========================================================================
-    # ========== RÉSUMÉ ==========
-    # ========================================================================
-    
-    if sl and qty > 0 and not sl_ok:
-        print(f"⚠️ {symbol} : SL NON placé")
-    
-    if tp and qty > 0 and not tp_ok:
-        print(f"⚠️ {symbol} : TP NON placé")
-    
-    return sl_ok, tp_ok
-
 def _extract_tp_sl_from_orders(orders: list) -> Tuple[Optional[float], Optional[float]]:
     """Retourne (tp_price, sl_price) détectés dans les ordres ouverts."""
     tp, sl = None, None
@@ -5159,6 +5022,46 @@ def _validate_be_strict(symbol: str, side: str, new_sl: float, entry_price: floa
     print(f"✅ BE valide pour {symbol} {side}: SL={new_sl:.6f}, profit sécurisé={profit_pct:.2f}%")
     return True, ""
 
+def _validate_sl_for_side(side: str, sl_price: float, current_price: float, tick_size: float) -> float:
+    """
+    Garantit la règle Bitget pour le SL :
+      - long (buy)   : SL < current_price
+      - short (sell) : SL > current_price
+    Corrige automatiquement de 1 tick si la condition est violée.
+    
+    Args:
+        side: 'buy' ou 'sell'
+        sl_price: Prix SL proposé
+        current_price: Prix de marché actuel (mark price)
+        tick_size: Taille du tick pour l'arrondi
+    
+    Returns:
+        float: SL validé et ajusté si nécessaire
+    """
+    if tick_size <= 0:
+        return sl_price
+    
+    def _round_to_tick(px: float) -> float:
+        """Arrondi au tick vers la grille la plus proche"""
+        ticks = round(px / tick_size)
+        return float(ticks) * float(tick_size)
+    
+    side_clean = str(side).lower().strip()
+    
+    if side_clean in ('buy', 'long'):
+        # LONG : SL doit être < current_price
+        if sl_price >= current_price:
+            # Pousser le SL en-dessous du marché
+            sl_price = _round_to_tick(current_price - tick_size)
+    
+    else:  # sell/short
+        # SHORT : SL doit être > current_price
+        if sl_price <= current_price:
+            # Pousser le SL au-dessus du marché
+            sl_price = _round_to_tick(current_price + tick_size)
+    
+    return sl_price
+
 
 def _place_sl_tp_safe(ex, symbol: str, side: str, qty: float, sl: Optional[float], tp: Optional[float], 
                       params: dict, is_long: bool, tick_size: float) -> tuple:
@@ -5314,6 +5217,7 @@ def manage_open_positions(ex):
     ✅ CORRECTION BE : Détection IMMÉDIATE si prix traverse BB20_mid (sans attendre bougie close)
     ✅ PROTECTION : Toutes les divisions sont protégées contre division par zéro
     ✅ CORRECTION BB : Utilise bb20_up/bb20_lo au lieu de bb20_upper/bb20_lower
+    ✅ CORRECTION INDEX : Gestion robuste iloc vs loc pour DatetimeIndex
     """
     try:
         sync_positions_with_exchange(ex)
@@ -5490,6 +5394,7 @@ def manage_open_positions(ex):
             # ========================================================================
             # 4. BREAKEVEN DYNAMIQUE (contact BB20_mid IMMÉDIAT)
             # ✅ CORRECTION : Utilise _validate_be_strict() + _place_sl_tp_safe()
+            # ✅ CORRECTION INDEX : Gestion robuste iloc vs loc
             # ========================================================================
             if breakeven_status == 'PENDING':
                 should_activate_be = False
@@ -5533,6 +5438,7 @@ def manage_open_positions(ex):
                     if not should_activate_be:
                         # Trouver l'index de la bougie d'ouverture
                         entry_idx = None
+                        use_iloc = False
                         
                         if 'timestamp' in df.columns:
                             try:
@@ -5542,10 +5448,20 @@ def manage_open_positions(ex):
                             except Exception:
                                 pass
                         
+                        # ✅ CORRECTION : Déterminer si on doit utiliser iloc ou loc
                         if entry_idx is None:
                             entry_idx = max(0, len(df) - 20)
+                            use_iloc = True  # entry_idx est un entier
+                        else:
+                            # Vérifier si entry_idx est un entier (position) ou un label (datetime)
+                            if isinstance(entry_idx, int):
+                                use_iloc = True
                         
-                        df_after_entry = df.loc[entry_idx:]
+                        # ✅ Utiliser iloc pour position numérique, loc pour DatetimeIndex
+                        if use_iloc:
+                            df_after_entry = df.iloc[entry_idx:]
+                        else:
+                            df_after_entry = df.loc[entry_idx:]
                         
                         if len(df_after_entry) >= 1:
                             for idx in df_after_entry.index:
@@ -5804,6 +5720,7 @@ def manage_open_positions(ex):
             print(f"❌ Erreur gestion position {pos.get('symbol', 'N/A')}: {e}")
             import traceback
             traceback.print_exc()
+            
 
 def get_usdt_balance(ex: ccxt.Exchange) -> Optional[float]:
     """
